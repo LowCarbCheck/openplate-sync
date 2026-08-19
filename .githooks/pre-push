@@ -1,0 +1,73 @@
+#!/usr/bin/env sh
+# Pre-push quality gate — this repo's ONLY test gate.
+#
+# There is no cloud CI: pushes from the workstation are what trigger Argo's
+# build/deploy, so the tests belong in front of the push rather than after it.
+#
+# Runs: lint -> typecheck -> unit tests -> integration tests (needs Postgres) -> build.
+#
+# Escape hatches (use deliberately, they push untested code):
+#   SKIP_TESTS=1 git push        skip the whole gate
+#   SKIP_INTEGRATION=1 git push  skip only the DB-backed integration tests
+set -e
+
+if [ "${SKIP_TESTS:-0}" = "1" ]; then
+  echo "⚠ pre-push: gate SKIPPED explicitly (SKIP_TESTS=1)"
+  exit 0
+fi
+
+# Branch/tag deletions push no content — nothing to test. stdin gives one line
+# per ref: "<local_ref> <local_sha> <remote_ref> <remote_sha>"; an all-zero
+# local_sha means "delete this remote ref".
+has_content=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  case "$local_sha" in
+    '' | *[!0]*) has_content=1 ;;
+  esac
+done
+if [ "$has_content" = "0" ]; then
+  echo "▶ pre-push: deletion-only push, no tests to run"
+  exit 0
+fi
+
+# TS commands need the ts-dev toolbox (the host lacks native build tools), but
+# must run bare when the hook itself is already executing inside a container.
+if [ -f /run/.containerenv ] || [ -f /.dockerenv ]; then
+  run() { CI=true "$@"; }
+elif command -v toolbox >/dev/null 2>&1; then
+  run() { toolbox run -c ts-dev env CI=true "$@"; }
+else
+  echo "✖ pre-push: no ts-dev toolbox and not inside a container — cannot run the gate."
+  echo "  Install the toolbox, or bypass once with: SKIP_TESTS=1 git push"
+  exit 1
+fi
+
+echo "▶ pre-push: lint"
+run pnpm lint
+
+echo "▶ pre-push: typecheck"
+run pnpm typecheck
+
+echo "▶ pre-push: unit tests"
+run pnpm test:unit
+
+# tests/integration/db-harness.ts defaults to the shared local Postgres on
+# :5433 (override with TEST_DATABASE_URL). Unreachable Postgres fails the push
+# rather than silently downgrading the gate to unit-only.
+DB_PORT=5433
+
+if [ "${SKIP_INTEGRATION:-0}" = "1" ]; then
+  echo "⚠ pre-push: integration tests SKIPPED explicitly (SKIP_INTEGRATION=1)"
+elif command -v nc >/dev/null 2>&1 && ! nc -z localhost "$DB_PORT" >/dev/null 2>&1; then
+  echo "✖ pre-push: no Postgres on :$DB_PORT — integration is a REQUIRED gate."
+  echo "  Start the shared local Postgres, or bypass once with: SKIP_INTEGRATION=1 git push"
+  exit 1
+else
+  echo "▶ pre-push: integration tests (postgres on :$DB_PORT)"
+  run pnpm test:integration
+fi
+
+echo "▶ pre-push: build"
+run pnpm build
+
+echo "✅ pre-push: all gates passed"

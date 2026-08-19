@@ -1,0 +1,118 @@
+/**
+ * The persistence contract the auth handler cores are written against —
+ * the account-system counterpart to `contract-types.ts`'s
+ * `SyncStorageAdapter`.
+ *
+ * Every method here is something the handlers need and nothing more. Keeping
+ * it an interface rather than importing Drizzle directly is what lets
+ * `auth-handlers.ts` stay pure and DB-free: the unit suite injects an
+ * in-memory implementation and exercises signup, login, rotation, reuse
+ * detection and revocation without a Postgres anywhere. The Drizzle
+ * implementation lives in `db/account-store.ts`.
+ *
+ * `rotateCredential` is the one method whose ATOMICITY is a correctness
+ * requirement rather than an implementation detail — see its doc.
+ */
+import type { SyncKeyRecordKind } from '../protocol.js';
+import type { JsonObject } from '../lib/json.js';
+import type { AccountTokenKind } from '../lib/tokens.js';
+import type { KdfDescriptor } from '../lib/kdf-descriptor.js';
+
+export interface AccountRecord {
+  id: number;
+  /** Always the normalized form (`lib/verifier.ts`'s `normalizeEmail`) — normalization happens before the store is called. */
+  email: string;
+  displayName: string | null;
+  verifier: string;
+  kdfDescriptor: KdfDescriptor;
+  emailVerifiedAt: Date | null;
+  createdAt: Date;
+}
+
+/** A persisted token row, reduced to what a lifecycle decision needs. The digest itself never comes back out. */
+export interface StoredToken {
+  id: number;
+  accountId: number;
+  kind: AccountTokenKind;
+  familyId: string | null;
+  expiresAt: Date;
+  revokedAt: Date | null;
+}
+
+export interface NewTokenInput {
+  accountId: number;
+  kind: AccountTokenKind;
+  tokenHash: string;
+  familyId: string | null;
+  expiresAt: Date;
+}
+
+export interface CreateAccountInput {
+  email: string;
+  displayName: string | null;
+  verifier: string;
+  kdfDescriptor: KdfDescriptor;
+}
+
+/** `email-taken` is the ONLY expected failure; anything else is a real fault and throws. */
+export type CreateAccountResult = { ok: true; account: AccountRecord } | { ok: false; reason: 'email-taken' };
+
+/** A client-re-wrapped DEK submitted as part of a credential rotation. */
+export interface KeyRecordSubmission {
+  kind: SyncKeyRecordKind;
+  kdfDescriptor: JsonObject | null;
+  wrappedDek: Uint8Array;
+}
+
+export interface RotateCredentialInput {
+  accountId: number;
+  /** The new verifier — `HMAC(pepper, newAuthHash)`. */
+  verifier: string;
+  kdfDescriptor: KdfDescriptor;
+  /**
+   * Re-wrapped DEKs, upserted by `kind`. Kinds NOT submitted are left
+   * untouched on purpose: a passphrase change re-wraps only `passphrase`,
+   * and the `recovery` record still wraps the same (unchanged) DEK, so
+   * deleting it would destroy a working recovery path for no reason.
+   */
+  keyRecords: KeyRecordSubmission[];
+  /** Session tokens minted for the caller, inserted inside the same transaction so a rotation always leaves them logged in. */
+  issue: NewTokenInput[];
+  /** Instant stamped on every revocation this rotation performs. */
+  revokedAt: Date;
+  /** A single-use link token to consume atomically (the reset path); `null` for an authenticated change. */
+  consumeTokenId: number | null;
+}
+
+export interface AccountStore {
+  findAccountByEmail(email: string): Promise<AccountRecord | null>;
+  findAccountById(accountId: number): Promise<AccountRecord | null>;
+  createAccount(input: CreateAccountInput): Promise<CreateAccountResult>;
+  /** Cascades to `sync_blobs` and `sync_key_records` via the schema's FKs — the self-serve DSAR path. */
+  deleteAccount(accountId: number): Promise<void>;
+  markEmailVerified(input: { accountId: number; verifiedAt: Date }): Promise<void>;
+
+  insertTokens(tokens: NewTokenInput[]): Promise<void>;
+  findToken(input: { kind: AccountTokenKind; tokenHash: string }): Promise<StoredToken | null>;
+  revokeToken(input: { tokenId: number; revokedAt: Date }): Promise<void>;
+  /** Revokes one device's lineage — used by logout and by refresh-reuse detection. */
+  revokeFamily(input: { accountId: number; familyId: string; revokedAt: Date }): Promise<void>;
+  /** Revokes every `access`/`refresh` token for the account, leaving link tokens alone. */
+  revokeSessions(input: { accountId: number; revokedAt: Date }): Promise<void>;
+  revokeTokensOfKind(input: { accountId: number; kind: AccountTokenKind; revokedAt: Date }): Promise<void>;
+
+  /**
+   * ATOMIC credential rotation: new verifier + new KDF descriptor + upserted
+   * key records + revocation of every outstanding session + the caller's new
+   * session, in ONE transaction.
+   *
+   * It has to be one transaction. A partial application is a data-loss bug,
+   * not a retryable hiccup: a new verifier stored without the re-wrapped DEK
+   * leaves an account that can log in but can never decrypt its own blob
+   * again, and the user has no way to tell until they try.
+   */
+  rotateCredential(input: RotateCredentialInput): Promise<void>;
+
+  /** Housekeeping: drops rows whose `expiresAt` is far enough in the past to be useless even for reuse detection. */
+  purgeExpiredTokens(input: { before: Date }): Promise<number>;
+}

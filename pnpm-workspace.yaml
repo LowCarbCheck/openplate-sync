@@ -1,0 +1,13 @@
+allowBuilds:
+  esbuild: true
+
+# Supply-chain hardening: a published version must be at least 7 days old before
+# pnpm will resolve it. pnpm 11's own default is 1440 minutes (24h); this widens
+# that to a week, which is the window in which a compromised release is normally
+# spotted and yanked — the point is that this repo never resolves it at all.
+#
+# Only affects RESOLUTION (adding/updating deps). `--frozen-lockfile` installs,
+# which is what CI and every Docker build runs, are unaffected. To take an urgent
+# patch sooner, lower this temporarily or add the package to
+# `minimumReleaseAgeExclude`.
+minimumReleaseAge: 10080

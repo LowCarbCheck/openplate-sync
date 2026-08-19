@@ -1,0 +1,65 @@
+# Self-hoster quickstart: Postgres + the sync service, nothing else.
+#
+#   cp .env.example .env
+#   # edit .env — SERVER_SECRET and CLIENT_BASE_URL are mandatory
+#   docker compose up -d
+#
+# With no mail configured the service uses its console transport, so the
+# verification and reset links appear in `docker compose logs -f sync`. That
+# is a supported way to run this, not a degraded one — a family instance never
+# needs an SMTP relay.
+#
+# NOTE FOR CONTRIBUTORS: this file is for SELF-HOSTERS. Local development and
+# the integration suite use the shared workspace Postgres (see
+# `tests/integration/db-harness.ts`), never this database.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openplate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openplate}
+      POSTGRES_DB: ${POSTGRES_DB:-openplate_sync}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-openplate} -d ${POSTGRES_DB:-openplate_sync}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Not published by default: nothing outside this compose network has any
+    # business reaching the database.
+    expose:
+      - '5432'
+
+  sync:
+    build: .
+    # Or pull the published image instead of building:
+    # image: ghcr.io/lowcarbcheck/openplate-sync:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://${POSTGRES_USER:-openplate}:${POSTGRES_PASSWORD:-openplate}@postgres:5432/${POSTGRES_DB:-openplate_sync}
+      SERVER_SECRET: ${SERVER_SECRET:?set SERVER_SECRET in .env — see .env.example}
+      CLIENT_BASE_URL: ${CLIENT_BASE_URL:?set CLIENT_BASE_URL in .env — where your openplate client is served}
+      SIGNUPS_OPEN: ${SIGNUPS_OPEN:-true}
+      REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-false}
+      # Set to the number of reverse proxies in front of this service, or the
+      # per-IP throttle collapses into one bucket anyone can lock for everyone.
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      EMAIL_FROM: ${EMAIL_FROM:-openplate <noreply@localhost>}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+    ports:
+      - '${SYNC_PORT:-3000}:3000'
+
+volumes:
+  postgres-data:

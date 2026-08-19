@@ -1,0 +1,121 @@
+/**
+ * Opaque-token primitives: minting, hashing, expiry and lifecycle
+ * classification. PURE and DB-free by design (the only impurity is
+ * `randomBytes`), so every rule below is unit-testable without a database —
+ * the DB-touching orchestration lives in `server/auth-handlers.ts` over an
+ * injected `AccountStore`.
+ *
+ * SECURITY MODEL — the reason these are opaque strings and not JWTs:
+ *
+ *  - A JWT is *stateless*, which is exactly the property this service must
+ *    not have. Revocation is the load-bearing feature here: PROTOCOL.md
+ *    requires that a passphrase change and both reset paths invalidate every
+ *    outstanding session immediately. A stateless token can only be made to
+ *    expire, never to stop working, without adding the same server-side
+ *    denylist that a database-backed opaque token already is.
+ *  - Only the SHA-256 digest of a token is persisted. A dumped
+ *    `account_tokens` table therefore yields nothing replayable. SHA-256 with
+ *    no stretching is correct here (unlike for passwords): the pre-image is
+ *    256 bits of `randomBytes`, so there is no dictionary to run.
+ *
+ * ACCESS/REFRESH SPLIT (counsel decision, M128 spec 02): the client in a
+ * zero-knowledge design must never cache the master passphrase, so it cannot
+ * silently re-derive an auth-hash to log in again. A long-lived rotating
+ * refresh token is what makes silent re-auth possible at all; the short-lived
+ * access token is what limits the damage of one leaking.
+ */
+import { createHash, randomBytes } from 'node:crypto';
+
+/**
+ * Every kind of opaque token this service issues. Session tokens
+ * (`access`/`refresh`) and single-use link tokens (`email-verification`,
+ * `auth-reset`) share one table because they share an identical lifecycle
+ * (hashed at rest, expiring, revocable) — the discriminator is what keeps
+ * `revokeAllSessions` from also nuking a pending verification link.
+ */
+export type AccountTokenKind = 'access' | 'refresh' | 'email-verification' | 'auth-reset';
+
+/** The kinds that constitute a logged-in session — exactly what a credential change revokes. */
+export const SESSION_TOKEN_KINDS: readonly AccountTokenKind[] = ['access', 'refresh'];
+
+/** Short — a leaked access token is useful for minutes, not weeks. */
+export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
+/** Long, but rotating: every use mints a replacement and revokes the presented one (see `server/auth-handlers.ts`). */
+export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** Email-verification links stay valid for a day — long enough to survive a delayed inbox. */
+export const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+/** Reset links are deliberately much shorter-lived: they are the strongest capability this service emails anyone. */
+export const AUTH_RESET_TTL_MS = 60 * 60 * 1000;
+
+export const TOKEN_TTL_MS = {
+  access: ACCESS_TOKEN_TTL_MS,
+  refresh: REFRESH_TOKEN_TTL_MS,
+  'email-verification': EMAIL_VERIFICATION_TTL_MS,
+  'auth-reset': AUTH_RESET_TTL_MS,
+} satisfies Record<AccountTokenKind, number>;
+
+/** A freshly minted token: `raw` goes to the client (or into an email), `hash` goes in the DB. Never store `raw`. */
+export interface GeneratedToken {
+  raw: string;
+  hash: string;
+}
+
+/** SHA-256 hex digest of a raw token — deterministic, which is the whole point of storing digests. */
+export function hashToken(raw: string): string {
+  return createHash('sha256').update(raw).digest('hex');
+}
+
+/** Mints a 256-bit random token and its digest. */
+export function generateToken(): GeneratedToken {
+  const raw = randomBytes(32).toString('base64url');
+  return { raw, hash: hashToken(raw) };
+}
+
+/**
+ * A refresh-token FAMILY id, carried unchanged across rotations. It is what
+ * lets `logout` revoke exactly one device's pair, and what lets a replayed
+ * (already-rotated) refresh token revoke that whole lineage rather than just
+ * itself — the standard reuse-detection response to a stolen token.
+ */
+export function generateFamilyId(): string {
+  return randomBytes(16).toString('hex');
+}
+
+export function computeExpiry(now: Date, ttlMs: number): Date {
+  return new Date(now.getTime() + ttlMs);
+}
+
+/** The persisted shape a lifecycle decision needs — a structural subset of an `account_tokens` row. */
+export interface TokenLifecycle {
+  expiresAt: Date;
+  revokedAt: Date | null;
+}
+
+export type TokenStatus = 'valid' | 'revoked' | 'expired';
+
+/**
+ * Classifies a token against `now`. `revoked` wins over `expired` because
+ * the two mean very different things to the caller: an expired refresh token
+ * is a routine re-login, while a revoked one that is still within its TTL is
+ * the reuse signal that triggers family revocation.
+ */
+export function classifyToken(token: TokenLifecycle, now: Date): TokenStatus {
+  if (token.revokedAt !== null) return 'revoked';
+  if (token.expiresAt.getTime() <= now.getTime()) return 'expired';
+  return 'valid';
+}
+
+export function isTokenUsable(token: TokenLifecycle, now: Date): boolean {
+  return classifyToken(token, now) === 'valid';
+}
+
+/**
+ * Extracts the token from an `Authorization: Bearer <token>` header value.
+ * Returns `null` for anything that is not exactly that shape — a missing
+ * header, a different scheme, or a bearer with no value.
+ */
+export function parseBearerHeader(headerValue: string | undefined): string | null {
+  if (headerValue === undefined) return null;
+  const match = /^Bearer[ ]+(\S+)$/i.exec(headerValue.trim());
+  return match ? (match[1] ?? null) : null;
+}
