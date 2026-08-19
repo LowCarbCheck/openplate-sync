@@ -56,19 +56,9 @@ Losing the passphrase without the recovery code means losing the data. Permanent
 
 ## How it works
 
-An openplate client serializes its whole local store, gzips it, encrypts it with AES-256-GCM under a key derived from the user's passphrase, and pushes the result as one opaque blob. The server versions those bytes and refuses writes that would clobber another device's. It also stores two small **key records** — the same data-encryption key wrapped under two different key-encryption keys, one from the passphrase and one from a recovery code — so a second device can bootstrap.
+The client encrypts your data before it ever leaves the device, using a key derived from your passphrase; the server only ever sees and stores opaque ciphertext blobs and wrapped key records, never a passphrase or a key that could decrypt them. This is a zero-knowledge design: authentication and sync both work without the server holding anything that unwraps your data.
 
-Accounts follow the Bitwarden model. The client derives two independent values from the passphrase via HKDF: one that unwraps the data key and never leaves the device, and one that it sends as its password. The server stores a keyed hash of the second under a secret held outside the database. Authentication therefore works without the server ever holding anything that could decrypt a blob.
-
-Sessions are a short-lived access token plus a rotating refresh token, both stored only as digests. A passphrase change or a reset revokes every outstanding session immediately — which is precisely why they are database-backed opaque tokens rather than JWTs.
-
-Full detail, including the exact HKDF labels, token lifetimes, and an honest account of what the server _does_ know: [`PROTOCOL.md`](./PROTOCOL.md).
-
-### An account service, not a sync server
-
-The name says sync because that is what it does today. The shape says account service, and that is deliberate: this is intended to become the shared identity for the wider [LowCarbCheck](https://lowcarbcheck.org) ecosystem, with community features (saved items, profiles, comments) hanging off the same account id later.
-
-That future is already constrained rather than left open. [ADR 001](./docs/adr/001-community-auth-lane.md) fixes the rule now, while it is still cheap: community features get a **second authentication lane** that shares only the account id space. They will never touch the vault credential, because that credential is a sibling of the key that decrypts a user's data, and the surfaces that render other people's content are the last place it belongs. The `accounts` table stays minimal for the same reason.
+Full detail, including the exact protocol, HKDF labels, and token lifetimes: [`PROTOCOL.md`](./PROTOCOL.md).
 
 ---
 

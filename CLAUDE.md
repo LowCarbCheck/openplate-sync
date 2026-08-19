@@ -27,10 +27,10 @@ workflow.
   per [`SECURITY.md`](./SECURITY.md) — don't discuss specifics publicly first.
   **Any report that even might be a crypto/correlation flaw — anything that
   could let the server decrypt or correlate a blob it shouldn't, break token
-  revocation, or open a new enumeration oracle beyond the one documented in
-  [ADR 002](./docs/adr/002-signup-enumeration-tradeoff.md) — is treated as
-  security until proven otherwise.** When in doubt, redirect privately first
-  and downgrade only after confirming it isn't one.
+  revocation, or open a new enumeration oracle beyond the signup-conflict `409`
+  documented as an accepted tradeoff in [`SECURITY.md`](./SECURITY.md) — is
+  treated as security until proven otherwise.** When in doubt, redirect
+  privately first and downgrade only after confirming it isn't one.
 - **PRs**: apply the relevant `area:` label(s) on open. Before requesting
   review, CI must be green end to end: lint → typecheck → unit →
   integration → build (see `pnpm` scripts below). Don't spend review effort
