@@ -293,7 +293,7 @@ The server stores `HMAC-SHA-256(serverPepper, authHash)`, **not** a second slow 
 
 **The `409` is a genuine account-enumeration oracle — the only one in this protocol — and it is accepted rather than removed.** The usual fix (always `202`, move the truth into an email) requires guaranteed mail delivery, and this service's default configuration has none: with `REQUIRE_EMAIL_VERIFICATION` off and the console mail transport, a duplicate signup answered with `202` would tell the user their account was created when it was not, with no email arriving to correct it. The oracle-free variant is therefore unavailable in the configuration most self-hosters run, not merely inconvenient.
 
-It is bounded by the per-IP signup throttle, removed entirely by `SIGNUPS_OPEN=false`, and deliberately not repeated anywhere else: `kdf`, `login` and `request-reset` all stay indistinguishable. Reasoning in full: `docs/adr/002-signup-enumeration-tradeoff.md`.
+It is bounded by the per-IP signup throttle, removed entirely by `SIGNUPS_OPEN=false`, and deliberately not repeated anywhere else: `kdf`, `login` and `request-reset` all stay indistinguishable. Full reasoning: [`SECURITY.md`](./SECURITY.md).
 
 ### 5.9 `POST /v1/auth/login`
 
