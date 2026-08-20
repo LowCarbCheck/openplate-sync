@@ -1,0 +1,58 @@
+# Contributor test database. NOT part of self-hosting.
+#
+# WHO THIS IS FOR: outside contributors who want to run `pnpm run
+# test:integration` and have no Postgres on port 5433 already. Inside the
+# SPRQVNTRS workspace that port is served by the shared `projects-postgres-1`
+# instance, so this file is redundant there — bring it up only if nothing
+# answers on 5433.
+#
+# SELF-HOSTERS NEVER NEED THIS FILE. It runs no sync service, stores nothing
+# you would want to keep, and its data lives in a throwaway volume. The
+# self-hosting stack is `docker/compose.yml`.
+#
+#   docker compose -f docker/compose.dev.yml up -d
+#   pnpm run test:integration
+#   docker compose -f docker/compose.dev.yml down -v    # -v drops the data
+#
+# The credentials below are fixed on purpose: they are the ones baked into
+# `tests/integration/db-harness.ts` as
+# `postgres://postgres:postgres@localhost:5433/openplate_sync_test`. Change
+# either side and the suite stops connecting. If you must run Postgres
+# somewhere else, leave this file alone and point the harness at it with
+# `TEST_DATABASE_URL` instead.
+#
+# The `openplate_sync_test` database is NOT created here. The harness creates
+# it on first run (via the default `postgres` database) and then applies the
+# same committed migrations production uses — which is the point of the
+# exercise, so a broken migration cannot pass a green suite.
+
+# Pin the Compose project name. Without it Compose names the project after
+# this file's parent directory — "docker" — and every container and volume
+# inherits that.
+name: openplate-sync-dev
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    # No `restart:` — this is a test database, and it should stop when you
+    # stop it rather than reappear on the next boot.
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      # The default `postgres` database is enough: it is what the harness
+      # connects to in order to CREATE DATABASE openplate_sync_test.
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgres']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Bound to loopback only: the test database has no business being
+    # reachable from the network.
+    ports:
+      - '127.0.0.1:5433:5432'
+    volumes:
+      - test-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  test-postgres-data:

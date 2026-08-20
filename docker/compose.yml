@@ -1,17 +1,39 @@
 # Self-hoster quickstart: Postgres + the sync service, nothing else.
 #
+# If you pulled the published image you can copy this one file anywhere and
+# run `docker compose up -d` beside it. From a checkout, the file lives in
+# `docker/`, so run it from the repository root like this:
+#
 #   cp .env.example .env
 #   # edit .env — SERVER_SECRET and CLIENT_BASE_URL are mandatory
-#   docker compose up -d
+#   docker compose --project-directory . -f docker/compose.yml up -d
+#
+# `--project-directory .` is not decoration. Without it, Compose treats
+# `docker/` as the project directory: it looks for `.env` there instead of at
+# the repository root, and resolves `build: .` to `docker/` instead of to the
+# checkout. With it, both point at the repository root, which is what the
+# quickstart above assumes. (The project name is pinned below, so that part
+# does not depend on where you run from.)
 #
 # With no mail configured the service uses its console transport, so the
-# verification and reset links appear in `docker compose logs -f sync`. That
-# is a supported way to run this, not a degraded one — a family instance never
-# needs an SMTP relay.
+# verification and reset links appear in the service log:
+#
+#   docker compose --project-directory . -f docker/compose.yml logs -f sync
+#
+# That is a supported way to run this, not a degraded one — a family instance
+# never needs an SMTP relay.
 #
 # NOTE FOR CONTRIBUTORS: this file is for SELF-HOSTERS. Local development and
 # the integration suite use the shared workspace Postgres (see
-# `tests/integration/db-harness.ts`), never this database.
+# `tests/integration/db-harness.ts`), never this database. If you are an
+# outside contributor with no shared Postgres to point at, bring up
+# `docker/compose.dev.yml` instead — it is a test database only, and it is the
+# one thing in `docker/` a self-hoster can ignore entirely.
+
+# Pin the Compose project name. Without it Compose names the project after
+# this file's parent directory — "docker" — and every container and volume
+# inherits that.
+name: openplate-sync
 
 services:
   postgres:

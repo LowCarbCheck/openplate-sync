@@ -23,20 +23,22 @@ cp .env.example .env
 openssl rand -hex 32     # → paste into SERVER_SECRET in .env
 # Set CLIENT_BASE_URL to wherever your openplate client is served.
 
-docker compose up -d
+docker compose --project-directory . -f docker/compose.yml up -d
 curl http://localhost:3000/health
 ```
 
 That is the whole install. Postgres comes up alongside the service, the schema migrates itself on boot, and there is nothing else to run.
 
-Then point your openplate app at it by setting `SYNC_SERVER_URL` to this service's public URL — the one a **browser** can reach, since the sync client runs in the page. If you want both halves in one file, openplate ships a combined [`docker-compose.full.yml`](https://github.com/LowCarbCheck/openplate/blob/main/docker-compose.full.yml) that brings up the app, this service and a shared Postgres together.
+`--project-directory .` is what keeps the repository root as the project root, so `.env` is read from where you created it and the image builds from the checkout rather than from `docker/`. If you would rather run the published image than build from source, copy `docker/compose.yml` out on its own, uncomment the `image:` line, and plain `docker compose up -d` beside it works.
+
+Then point your openplate app at it by setting `SYNC_SERVER_URL` to this service's public URL — the one a **browser** can reach, since the sync client runs in the page. If you want both halves in one file, openplate ships a combined [`docker/topologies/compose.sync.yml`](https://github.com/LowCarbCheck/openplate/blob/main/docker/topologies/compose.sync.yml) that brings up the app, this service and a shared Postgres together.
 
 ### Mail is optional
 
 With no mail configured, verification and reset links are printed to the service log:
 
 ```bash
-docker compose logs -f sync
+docker compose --project-directory . -f docker/compose.yml logs -f sync
 ```
 
 That is a supported way to run a personal or family instance, not a degraded one. Set `SMTP_HOST` and friends when you want real delivery. Every setting is documented in [`.env.example`](./.env.example).
@@ -80,6 +82,11 @@ pnpm run build              # esbuild → dist/server.js
 pnpm run dev                # tsx watch
 ```
 
+Two optional conveniences:
+
+- `nix develop` gives you a shell with the expected Node 22 and pnpm, if you have Nix with flakes enabled.
+- `docker compose -f docker/compose.dev.yml up -d` starts the contributor test database on port 5433, for the integration suite. Skip it if something already answers on that port.
+
 Linting is [oxlint](https://oxc.rs) plus a vendored `anti-slop` plugin under
 `tools/oxlint/anti-slop/` (MIT, © Dillon Mulroy — its own LICENSE ships beside
 it). The gate is zero warnings, and `pnpm lint` runs first in the pre-push
@@ -88,7 +95,7 @@ input: request bodies enter as `JsonValue` and are decoded through
 `src/lib/json.ts`, which is the only module that inspects a JSON primitive at
 runtime.
 
-The integration suite targets a local Postgres at `localhost:5433` and creates `openplate_sync_test` on first run. Override with `TEST_DATABASE_URL`. It deliberately does **not** use the compose database — that one is for self-hosters.
+The integration suite targets a local Postgres at `localhost:5433` (user `postgres`, password `postgres`) and creates `openplate_sync_test` on first run. Override with `TEST_DATABASE_URL`. It deliberately does **not** use the self-hosting database in `docker/compose.yml` — that one is for self-hosters. If you have no Postgres on 5433, `docker/compose.dev.yml` is a one-service file that provides exactly that and nothing else.
 
 ### Layout
 

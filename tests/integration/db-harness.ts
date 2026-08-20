@@ -3,8 +3,10 @@
  *
  * Points at the SHARED local Postgres (`localhost:5433` by default — the
  * workspace's `projects-postgres-1`), never at a per-repo compose database.
- * The compose file in this repo exists for self-hosters; using it for tests
- * would mean every developer running a second Postgres for no reason.
+ * `docker/compose.yml` exists for self-hosters; using it for tests would mean
+ * every developer running a second Postgres for no reason. A contributor with
+ * no shared Postgres can start `docker/compose.dev.yml`, which serves exactly
+ * the default URL below.
  *
  * The test database is created idempotently (a `42P04` "already exists" is
  * the expected outcome on every run after the first) and migrated with the
