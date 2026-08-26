@@ -54,6 +54,34 @@ Also worth knowing: **`SIGNUPS_OPEN=false`** closes registration on a family ins
 
 Losing the passphrase without the recovery code means losing the data. Permanently, and to you as the operator too. The email reset flow restores _login_ and cannot restore _data_ — the reset email says so in those words before anyone clicks. This is the direct cost of the server not being able to read anything, and it is not a bug you can fix from the server side.
 
+### The admin API is off unless you turn it on
+
+There is an operator API at `/v1/admin` — list accounts, read one account's
+metadata, aggregate storage counts, and **delete an account with everything
+attached to it**. It exists mainly for that last one: an erasure request is an
+obligation, and a service whose only erasure mechanism is a hand-written
+`DELETE` in a SQL client is a service that will eventually get it wrong.
+
+It is **unmounted unless `ADMIN_TOKEN` is set**. With the variable unset the
+whole `/v1/admin` tree answers the same `404` any unknown path does, to
+everybody — an instance that never configured it is indistinguishable from one
+built before the feature existed. A `401` there would announce that a
+credential exists and is merely locked.
+
+What it can never do, by design rather than by default:
+
+- **Read a blob.** Ciphertext is not exported through the admin surface in any
+  form. A blob is reported as a byte count and a timestamp.
+- **Return a verifier or a KDF descriptor.** Neither has an operational use
+  that justifies putting it where a screenshot or a paste can carry it.
+- **Reset anyone's passphrase.** There cannot be a meaningful admin reset: the
+  passphrase wraps the data key on the client, so a server-side credential
+  change would produce an account that logs in and decrypts nothing.
+- **Send email.**
+
+The reasoning in full is in
+[`docs/adr/0001-an-admin-api-for-a-zero-knowledge-service.md`](./docs/adr/0001-an-admin-api-for-a-zero-knowledge-service.md).
+
 ---
 
 ## How it works
@@ -82,6 +110,22 @@ pnpm run build              # esbuild → dist/server.js
 pnpm run dev                # tsx watch
 ```
 
+`pnpm sync-api` is a thin HTTP client over the admin API — it imports no
+database code, so it runs from a machine with no Postgres:
+
+```bash
+ADMIN_TOKEN=... pnpm sync-api status
+ADMIN_TOKEN=... pnpm sync-api accounts list --limit 20
+ADMIN_TOKEN=... pnpm sync-api accounts get 42 --json
+ADMIN_TOKEN=... pnpm sync-api accounts delete 42 --yes
+```
+
+The token comes from `ADMIN_TOKEN` and nowhere else — there is no `--token`
+flag, because a credential in argv lands in shell history and is visible in
+`ps`. The target is `--url`, then `SYNC_SERVER_URL`, then
+`http://localhost:3000`. Deletion requires `--yes`. The CLI is not part of the
+Docker image.
+
 Two optional conveniences:
 
 - `nix develop` gives you a shell with the expected Node 22 and pnpm, if you have Nix with flakes enabled.
@@ -105,8 +149,10 @@ The integration suite targets a local Postgres at `localhost:5433` (user `postgr
 | `src/server/`         | Express glue, the sync handler cores, CORS, bearer auth, error handling.      |
 | `src/accounts/`       | Account policy as pure handlers over an injected `AccountStore`.              |
 | `src/db/`             | Drizzle schema and the two store implementations.                             |
+| `src/admin/`          | The admin metadata read contract — deliberately not part of `AccountStore`.   |
 | `src/lib/`            | Pure primitives: verifier, tokens, KDF descriptors, throttle.                 |
 | `src/mail/`           | Console / SMTP / pigeon transports and the two messages this service sends.   |
+| `scripts/sync-api/`   | The `pnpm sync-api` admin CLI. HTTP only — it imports no database code.       |
 | `drizzle/migrations/` | Generated migrations. Never hand-written — see `src/db/schema.ts`.            |
 
 ### Invariants

@@ -23,6 +23,7 @@ import { createLogger } from './logger.js';
 import { createDatabase, runMigrations, waitForDatabase } from './db/client.js';
 import { createDrizzleAccountStore } from './db/account-store.js';
 import { createDrizzleStorageAdapter } from './db/storage-adapter.js';
+import { createDrizzleAdminStore } from './db/admin-store.js';
 import { deriveServerSecrets } from './lib/server-secrets.js';
 import { createThrottleStore } from './lib/throttle.js';
 import { generateFamilyId, generateToken } from './lib/tokens.js';
@@ -67,12 +68,18 @@ async function main(): Promise<void> {
     logger,
   };
 
+  // `null` unless ADMIN_TOKEN is set, which leaves the whole `/v1/admin` tree
+  // answering the ordinary unknown-path 404 — see `server/create-app.ts`.
+  const admin =
+    config.adminToken === null ? null : { token: config.adminToken, metadata: createDrizzleAdminStore(database.db) };
+
   const app = createApp({
     authContext,
     storage: createDrizzleStorageAdapter(database.db),
     throttle: createThrottleStore(),
     logger,
     trustProxy: config.trustProxy,
+    admin,
   });
 
   const server = app.listen(config.port, () => {
@@ -81,6 +88,8 @@ async function main(): Promise<void> {
       serviceVersion: SERVICE_VERSION,
       signupsOpen: config.signupsOpen,
       requireEmailVerification: config.requireEmailVerification,
+      // Whether the operator API exists on this instance, never its token.
+      adminApi: admin !== null,
     });
   });
 

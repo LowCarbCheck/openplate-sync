@@ -22,6 +22,17 @@ import { isLogLevel, type LogLevel } from './logger.js';
  */
 export const MIN_SERVER_SECRET_LENGTH = 32;
 
+/**
+ * Minimum accepted `ADMIN_TOKEN` length, matching `openplate-gateway`'s
+ * `MIN_ADMIN_TOKEN_LENGTH`. This credential lists every account on the
+ * instance and erases any of them, so it is worth more to an attacker than
+ * any single user's session: it must be GENERATED, not chosen, and 24
+ * characters is the shortest length at which a generated value is not worth
+ * guessing. A too-short value is a boot failure rather than a warning — see
+ * the module header.
+ */
+export const MIN_ADMIN_TOKEN_LENGTH = 24;
+
 export interface SmtpSettings {
   host: string;
   port: number;
@@ -61,8 +72,38 @@ export interface ServiceConfig {
    * one global bucket that any single attacker can lock for everyone.
    */
   trustProxy: boolean | number;
+  /**
+   * The operator's admin credential, or `null` when the admin API is not
+   * enabled on this instance — which is the default, and the state every
+   * deployment is in until somebody deliberately sets the variable.
+   *
+   * `null` does not mean "mounted but locked". It means the entire
+   * `/v1/admin` tree answers the ordinary unknown-path `404`, to everybody
+   * (`server/create-app.ts`). See
+   * `docs/adr/0001-an-admin-api-for-a-zero-knowledge-service.md`: this
+   * service auto-deploys on push, so the commit that adds a route is the
+   * commit that puts it in production, and an unconfigured deployment has to
+   * be indistinguishable from one where the feature was never written.
+   */
+  adminToken: string | null;
   logLevel: LogLevel;
   email: EmailSettings;
+}
+
+/**
+ * `ADMIN_TOKEN` is optional; when present it must be long enough to be worth
+ * having. An absent value is not a misconfiguration — it is the default, and
+ * it leaves the admin API unmounted.
+ */
+function parseAdminToken(env: NodeJS.ProcessEnv): string | null {
+  const raw = env.ADMIN_TOKEN?.trim();
+  if (raw === undefined || raw === '') return null;
+  if (raw.length < MIN_ADMIN_TOKEN_LENGTH) {
+    throw new Error(
+      `ADMIN_TOKEN must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters — generate it, do not choose it (see .env.example)`,
+    );
+  }
+  return raw;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -138,6 +179,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
     requireEmailVerification: parseBoolean(env, 'REQUIRE_EMAIL_VERIFICATION', false),
     clientBaseUrl: normalizeBaseUrl(required(env, 'CLIENT_BASE_URL')),
     trustProxy: parseTrustProxy(env),
+    adminToken: parseAdminToken(env),
     logLevel: parseLogLevel(env),
     email: {
       from: optional(env, 'EMAIL_FROM', 'openplate-sync <noreply@localhost>'),
