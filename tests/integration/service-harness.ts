@@ -16,6 +16,7 @@ import type { AddressInfo } from 'node:net';
 import { createApp } from '../../src/server/create-app.js';
 import { createDrizzleAccountStore } from '../../src/db/account-store.js';
 import { createDrizzleStorageAdapter } from '../../src/db/storage-adapter.js';
+import { createDrizzleAdminStore } from '../../src/db/admin-store.js';
 import { createSilentLogger } from '../../src/logger.js';
 import { createThrottleStore, type ThrottleConfig } from '../../src/lib/throttle.js';
 import { generateFamilyId, generateToken } from '../../src/lib/tokens.js';
@@ -35,6 +36,8 @@ export interface HttpRequestInput {
   path: string;
   body?: unknown;
   accessToken?: string;
+  /** An admin bearer credential, for the `/v1/admin` routes. Mutually exclusive with `accessToken` in practice. */
+  adminToken?: string;
 }
 
 export interface ServiceHarness {
@@ -65,6 +68,12 @@ export interface StartServiceOptions {
   signupsOpen?: boolean;
   requireEmailVerification?: boolean;
   throttleConfig?: ThrottleConfig;
+  /**
+   * Absent (the default) boots the service the way every deployment boots
+   * today: no admin API at all, and `/v1/admin/*` answering the ordinary
+   * unknown-path 404. `admin-api.test.ts` opts in.
+   */
+  adminToken?: string | null;
 }
 
 export async function startService(options: StartServiceOptions): Promise<ServiceHarness> {
@@ -95,6 +104,10 @@ export async function startService(options: StartServiceOptions): Promise<Servic
     throttle: createThrottleStore(options.throttleConfig ?? PERMISSIVE_THROTTLE),
     logger: createSilentLogger(),
     trustProxy: false,
+    admin:
+      options.adminToken === undefined || options.adminToken === null
+        ? null
+        : { token: options.adminToken, metadata: createDrizzleAdminStore(options.db) },
   });
 
   const server: Server = app.listen(0);
@@ -117,6 +130,7 @@ export async function startService(options: StartServiceOptions): Promise<Servic
       const headers: Record<string, string> = {};
       if (input.body !== undefined) headers['content-type'] = 'application/json';
       if (input.accessToken) headers.authorization = `Bearer ${input.accessToken}`;
+      if (input.adminToken) headers.authorization = `Bearer ${input.adminToken}`;
 
       const response = await fetch(`${baseUrl}${input.path}`, {
         method: input.method,

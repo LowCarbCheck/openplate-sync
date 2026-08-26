@@ -12,6 +12,7 @@
     "start": "node dist/server.js",
     "dev": "node --import tsx --watch src/main.ts",
     "build": "tsx scripts/build.ts",
+    "sync-api": "tsx scripts/sync-api/main.ts",
     "typecheck": "tsc --noEmit",
     "test:unit": "node --import tsx --test 'tests/unit/**/*.test.ts'",
     "test:integration": "node --import tsx --test --test-concurrency=1 'tests/integration/**/*.test.ts'",

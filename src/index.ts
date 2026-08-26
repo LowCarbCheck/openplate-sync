@@ -20,9 +20,11 @@ export type * from './contract-types.js';
 
 // HTTP composition.
 export { createApp } from './server/create-app.js';
-export type { CreateAppOptions } from './server/create-app.js';
+export type { CreateAppOptions, AdminSurfaceOptions } from './server/create-app.js';
 export { registerSyncRoutes } from './server/register-routes.js';
 export { registerAuthRoutes, AUTH_API_PREFIX } from './accounts/register-auth-routes.js';
+export { createAdminRoutes, ADMIN_API_PREFIX } from './server/admin-routes.js';
+export { createAdminAuthMiddleware } from './server/admin-auth.js';
 export { createBearerAuthMiddleware, createEntitledUserResolver, getRequestSession } from './server/bearer-auth.js';
 
 // Account system.
@@ -34,6 +36,8 @@ export { createDatabase, runMigrations, waitForDatabase } from './db/client.js';
 export type { Database, DatabaseHandle } from './db/client.js';
 export { createDrizzleAccountStore } from './db/account-store.js';
 export { createDrizzleStorageAdapter } from './db/storage-adapter.js';
+export { createDrizzleAdminStore } from './db/admin-store.js';
+export type * from './admin/admin-store.js';
 export * as schema from './db/schema.js';
 
 // Configuration and cross-cutting utilities.
