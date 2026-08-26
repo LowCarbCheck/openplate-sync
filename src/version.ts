@@ -11,4 +11,4 @@
  * It is DIAGNOSTIC ONLY. `protocolVersion`/`envelopeVersion` are the values
  * a client compares (PROTOCOL.md §6); this one is never compared by anyone.
  */
-export const SERVICE_VERSION = process.env.SERVICE_VERSION ?? '0.1.0';
+export const SERVICE_VERSION = process.env.SERVICE_VERSION ?? '0.2.0';
