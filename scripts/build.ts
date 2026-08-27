@@ -62,6 +62,46 @@ async function assertBundleHasNoDynamicRequire(outfile: string): Promise<void> {
   );
 }
 
+/**
+ * The version the built server reports on `/health`.
+ *
+ * Read from `package.json` HERE, at build time, and inlined — because the
+ * bundle runs as `dist/server.js` where `package.json` sits at no guaranteed
+ * relative path, and because the alternative is a hand-maintained constant
+ * that goes stale. It did: 0.3.0 deployed reporting `0.2.0`, which is exactly
+ * the value an operator reads to decide whether their deploy landed.
+ */
+async function packageVersion(): Promise<string> {
+  const raw = await readFile(resolve(repoRoot, 'package.json'), 'utf8');
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== 'object' || parsed === null || !('version' in parsed)) {
+    throw new Error('package.json has no version field');
+  }
+  const { version } = parsed as { version: unknown };
+  if (typeof version !== 'string' || version.length === 0) {
+    throw new Error('package.json version is not a non-empty string');
+  }
+  return version;
+}
+
+/**
+ * Fails the build if the emitted bundle does not carry the package version.
+ *
+ * The `define` above is easy to delete in a refactor, and nothing else would
+ * notice: typecheck passes, tests pass (they run the TS sources, where the
+ * fallback applies), and the image starts fine — reporting the wrong version
+ * to the only person who is checking whether their deploy landed. That is not
+ * hypothetical; it is what happened to the constant this replaced.
+ */
+async function assertBundleReportsVersion(outfile: string, version: string): Promise<void> {
+  const bundle = await readFile(outfile, 'utf8');
+  if (bundle.includes(JSON.stringify(version))) return;
+  throw new Error(
+    `dist/server.js does not contain the package version ${version}, so the built server would ` +
+      'report a stale one. The `define` for `__SERVICE_VERSION__` is missing or has stopped working.',
+  );
+}
+
 async function main(): Promise<void> {
   const outfile = resolve(repoRoot, 'dist/server.js');
   await build({
@@ -74,8 +114,10 @@ async function main(): Promise<void> {
     external: ['express', 'pg', 'nodemailer', 'dotenv'],
     sourcemap: true,
     logLevel: 'info',
+    define: { __SERVICE_VERSION__: JSON.stringify(await packageVersion()) },
   });
   await assertBundleHasNoDynamicRequire(outfile);
+  await assertBundleReportsVersion(outfile, await packageVersion());
 }
 
 main().catch((cause: unknown) => {

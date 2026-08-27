@@ -11,4 +11,22 @@
  * It is DIAGNOSTIC ONLY. `protocolVersion`/`envelopeVersion` are the values
  * a client compares (PROTOCOL.md §6); this one is never compared by anyone.
  */
-export const SERVICE_VERSION = process.env.SERVICE_VERSION ?? '0.2.0';
+declare const __SERVICE_VERSION__: string | undefined;
+
+/**
+ * Resolution order, and why each step exists:
+ *
+ *  1. `SERVICE_VERSION` in the environment — lets an operator or a CI build
+ *     stamp a git sha without touching source.
+ *  2. `__SERVICE_VERSION__`, inlined by `scripts/build.ts` from `package.json`
+ *     at build time. This is what the shipped image reports.
+ *  3. `'0.0.0-dev'` — only reachable when running the TS sources directly.
+ *
+ * There is deliberately NO hand-maintained release number here any more. The
+ * previous constant said `'0.2.0'` while the 0.3.0 image was serving traffic,
+ * and that string is precisely what an operator reads to decide whether their
+ * deploy landed.
+ */
+export const SERVICE_VERSION =
+  process.env.SERVICE_VERSION ??
+  (typeof __SERVICE_VERSION__ === 'string' ? __SERVICE_VERSION__ : '0.0.0-dev');
