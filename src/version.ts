@@ -11,7 +11,6 @@
  * It is DIAGNOSTIC ONLY. `protocolVersion`/`envelopeVersion` are the values
  * a client compares (PROTOCOL.md §6); this one is never compared by anyone.
  */
-declare const __SERVICE_VERSION__: string | undefined;
 
 /**
  * Resolution order, and why each step exists:
@@ -27,6 +26,10 @@ declare const __SERVICE_VERSION__: string | undefined;
  * and that string is precisely what an operator reads to decide whether their
  * deploy landed.
  */
-export const SERVICE_VERSION =
-  process.env.SERVICE_VERSION ??
-  (typeof __SERVICE_VERSION__ === 'string' ? __SERVICE_VERSION__ : '0.0.0-dev');
+// SAFETY: `scripts/build.ts` replaces this exact member expression with a string
+// literal at build time (esbuild `define`). Running the TS sources leaves it
+// absent, which the `??` chain below handles — so the cast describes what the
+// build guarantees, not an assumption about untrusted input.
+const injected = (globalThis as { __SERVICE_VERSION__?: string }).__SERVICE_VERSION__;
+
+export const SERVICE_VERSION = process.env.SERVICE_VERSION ?? injected ?? '0.0.0-dev';

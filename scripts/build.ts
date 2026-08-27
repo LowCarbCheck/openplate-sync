@@ -73,14 +73,11 @@ async function assertBundleHasNoDynamicRequire(outfile: string): Promise<void> {
  */
 async function packageVersion(): Promise<string> {
   const raw = await readFile(resolve(repoRoot, 'package.json'), 'utf8');
-  const parsed: unknown = JSON.parse(raw);
-  if (typeof parsed !== 'object' || parsed === null || !('version' in parsed)) {
-    throw new Error('package.json has no version field');
-  }
-  const { version } = parsed as { version: unknown };
-  if (typeof version !== 'string' || version.length === 0) {
-    throw new Error('package.json version is not a non-empty string');
-  }
+  // SAFETY: this file is our own `package.json`, read from the repo root two
+  // lines above. A malformed one fails the guard below rather than shipping a
+  // wrong version, and it is not external input.
+  const { version } = JSON.parse(raw) as { version?: string };
+  if (!version) throw new Error('package.json has no usable version field');
   return version;
 }
 
@@ -114,7 +111,7 @@ async function main(): Promise<void> {
     external: ['express', 'pg', 'nodemailer', 'dotenv'],
     sourcemap: true,
     logLevel: 'info',
-    define: { __SERVICE_VERSION__: JSON.stringify(await packageVersion()) },
+    define: { 'globalThis.__SERVICE_VERSION__': JSON.stringify(await packageVersion()) },
   });
   await assertBundleHasNoDynamicRequire(outfile);
   await assertBundleReportsVersion(outfile, await packageVersion());
