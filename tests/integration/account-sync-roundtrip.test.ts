@@ -369,3 +369,127 @@ test('an unknown endpoint returns the documented JSON error shape', async () => 
   assert.equal(response.status, 404);
   assert.notEqual(response.body.error.length, 0);
 });
+
+/**
+ * The regression suite for the key-record CAS precision bug (M160 spec 06).
+ *
+ * Every OTHER CAS test in this repo hands `putKeyRecord` a `Date` it still
+ * holds in memory, at whatever precision the database chose. These two go the
+ * long way round instead — token out as an ISO-8601 string on the wire, token
+ * back in as that same string — because the truncation only happens on that
+ * trip, and skipping it is exactly why the bug survived to production.
+ */
+
+interface KeyRecordBody {
+  kind: string;
+  wrappedDek: string;
+  updatedAt: string;
+}
+
+interface ConflictBody {
+  currentUpdatedAt: string | null;
+}
+
+/** Creates the account's `recovery` record and returns its token exactly as a client sees it. */
+async function createRecoveryRecord(accessToken: string, seed: number): Promise<string> {
+  const created = await service.request<KeyRecordBody>({
+    method: 'PUT',
+    path: '/v1/sync/key-records/recovery',
+    accessToken,
+    body: { kdfDescriptor: null, wrappedDek: sampleWrappedDek(seed), expectedUpdatedAt: null },
+  });
+  assert.equal(created.status, 200);
+  return created.body.updatedAt;
+}
+
+test('key-record rotation survives a wire round-trip of its CAS token', async () => {
+  const { accountId, accessToken } = await signUp();
+  await createRecoveryRecord(accessToken, 41);
+
+  // The token as `regenerateRecoveryCode()` obtains it: from the LIST response,
+  // already serialised to JSON and parsed back. This is the whole point of the
+  // test — the value below is a string, not a `Date` kept from the insert.
+  const listed = await service.request<{ records: KeyRecordBody[] }>({
+    method: 'GET',
+    path: '/v1/sync/key-records',
+    accessToken,
+  });
+  assert.equal(listed.status, 200);
+  const observedToken = listed.body.records[0]?.updatedAt;
+  assert.ok(observedToken, 'the recovery record must be listed');
+
+  // ISO-8601 as this protocol emits it carries exactly three fractional
+  // digits. Anything the column can hold beyond them is unrepresentable here,
+  // and would be silently dropped on the way out.
+  assert.match(observedToken, /\.\d{3}Z$/);
+
+  // ...and the stored value must be fully expressible in that format, or the
+  // client is holding a truncation and the exact-equality CAS can never match.
+  //
+  // Read as TEXT deliberately. `pg` parses a `timestamp` into a JS `Date`,
+  // which is millisecond-only, so a driver-parsed value would agree with the
+  // wire even when the column holds a microsecond tail — the assertion would
+  // look right and prove nothing. Postgres's own rendering is the only view
+  // here that can still see the digits at issue.
+  const stored = await database.pool.query<{ updatedAtText: string }>(
+    'SELECT updated_at::text AS "updatedAtText" FROM sync_key_records WHERE account_id = $1',
+    [accountId],
+  );
+  assert.equal(stored.rows.length, 1);
+  assert.equal(
+    new Date(`${stored.rows[0]?.updatedAtText.replace(' ', 'T')}Z`).toISOString(),
+    observedToken,
+    'the wire token must be the whole stored value, not a truncation of it',
+  );
+  assert.doesNotMatch(
+    stored.rows[0]?.updatedAtText ?? '',
+    /\.\d{4,}$/,
+    'the column must not be able to hold a sub-millisecond tail the wire cannot carry',
+  );
+
+  const rotatedDek = sampleWrappedDek(42);
+  const rotated = await service.request<KeyRecordBody>({
+    method: 'PUT',
+    path: '/v1/sync/key-records/recovery',
+    accessToken,
+    body: { kdfDescriptor: null, wrappedDek: rotatedDek, expectedUpdatedAt: observedToken },
+  });
+  assert.equal(rotated.status, 200, 'a token read back over the wire must still win its CAS');
+  assert.equal(rotated.body.wrappedDek, rotatedDek);
+  assert.notEqual(rotated.body.updatedAt, observedToken, 'a successful rotation must mint a new token');
+});
+
+test('a stale token loses its key-record CAS, and the 409 reports a token that works', async () => {
+  const { accessToken } = await signUp();
+  const staleToken = await createRecoveryRecord(accessToken, 51);
+
+  const rotated = await service.request<KeyRecordBody>({
+    method: 'PUT',
+    path: '/v1/sync/key-records/recovery',
+    accessToken,
+    body: { kdfDescriptor: null, wrappedDek: sampleWrappedDek(52), expectedUpdatedAt: staleToken },
+  });
+  assert.equal(rotated.status, 200);
+  const currentToken = rotated.body.updatedAt;
+
+  // Replaying the now-superseded token is the genuine conflict this CAS exists
+  // for, and it must still be refused.
+  const replayed = await service.request<ConflictBody>({
+    method: 'PUT',
+    path: '/v1/sync/key-records/recovery',
+    accessToken,
+    body: { kdfDescriptor: null, wrappedDek: sampleWrappedDek(53), expectedUpdatedAt: staleToken },
+  });
+  assert.equal(replayed.status, 409);
+  assert.equal(replayed.body.currentUpdatedAt, currentToken, 'the 409 must name the REAL current token');
+
+  // And the retry the client is invited to make has to be able to succeed —
+  // the half of the promise the precision bug quietly broke.
+  const retried = await service.request<KeyRecordBody>({
+    method: 'PUT',
+    path: '/v1/sync/key-records/recovery',
+    accessToken,
+    body: { kdfDescriptor: null, wrappedDek: sampleWrappedDek(54), expectedUpdatedAt: replayed.body.currentUpdatedAt },
+  });
+  assert.equal(retried.status, 200, 'the token the 409 reported must be usable on the retry');
+});

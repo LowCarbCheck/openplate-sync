@@ -211,13 +211,33 @@ export const syncKeyRecords = pgTable(
     kdfDescriptor: jsonb('kdf_descriptor').$type<JsonObject>(),
     /** The account's DEK wrapped under this record's KEK, one packed `iv ‖ ciphertext‖tag` blob. Never unwrapped here. */
     wrappedDek: bytea('wrapped_dek').notNull(),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    /**
+     * MILLISECOND precision, deliberately — `timestamp(3)`, not the `timestamp(6)`
+     * a bare `timestamp()` gives you. Kept identical to `updatedAt` below so the
+     * two are comparable; see that column for the whole reason.
+     */
+    createdAt: timestamp('created_at', { precision: 3 }).defaultNow().notNull(),
     /**
      * Also this row's CAS token: `PUT /v1/sync/key-records/:kind` requires the
      * caller's `expectedUpdatedAt` to match exactly (or be `null`, asserting
      * no row exists yet) before a write is accepted.
+     *
+     * MILLISECOND precision is therefore LOAD-BEARING, not cosmetic. The token
+     * leaves here as an ISO-8601 string, which carries milliseconds; Postgres's
+     * `now()` carries MICROSECONDS. While this column was a bare `timestamp`
+     * (= `timestamp(6)`) an INSERT that let `defaultNow()` supply the value
+     * stored a µs tail the wire could not express, so the token a client read
+     * back was a truncation of the stored value and the exact-equality CAS
+     * matched zero rows — every rotation 409'd forever (M160 spec 06).
+     *
+     * Declaring the precision fixes the CLASS rather than the instance: the
+     * database now refuses to hold anything the protocol cannot round-trip, so
+     * the next writer who reaches for `defaultNow()` here cannot reintroduce
+     * the trap. `sync_shares` solves the same problem the other way, by writing
+     * JS `Date`s on insert — that works, but only for as long as every future
+     * insert remembers to.
      */
-    updatedAt: timestamp('updated_at')
+    updatedAt: timestamp('updated_at', { precision: 3 })
       .defaultNow()
       .$onUpdate(() => new Date())
       .notNull(),
@@ -281,14 +301,28 @@ export const syncShares = pgTable(
     wrappedDek: bytea('wrapped_dek').notNull(),
     /** Pinning metadata only (see the table doc) — never a key, and never served as one. */
     recipientKeyFingerprint: text('recipient_key_fingerprint').notNull(),
-    createdAt: timestamp('created_at').defaultNow().notNull(),
+    /** Millisecond precision, for the reason recorded on `updatedAt` below. */
+    createdAt: timestamp('created_at', { precision: 3 }).defaultNow().notNull(),
     /**
      * Also this row's CAS token, exactly as for `sync_key_records`: a
      * re-wrap after a DEK rotation can race a re-grant, so
      * `PUT /v1/sync/shares/:granteeAccountId` requires the caller's
      * `expectedUpdatedAt` to match (or be `null`, asserting no row yet).
+     *
+     * MILLISECOND PRECISION, DECLARED, NOT MERELY WRITTEN. A bare `timestamp`
+     * is `timestamp(6)`, and the wire carries ISO-8601 at millisecond
+     * precision — so a token read back over the wire is a TRUNCATION of what
+     * is stored, the exact `eq()` below it never matches, and every rotation
+     * 409s forever. That is not hypothetical: it shipped on
+     * `sync_key_records` and made "Regenerate recovery code" permanently
+     * impossible, with an error blaming another device.
+     *
+     * `putShare` also writes millisecond `Date`s, which is what kept this
+     * table correct before this line existed. That fixes the instance; this
+     * line fixes the class, because it stops the next writer who reaches for
+     * `defaultNow()` from bringing the trap back.
      */
-    updatedAt: timestamp('updated_at')
+    updatedAt: timestamp('updated_at', { precision: 3 })
       .defaultNow()
       .$onUpdate(() => new Date())
       .notNull(),

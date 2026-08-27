@@ -15,6 +15,20 @@
       "when": 1787823791135,
       "tag": "0001_pretty_senator_kelly",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787825676797,
+      "tag": "0002_majestic_junta",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1787826498144,
+      "tag": "0003_loving_the_enforcers",
+      "breakpoints": true
     }
   ]
 }

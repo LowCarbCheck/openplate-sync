@@ -14,6 +14,7 @@
     "build": "tsx scripts/build.ts",
     "sync-api": "tsx scripts/sync-api/main.ts",
     "typecheck": "tsc --noEmit",
+    "test": "pnpm run test:unit && pnpm run test:integration",
     "test:unit": "node --import tsx --test 'tests/unit/**/*.test.ts'",
     "test:integration": "node --import tsx --test --test-concurrency=1 'tests/integration/**/*.test.ts'",
     "lint": "oxlint --max-warnings 0",
