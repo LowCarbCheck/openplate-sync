@@ -149,9 +149,19 @@ different payload, different key, different lifecycle, and **no DEK is involved*
 compartment, so it survives a recovery restore and reaches a second device.
 
 ```
-pid = HMAC-SHA-256(root, "openplate-sync:study-pseudonym:v1" ‖ studyAccountId)
-      truncated to 128 bits, Crockford base32
+pid = HMAC-SHA-256(root, "openplate-sync:study-pseudonym:v1" ‖ uint64be(studyAccountId))
+      truncated to the leading 128 bits, Crockford base32, 26 characters
 ```
+
+**The bytes are fixed, because an underspecified concatenation is two
+implementations that disagree in one deployment.** The label is its UTF-8
+bytes with no terminator; `studyAccountId` is **8 bytes, unsigned,
+big-endian, always eight** — never its decimal text and never a
+minimal-length encoding. The output is the MAC's leading 16 bytes in the
+Crockford base32 alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ` (no check
+symbol, no hyphens), which is exactly 26 upper-case characters. A client
+deriving over the id's ASCII digits produces a well-formed pseudonym that
+joins up with nothing.
 
 Stable across a contributor's submissions, unlinkable across studies (HMAC
 outputs under different messages are independent), and underivable by anyone
