@@ -24,6 +24,7 @@ import { createDatabase, runMigrations, waitForDatabase } from './db/client.js';
 import { createDrizzleAccountStore } from './db/account-store.js';
 import { createDrizzleStorageAdapter } from './db/storage-adapter.js';
 import { createDrizzleAdminStore } from './db/admin-store.js';
+import { createDrizzleShareStore } from './db/share-store.js';
 import { deriveServerSecrets } from './lib/server-secrets.js';
 import { createThrottleStore } from './lib/throttle.js';
 import { generateFamilyId, generateToken } from './lib/tokens.js';
@@ -73,6 +74,10 @@ async function main(): Promise<void> {
   const admin =
     config.adminToken === null ? null : { token: config.adminToken, metadata: createDrizzleAdminStore(database.db) };
 
+  // `null` unless SYNC_SHARING is on, which leaves both share subtrees
+  // answering the ordinary unknown-path 404 — see `server/create-app.ts`.
+  const shares = config.sharingEnabled ? createDrizzleShareStore(database.db) : null;
+
   const app = createApp({
     authContext,
     storage: createDrizzleStorageAdapter(database.db),
@@ -80,6 +85,7 @@ async function main(): Promise<void> {
     logger,
     trustProxy: config.trustProxy,
     admin,
+    shares,
   });
 
   const server = app.listen(config.port, () => {
@@ -90,6 +96,7 @@ async function main(): Promise<void> {
       requireEmailVerification: config.requireEmailVerification,
       // Whether the operator API exists on this instance, never its token.
       adminApi: admin !== null,
+      sharing: shares !== null,
     });
   });
 

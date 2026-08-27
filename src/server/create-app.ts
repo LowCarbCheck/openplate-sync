@@ -26,17 +26,26 @@
  * commit that puts them in production — the indistinguishability has to be
  * true from the first one. See
  * `docs/adr/0001-an-admin-api-for-a-zero-knowledge-service.md`.
+ *
+ * THE SHARE TREE IS THE SAME BARGAIN, WITH ONE EXTRA CONSTRAINT. `SYNC_SHARING`
+ * unset means `/v1/sync/shares*` and `/v1/sync/shared*` answer the ordinary
+ * unknown-path 404 to everybody. Its terminator is mounted BEFORE the bearer
+ * middleware rather than after it, because those paths sit inside
+ * `SYNC_API_PREFIX`: mounted after, an unconfigured tree would answer 401 to
+ * an anonymous caller and announce that a credential exists worth guessing.
+ * See `docs/adr/0002-sharing-a-diary-without-giving-the-server-a-key.md`.
  */
 import express from 'express';
 import type { Express } from 'express';
 import { ENVELOPE_VERSION, PROTOCOL_VERSION, SYNC_API_PREFIX } from '../protocol.js';
 import type { ProtocolHandshake } from '../protocol.js';
-import type { SyncStorageAdapter } from '../contract-types.js';
+import type { SyncShareStore, SyncStorageAdapter } from '../contract-types.js';
 import type { AuthContext } from '../accounts/auth-handlers.js';
 import { registerAuthRoutes } from '../accounts/register-auth-routes.js';
 import { ADMIN_API_PREFIX, createAdminRoutes } from './admin-routes.js';
 import { createAdminAuthMiddleware } from './admin-auth.js';
 import { registerSyncRoutes } from './register-routes.js';
+import { SHARE_API_PREFIXES, registerShareRoutes } from './share-routes.js';
 import { createBearerAuthMiddleware, createEntitledUserResolver } from './bearer-auth.js';
 import { createCorsMiddleware } from './cors.js';
 import { createErrorMiddleware, handleNotFound } from './error-middleware.js';
@@ -70,6 +79,13 @@ export interface CreateAppOptions {
    * See the module header for why absence is a 404 rather than a 401.
    */
   admin?: AdminSurfaceOptions | null;
+  /**
+   * The share graph's storage, or `null`/absent for "this instance does not
+   * do sharing" — which is the default and what every deployment without
+   * `SYNC_SHARING` gets. Absence is a 404 on both share subtrees, not a
+   * mounted-but-refusing surface.
+   */
+  shares?: SyncShareStore | null;
 }
 
 export function createApp(options: CreateAppOptions): Express {
@@ -100,15 +116,46 @@ export function createApp(options: CreateAppOptions): Express {
   const requireAuth = createBearerAuthMiddleware(options.authContext);
   registerAuthRoutes(app, { ctx: options.authContext, throttle: options.throttle, requireAuth });
 
+  // THE SHARE TERMINATOR, AND WHY IT IS HERE AND NOT LOWER DOWN.
+  //
+  // `SYNC_SHARING` is unset on every deployment that has not deliberately
+  // turned sharing on. Both share subtrees then answer the ordinary
+  // unknown-path 404, to everybody, credentialed or not — the same bargain
+  // the admin tree makes, for the same reason (this service auto-deploys on
+  // push).
+  //
+  // The ORDER is the load-bearing part. These paths live inside
+  // `SYNC_API_PREFIX`, so the bearer middleware mounted just below would
+  // otherwise reach them first and answer 401 to an anonymous caller — which
+  // announces that a credential exists here worth guessing. Mounting the
+  // terminator ahead of authentication is what makes an unconfigured instance
+  // indistinguishable from one where the feature was never written.
+  const shares = options.shares ?? null;
+  if (shares === null) {
+    // No SYNC_SHARING on this instance: an explicit 404, never a bare absence.
+    for (const prefix of SHARE_API_PREFIXES) {
+      app.use(prefix, handleNotFound);
+    }
+  }
+
   // Every blob/key-record route is behind the bearer gate. `registerSyncRoutes`
   // still does its own `resolveEntitledUser` check — defence in depth, and the
   // seam a future entitlement rule would use.
   app.use(SYNC_API_PREFIX, requireAuth);
+  const resolveEntitledUser = createEntitledUserResolver();
   registerSyncRoutes(app, {
     storage: options.storage,
-    resolveEntitledUser: createEntitledUserResolver(),
+    resolveEntitledUser,
     logger: options.logger,
   });
+
+  // The share family, when this instance has one. It is handed the same
+  // caller resolver, and deliberately NOT a way to turn a caller into a
+  // target — see `share-routes.ts`'s header on the confused deputy that
+  // reusing this resolver for target selection would create.
+  if (shares !== null) {
+    registerShareRoutes(app, { shares, storage: options.storage, resolveEntitledUser });
+  }
 
   // The admin API, or nothing that admits to being one.
   //

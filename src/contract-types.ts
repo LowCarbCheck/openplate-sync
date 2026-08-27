@@ -73,6 +73,78 @@ export interface SyncStorageAdapter {
   deleteKeyRecord(input: { accountId: number; kind: SyncKeyRecordKind }): Promise<void>;
 }
 
+/**
+ * A share row, as the grantee sees it (ADR-0002). `wrappedDek` is the frozen
+ * 125-byte asymmetric wrap; the service stores and returns it verbatim and
+ * holds no key for it.
+ */
+export interface SyncShare {
+  /** The grantor — whose blob this wrap opens. */
+  accountId: number;
+  /** The grantee — whose public key the wrap is addressed to. */
+  granteeAccountId: number;
+  wrappedDek: Uint8Array;
+  /** Pinning metadata. Never a key, and the service never endorses it. */
+  recipientKeyFingerprint: string;
+  createdAt: Date;
+  /** The CAS token, exactly as `SyncKeyRecord.updatedAt` is. */
+  updatedAt: Date;
+}
+
+/**
+ * A share row WITHOUT its wrap — the shape the grantor is allowed to see.
+ *
+ * This is a separate type rather than an `Omit<>` at the route, because the
+ * point is that the wrap is never SELECTed for the grantor's list at all: the
+ * grantor has no use for a blob addressed to somebody else's key, so it does
+ * not travel to where nobody needs it (ADR-0002).
+ */
+export interface SyncShareSummary {
+  accountId: number;
+  granteeAccountId: number;
+  recipientKeyFingerprint: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Mirrors {@link PutKeyRecordResult}: a losing CAS reports the real current token, never a blind upsert. */
+export type PutShareResult = { ok: true; share: SyncShare } | { ok: false; currentUpdatedAt: Date | null };
+
+/**
+ * Storage for the share graph, kept OUT of {@link SyncStorageAdapter} on
+ * purpose. The owner-only blob/key-record routes must not be able to reach
+ * the share tables even by accident, and an instance with `SYNC_SHARING`
+ * unset does not construct this at all.
+ */
+export interface SyncShareStore {
+  /**
+   * CAS write: `expectedUpdatedAt: null` asserts "no share to this grantee
+   * exists yet"; any other value asserts "the row I last read had exactly
+   * this `updatedAt`" (a re-wrap after rotation). `no-such-account` is the
+   * grantee foreign key refusing a grant to an account that does not exist —
+   * reported rather than thrown so the route can answer it without a 500.
+   */
+  putShare(input: {
+    accountId: number;
+    granteeAccountId: number;
+    wrappedDek: Uint8Array;
+    recipientKeyFingerprint: string;
+    expectedUpdatedAt: Date | null;
+  }): Promise<PutShareResult | { ok: false; reason: 'no-such-account' }>;
+  /** The grantor's own grants. Returns summaries — the wrap is never selected here. */
+  listSharesByGrantor(accountId: number): Promise<SyncShareSummary[]>;
+  /** What has been shared WITH this account. The wrap travels, because only this caller can open it. */
+  listSharesByGrantee(granteeAccountId: number): Promise<SyncShare[]>;
+  /**
+   * The single authorisation lookup for the grantee read path. Checked on
+   * EVERY request and never cached — that is what makes a revoke effective
+   * on the next request (ADR-0002's Tier 1).
+   */
+  getShare(input: { accountId: number; granteeAccountId: number }): Promise<SyncShare | null>;
+  /** Hard delete, from either end. Idempotent: deleting a row that is not there is not an error. */
+  deleteShare(input: { accountId: number; granteeAccountId: number }): Promise<void>;
+}
+
 /** The caller a request resolves to. M128 spec 02 replaces the "entitlement" framing with this service's own accounts. */
 export interface SyncEntitledUser {
   userId: number;
@@ -89,4 +161,17 @@ export interface SyncHostContext {
    * can see is a capacity cliff discovered by a user.
    */
   logger?: Logger;
+}
+
+/**
+ * What `registerShareRoutes` needs. It takes `storage` only to read the
+ * GRANTOR's blob by an explicitly-named id — the caller and the target are
+ * separate values here, which is the whole point of not reusing
+ * `resolveEntitledUser` to pick the target (ADR-0002: doing so would make a
+ * grantee BECOME the grantor, including on the write and key-record paths).
+ */
+export interface SyncShareHostContext {
+  shares: SyncShareStore;
+  storage: SyncStorageAdapter;
+  resolveEntitledUser: (req: Request) => Promise<SyncEntitledUser | null>;
 }

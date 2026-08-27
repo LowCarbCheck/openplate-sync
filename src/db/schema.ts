@@ -17,8 +17,19 @@
  * rather than a port of the app's history: zero production blobs ever
  * existed, so there was nothing to migrate — only DDL to re-home.
  */
-import { relations, type InferInsertModel, type InferSelectModel } from 'drizzle-orm';
-import { customType, index, integer, jsonb, pgTable, serial, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core';
+import { relations, sql, type InferInsertModel, type InferSelectModel } from 'drizzle-orm';
+import {
+  check,
+  customType,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  serial,
+  text,
+  timestamp,
+  uniqueIndex,
+} from 'drizzle-orm/pg-core';
 import type { SyncKeyRecordKind } from '../protocol.js';
 import type { AccountTokenKind } from '../lib/tokens.js';
 import type { KdfDescriptor } from '../lib/kdf-descriptor.js';
@@ -218,6 +229,87 @@ export type InsertSyncKeyRecord = InferInsertModel<typeof syncKeyRecords>;
 export type SelectSyncKeyRecord = InferSelectModel<typeof syncKeyRecords>;
 
 // =============================================================================
+// Sync shares (ADR-0002 — sharing a diary without giving the server a key)
+// =============================================================================
+
+/**
+ * A THIRD WRAP of an account's DEK, addressed to another account's public key.
+ *
+ * The server's position is unchanged by this table: it holds one more blob it
+ * has no key for. `wrappedDek` here is the ADR's frozen 125-byte
+ * `ephPub(65) ‖ iv(12) ‖ AES-256-GCM(KEK_share, DEK, aad=...)` construction,
+ * and the AAD binds the wrap to its grantor and its recipient key — so a
+ * malicious server splicing one patient's wrap into another patient's row
+ * produces a tag failure rather than a misattributed diary.
+ *
+ * WHY THIS IS NOT A `kind` ON `sync_key_records`. That table's invariant is
+ * one row per (account, kind), both kinds owner-held, both rotating together
+ * through the atomic credential change of PROTOCOL.md §5.14. A share is
+ * multi-valued, is held by a DIFFERENT principal, has a grant/revoke
+ * lifecycle rather than create/rotate, and must never ride through
+ * change-passphrase or reset — those rotate KEKs, and a share has no KEK to
+ * rotate. A nullable discriminator would make the unique index partial and
+ * fork every kind-validation branch.
+ *
+ * THE GRANTEE'S PUBLIC KEY IS NOT STORED HERE, only a fingerprint used for
+ * pinning. Storing the key would make this service the clinician key
+ * directory ADR-0002 rejects outright — a trust role a zero-knowledge service
+ * does not have. The full public key is pinned inside the grantor's own
+ * encrypted snapshot.
+ *
+ * REVOCATION IS A HARD DELETE. There is deliberately no tombstone column: a
+ * whole-database restore predates the revoke and so lacks the tombstone too,
+ * which means it cannot prevent what it never contains, and re-creating a row
+ * needs the grantor's own bearer token AND a fresh wrap only the grantor's
+ * client can produce — a re-grant, which is a legitimate act. Against that
+ * zero defensive value stands a permanent server-side assertion that a named
+ * patient was under a named clinician's care, outliving its own revocation.
+ */
+export const syncShares = pgTable(
+  'sync_shares',
+  {
+    id: serial('id').primaryKey(),
+    /** The grantor — the account whose blob is being shared. Cascades: deleting it kills every grant it made. */
+    accountId: integer('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** The grantee — the account the wrap is addressed to. Cascades: deleting it kills every wrap aimed at it. */
+    granteeAccountId: integer('grantee_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** The grantor's DEK wrapped to the grantee's public key. Opaque here; the service holds no key for it. */
+    wrappedDek: bytea('wrapped_dek').notNull(),
+    /** Pinning metadata only (see the table doc) — never a key, and never served as one. */
+    recipientKeyFingerprint: text('recipient_key_fingerprint').notNull(),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+    /**
+     * Also this row's CAS token, exactly as for `sync_key_records`: a
+     * re-wrap after a DEK rotation can race a re-grant, so
+     * `PUT /v1/sync/shares/:granteeAccountId` requires the caller's
+     * `expectedUpdatedAt` to match (or be `null`, asserting no row yet).
+     */
+    updatedAt: timestamp('updated_at')
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    // The stable identity of a share is the (grantor, grantee) PAIR — that is
+    // what has to survive a DEK rotation, and it is why both sides of the API
+    // address a share by the counterpart's account id and never by `id`.
+    uniqueIndex('sync_shares_pair_idx').on(table.accountId, table.granteeAccountId),
+    // The grantee's "what has been shared with me" read.
+    index('sync_shares_grantee_idx').on(table.granteeAccountId),
+    // A self-share is nonsense the schema can refuse outright: the wrap would
+    // be addressed to a key the account already has a plainer route to.
+    check('sync_shares_not_self', sql`${table.accountId} <> ${table.granteeAccountId}`),
+  ],
+);
+
+export type InsertSyncShare = InferInsertModel<typeof syncShares>;
+export type SelectSyncShare = InferSelectModel<typeof syncShares>;
+
+// =============================================================================
 // Relations
 // =============================================================================
 
@@ -225,6 +317,10 @@ export const accountsRelations = relations(accounts, ({ many }) => ({
   tokens: many(accountTokens),
   blobs: many(syncBlobs),
   keyRecords: many(syncKeyRecords),
+  // Both directions of the share graph hang off the same account row; the
+  // relation names say which end this account is standing at.
+  sharesGranted: many(syncShares, { relationName: 'sharesGranted' }),
+  sharesReceived: many(syncShares, { relationName: 'sharesReceived' }),
 }));
 
 export const accountTokensRelations = relations(accountTokens, ({ one }) => ({
@@ -237,4 +333,17 @@ export const syncBlobsRelations = relations(syncBlobs, ({ one }) => ({
 
 export const syncKeyRecordsRelations = relations(syncKeyRecords, ({ one }) => ({
   account: one(accounts, { fields: [syncKeyRecords.accountId], references: [accounts.id] }),
+}));
+
+export const syncSharesRelations = relations(syncShares, ({ one }) => ({
+  grantor: one(accounts, {
+    fields: [syncShares.accountId],
+    references: [accounts.id],
+    relationName: 'sharesGranted',
+  }),
+  grantee: one(accounts, {
+    fields: [syncShares.granteeAccountId],
+    references: [accounts.id],
+    relationName: 'sharesReceived',
+  }),
 }));

@@ -86,6 +86,18 @@ export interface ServiceConfig {
    * be indistinguishable from one where the feature was never written.
    */
   adminToken: string | null;
+  /**
+   * Whether this instance implements ADR-0002's clinician sharing.
+   *
+   * `false` — the default, and what every deployment gets until an operator
+   * deliberately turns it on — is not "mounted but refusing". Both share
+   * subtrees answer the ordinary unknown-path 404, to everybody
+   * (`server/create-app.ts`), for the same reason the admin API does: this
+   * service auto-deploys on push, so the commit that adds a route is the
+   * commit that puts it in production, and an instance that has not opted in
+   * must be indistinguishable from one where the feature was never written.
+   */
+  sharingEnabled: boolean;
   logLevel: LogLevel;
   email: EmailSettings;
 }
@@ -180,6 +192,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
     clientBaseUrl: normalizeBaseUrl(required(env, 'CLIENT_BASE_URL')),
     trustProxy: parseTrustProxy(env),
     adminToken: parseAdminToken(env),
+    sharingEnabled: parseBoolean(env, 'SYNC_SHARING', false),
     logLevel: parseLogLevel(env),
     email: {
       from: optional(env, 'EMAIL_FROM', 'openplate-sync <noreply@localhost>'),

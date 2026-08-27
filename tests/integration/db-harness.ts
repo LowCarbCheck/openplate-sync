@@ -73,7 +73,7 @@ export async function setupTestDatabase(): Promise<TestDatabase> {
       // One statement, CASCADE, identity restart: fast, and it exercises the
       // real foreign keys rather than deleting in a hand-maintained order.
       await handle.pool.query(
-        'TRUNCATE TABLE account_tokens, sync_blobs, sync_key_records, accounts RESTART IDENTITY CASCADE',
+        'TRUNCATE TABLE account_tokens, sync_blobs, sync_key_records, sync_shares, accounts RESTART IDENTITY CASCADE',
       );
     },
   };

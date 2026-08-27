@@ -17,6 +17,7 @@ import { createApp } from '../../src/server/create-app.js';
 import { createDrizzleAccountStore } from '../../src/db/account-store.js';
 import { createDrizzleStorageAdapter } from '../../src/db/storage-adapter.js';
 import { createDrizzleAdminStore } from '../../src/db/admin-store.js';
+import { createDrizzleShareStore } from '../../src/db/share-store.js';
 import { createSilentLogger } from '../../src/logger.js';
 import { createThrottleStore, type ThrottleConfig } from '../../src/lib/throttle.js';
 import { generateFamilyId, generateToken } from '../../src/lib/tokens.js';
@@ -24,6 +25,7 @@ import { deriveServerSecrets } from '../../src/lib/server-secrets.js';
 import type { AuthContext } from '../../src/accounts/auth-handlers.js';
 import type { MailMessage, MailResult } from '../../src/mail/transport.js';
 import type { Database } from '../../src/db/client.js';
+import { SHARE_WRAPPED_DEK_BYTES } from '../../src/server/share-routes.js';
 
 export interface HttpResponse<T> {
   status: number;
@@ -74,6 +76,12 @@ export interface StartServiceOptions {
    * unknown-path 404. `admin-api.test.ts` opts in.
    */
   adminToken?: string | null;
+  /**
+   * Absent (the default) boots the service the way every deployment boots
+   * today: `SYNC_SHARING` unset, and both share subtrees answering the
+   * ordinary unknown-path 404. `sharing.test.ts` opts in.
+   */
+  sharing?: boolean;
 }
 
 export async function startService(options: StartServiceOptions): Promise<ServiceHarness> {
@@ -108,6 +116,7 @@ export async function startService(options: StartServiceOptions): Promise<Servic
       options.adminToken === undefined || options.adminToken === null
         ? null
         : { token: options.adminToken, metadata: createDrizzleAdminStore(options.db) },
+    shares: options.sharing === true ? createDrizzleShareStore(options.db) : null,
   });
 
   const server: Server = app.listen(0);
@@ -169,4 +178,13 @@ export function sampleWrappedDek(seed = 9): string {
 
 export function sampleCiphertext(seed = 3, bytes = 256): string {
   return Buffer.alloc(bytes, seed).toString('base64');
+}
+
+/**
+ * A structurally valid share wrap: ADR-0002's frozen 125 bytes
+ * (`ephPub(65) ‖ iv(12) ‖ AES-256-GCM(...)`). The service never looks inside
+ * it, but it does check the length, so a test wrap has to be the right size.
+ */
+export function sampleShareWrap(seed = 5): string {
+  return Buffer.alloc(SHARE_WRAPPED_DEK_BYTES, seed).toString('base64');
 }
