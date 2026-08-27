@@ -92,6 +92,52 @@ parse:  split(iv, rest) ─► AES-256-GCM decrypt ─► gunzip ─► UTF-8 �
 
 Conflicts are resolved per entity by `(lamport, deviceId)`: higher Lamport counter wins; ties break on lexicographic `deviceId`. Device wall-clock is explicitly **not** an ordering authority — it drifts and is trivially wrong across devices. A tombstone participates in the same comparison as a live value. Accepted v1 trade-off: whole-record last-writer-wins, so a concurrent offline edit to the _same_ entity on two devices loses the older write silently. No field-level merge, no conflict UI.
 
+### 3.4 The share wrap (ADR-0002)
+
+A **share** is a third wrapping of the same DEK, addressed to another account's
+public key. The server stores it, serves it to the one account it is addressed
+to, and holds no key for it — §9.1 is unchanged by this feature.
+
+```
+sender (grantor, holding recipientPub):
+  (ephPriv, ephPub) ← ECDH P-256, fresh per wrap, discarded after
+  Z         ← ECDH(ephPriv, recipientPub)
+  KEK_share ← HKDF-SHA-256(salt = empty, IKM = Z,
+                           info = "openplate-sync:share-kek:p256:v1")
+  AAD       ← UTF-8 of canonical fixed-key-order JSON:
+              {"grantorAccountId":<int>,"recipientKeyFingerprint":"<base64>"}
+  wrap      ← ephPub(65, uncompressed SEC1) ‖ iv(12) ‖ AES-256-GCM(KEK_share, DEK, aad=AAD)
+```
+
+- **Length is 125 bytes**, always. Note this is a *different* invariant from
+  §3.2's 60-byte wrapped DEK: 60 for a key record, 125 for a share. They live in
+  different tables and no shared validation path branches on length.
+- **P-256**, and the curve is named in the label rather than only the version, so
+  a future construction is a new label instead of an ambiguity about `:v1`.
+- **The empty HKDF salt is correct**, on the same RFC 5869 §3.1 grounds §3.1
+  already records for the recovery code: the IKM is a fresh, high-entropy ECDH
+  output, not a human secret needing a memory-hard stretch.
+- **This wrap carries AAD; the §3.2 wrapped DEKs do not.** A key-record wrap is
+  scoped by an owner-only row and cannot be confused with anyone else's. A share
+  wrap sits in a server-controlled association table, where it could be: binding
+  it means a spliced row fails its tag check rather than decrypting into the
+  wrong diary.
+- **The AAD binds the recipient's key fingerprint, not the grantee's account id.**
+  Substitution attacks the key, so the key is what the binding names — and the
+  grantee reconstructs the AAD from a fingerprint computed locally, so no
+  server-supplied value enters the trust path.
+- `recipientKeyFingerprint` is `SHA-256` of the raw uncompressed public key. The
+  server stores it as pinning metadata and **never** endorses, serves or
+  generates a public key; the authoritative pinned key lives inside the
+  grantor's own encrypted snapshot.
+
+**A grantee must trial-decrypt.** §3.2's blob AAD binds `payloadSchemaVersion`,
+which §7 defines as an opaque integer that never appears on the wire. An owner
+knows its own; a grantee does not know the grantor's. So a grantee attempts
+decryption across the schema versions its build supports and takes the one whose
+GCM tag verifies. This is cheap, and it is the intended behaviour — do not add a
+plaintext schema-version field to solve it.
+
 ## 4. Transport conventions
 
 - All request and response bodies are `application/json`.
@@ -231,6 +277,8 @@ Responses:
 `204`, no body. Idempotent — deleting a record that does not exist is still `204`.
 
 > Deleting the **only remaining** key record makes every stored blob permanently undecryptable. The server does not prevent this; a client must not offer it without an unmistakable warning.
+>
+> **A share (§5.16) does not count as a key record here.** It is cryptographically a third wrap of the same DEK, but it is another person's capability — revocable by them, unverifiable by you, and dependent on their continued cooperation and honesty. Deleting both key records still bricks the account with live shares in existence, and no client may ever offer "recover your data through your dietician" as a recovery path.
 
 ### 5.6 `GET /health` — version handshake
 
@@ -353,6 +401,45 @@ Both bearer.
 
 Deletion removes the account and, by cascade, every blob and key record it owns. There is no soft delete and no grace period. This is the self-serve erasure path, and it is complete by construction rather than by a cleanup job someone has to remember to run.
 
+### 5.16 Shares — `/v1/sync/shares` and `/v1/sync/shared` (ADR-0002)
+
+**Present only when the deployment sets `SYNC_SHARING`.** Without it every path
+below answers the ordinary unknown-route `404`, to every caller, credentialed or
+not — the terminator is mounted *ahead* of authentication, so an unconfigured
+instance is indistinguishable from one where the feature was never written.
+
+Both sides address a share by the **counterpart's account id**, never by a
+synthetic share id: the stable identity of a share is the (grantor, grantee)
+pair, and that is what survives a DEK rotation.
+
+**Grantor side.**
+
+| Verb | Path | Notes |
+| --- | --- | --- |
+| `PUT` | `/shares/:granteeAccountId` | `{"wrappedDek": "<base64>", "recipientKeyFingerprint": "<string>", "expectedUpdatedAt": "<iso>" \| null}`. CAS exactly as §5.4: `null` asserts no share exists yet, any other value asserts the row last read had this `updatedAt`, and an **absent** key is a `400`. `409` returns `{"currentUpdatedAt": "<iso>" \| null}`. |
+| `GET` | `/shares` | The grantor's own grants. **Never returns `wrappedDek`** — a blob addressed to somebody else's key has no use here, so it does not travel where nobody needs it. |
+| `DELETE` | `/shares/:granteeAccountId` | `204`, idempotent. A **hard delete**; there is no tombstone. |
+
+**Grantee side.**
+
+| Verb | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/shared` | Shares addressed to this caller, each with its `wrappedDek` — only this caller can open it. |
+| `GET` | `/shared/:grantorAccountId/blob` | `{"grantorAccountId": <int>, "blobVersion": <int>, "envelopeVersion": <int>, "ciphertext": "<base64>", "createdAt": "<iso>"}`. **`grantorAccountId` is required**: §3.2's AAD binds it, so a grantee without it cannot decrypt at all. |
+| `DELETE` | `/shared/:grantorAccountId` | `204`, idempotent. Lets a grantee drop a share aimed at them. |
+
+- **The grantee surface has no write verbs against the grantor**, and serves only
+  the caller's own share row, the grantor's current blob, and `grantorAccountId`.
+  Never the grantor's key records, KDF descriptor, verifier, email or display
+  name. A grantee who could pull the grantor's `recovery` wrapped DEK would be
+  one brute-forced recovery code away from rotation authority over that account.
+- **Only the current blob.** The retained version ring is an owner-recovery
+  mechanism, not a grantee timeline.
+- **Authorisation is a live row read on every request, never cached.** That is
+  what makes a `DELETE` effective on the very next call.
+- Unknown, foreign and never-pushed all answer the **same** `404`. Absence of a
+  share must not confirm that an account exists.
+
 ## 6. Version handshake — required, and required to fail closed
 
 **A client MUST read this document from the service and check it before its first sync of a session.**
@@ -411,6 +498,7 @@ Being honest about the metadata, because "end-to-end encrypted" is often heard a
 - **Whether an account has completed setup** (has key records) and whether it has ever synced (has a blob).
 - **The account itself**: an email address, an optional display name, an authentication verifier (a keyed hash of a keyed hash of the passphrase — see §5.8), the account's KDF parameters, and whether the address has been confirmed.
 - **Session metadata**: how many active sessions exist, when each was created, and when tokens were last rotated or revoked. Token values themselves are stored only as digests.
+- **The sharing graph**, on a deployment with `SYNC_SHARING` set (§5.16): which account has granted read access to which other account, when the grant was made, and when the grantee exercises it. That is a relationship graph, and a genuine expansion of what this service knows, and in the setting the feature was built for — a patient and their dietician — an edge in that graph is itself health-adjacent personal data, because it says someone is under care. It is the minimum needed to authorise the read; both ends consent, since the grantor creates the row and the grantee can delete their side; and the edge is hard-deleted on revocation and cascades away when either account is deleted. A deployment that does not set `SYNC_SHARING` stores no such graph and has no table to put one in.
 
 Not knowable from the above: what was eaten, when, how much, or anything else inside the payload.
 
