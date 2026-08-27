@@ -377,10 +377,42 @@ nothing. A second blob with its own key records would buy the same properties
 with new endpoints, new key-record kinds and a two-repo change, to store what is
 architecturally a mini key-record pair.
 
-Lifecycle is symmetric with what the client already does: a passphrase change
-rewraps the `K_pp` slot in the same moment it rewraps the key records, a
-recovery reset opens via `K_pr` and rewraps both, and a DEK rotation does not
-touch the CDK at all.
+Lifecycle follows what the client already does, with three corrections found in
+implementation and recorded here because the first draft of this section was
+wrong about all three.
+
+- **A passphrase change rewraps the `K_pp` slot** — but *not* "in the same
+  moment", which is not achievable. The key records ride in one atomic auth
+  request; the compartment lives in the blob and needs a second write. There is
+  an unavoidable residual window. The ordering is chosen so the device that can
+  repair it is the device that caused it, and a failure to rewrap is **not**
+  reported as a failed passphrase change: the credential change already
+  succeeded, and saying otherwise would invite the user to repeat it.
+- **Regenerating the recovery code must rewrap slot 2**, which the first draft
+  omitted entirely. Rotating the recovery key record without rewrapping the
+  compartment would leave it openable only by the code the user has just been
+  told to discard. This is also the upgrade path: an account predating the
+  partition gets a compartment here.
+- **A recovery-code reset** rewrites both slots while the code is still in the
+  call frame. The **no-recovery-code** branch cannot — there is no session and
+  no decryptable blob at that point — so such an account has no compartment
+  until the next recovery-code regeneration. Degraded but safe: the key material
+  stays on the device rather than being published in the clear.
+- **A DEK rotation does not touch the CDK at all.**
+
+**The compartment lives on the wire, not in the local store.** The device store
+and the backup file keep `shareIdentity` and `sharePeers` in the clear, because
+only a blob is ever handed to a second person. Stripping them from the backup
+would leave a restored device unable to open any patient's wrap — solving a
+disclosure problem by breaking recovery.
+
+**The snapshot version is a safety interlock here, not a migration.** The local
+shape does not change, so an older backup imports unchanged. The version is
+bound into the envelope AAD, and that is the point: without a bump, a client
+built before the partition would decrypt a partitioned blob, strip the
+compartment as an unknown key, and push the result back — destroying the
+account's share keys with nothing failing anywhere. With the bump it gets a tag
+failure instead.
 
 **Residual disclosure, stated:** a grantee still sees that a compartment exists
 and roughly how large it is, which leaks an approximate peer count. Real, minor,
