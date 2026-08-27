@@ -138,6 +138,64 @@ decryption across the schema versions its build supports and takes the one whose
 GCM tag verifies. This is cheap, and it is the intended behaviour — do not add a
 plaintext schema-version field to solve it.
 
+### 3.5 The research contribution envelope (ADR-0003)
+
+A **contribution** is a reduced, date-bounded slice of the diary, encrypted to a
+study's public key. It is a different artifact from a share, not a narrower one:
+different payload, different key, different lifecycle, and **no DEK is involved**
+— the wrap is over the payload directly.
+
+**The pseudonym.** A per-account random 256-bit root lives in the owner-private
+compartment, so it survives a recovery restore and reaches a second device.
+
+```
+pid = HMAC-SHA-256(root, "openplate-sync:study-pseudonym:v1" ‖ studyAccountId)
+      truncated to 128 bits, Crockford base32
+```
+
+Stable across a contributor's submissions, unlinkable across studies (HMAC
+outputs under different messages are independent), and underivable by anyone
+holding both the account table and a cohort. `H(accountId ‖ studyId)` would
+*not* have that last property: with public inputs it reverses by enumeration.
+
+The pseudonym defends against the **researcher**, not the server. The server
+authenticates the push by bearer token and therefore knows the account behind
+every row regardless — see §9.2.
+
+**The envelope.**
+
+```
+  (ephPriv, ephPub) ← ECDH P-256, fresh per contribution
+  Z         ← ECDH(ephPriv, studyPub)
+  KEK       ← HKDF-SHA-256(salt = empty, IKM = Z,
+                           info = "openplate-sync:research-kek:p256:v1")
+  AAD       ← UTF-8 of canonical fixed-key-order JSON:
+              {"studyAccountId":<int>,"pseudonym":"<string>",
+               "contributionVersion":<int>,"schemaTier":"<string>",
+               "studyKeyFingerprint":"<base64>"}
+  body      ← ephPub(65) ‖ iv(12) ‖ AES-256-GCM(KEK, payload, aad = AAD)
+```
+
+A new frozen label rather than a version of the share label: different purpose,
+same reasoning that put the curve in the name.
+
+**The AAD carries no account id, and neither does any study-side response.**
+This is the deliberate inversion of §5.16, where `grantorAccountId` is required
+because §3.2's AAD binds it. Every AAD field here is reconstructible by the
+researcher before decryption — four ride in the response, and the fingerprint she
+computes locally from her own key.
+
+**The payload is a fixed tier**, selected by name. A study chooses a tier and a
+window; it never supplies a field list. v1 defines one:
+
+`daily-intake:v1` — one row per calendar day in the window, with `date` (day
+granularity, no timestamps), `energyKcal`, `proteinG`, `carbsG`, `fatG`,
+`fiberG`, `loggedEntryCount`. The count exists because a researcher cannot
+otherwise tell "ate nothing" from "did not log"; it is a count, never the
+entries.
+
+A new field is a protocol revision, never a configuration. See ADR-0003.
+
 ## 4. Transport conventions
 
 - All request and response bodies are `application/json`.
@@ -509,6 +567,33 @@ Deleting a share row stops the server serving; rotating adds that future
 entries are sealed with a key the revoked party never had. Neither repossesses
 what was already downloaded, and no client may say otherwise.
 
+### 5.18 Research contributions — `/v1/sync/contributions` and `/v1/sync/study` (ADR-0003)
+
+**Present only when the deployment sets `SYNC_RESEARCH`.** Absent, every path
+below answers the ordinary unknown-route 404 to every caller, credentialed or
+not, with the terminator mounted ahead of authentication. Independent of
+`SYNC_SHARING`; neither flag implies the other.
+
+**Contributor side**, authenticated as the contributor:
+
+| Verb | Path | Notes |
+| --- | --- | --- |
+| `PUT` | `/contributions/:studyAccountId` | `{"pseudonym","schemaTier","body","contributionVersion"}`. CAS on a monotonic `contributionVersion`. The contribution is the cumulative dataset for the window, recomputed and re-pushed whole — the client always holds the source, so this row is a projection, never a primary copy. |
+| `GET` | `/contributions` | The contributor's own enrolments. Never returns `body`. |
+| `DELETE` | `/contributions/:studyAccountId` | **Withdrawal.** One transaction: hard-delete the row, insert a pseudonym-keyed tombstone. `204`, idempotent. |
+
+**Study side**, authenticated as the study account:
+
+| Verb | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/study/contributions` | `{"pseudonym","contributionVersion","schemaTier","body","createdAt"}` per row. **No account id, ever.** |
+| `GET` | `/study/withdrawals` | Pseudonyms that withdrew, with timestamps. The study client must purge these before presenting or exporting anything. |
+
+**Withdrawal is genuinely erasing on this side.** A contribution the study has
+not yet pulled reaches nobody. What the study already pulled cannot be
+repossessed — the tombstone carries the instruction, and honouring it is an
+ethics obligation this system states and cannot enforce.
+
 ## 6. Version handshake — required, and required to fail closed
 
 **A client MUST read this document from the service and check it before its first sync of a session.**
@@ -567,6 +652,18 @@ Being honest about the metadata, because "end-to-end encrypted" is often heard a
 - **Whether an account has completed setup** (has key records) and whether it has ever synced (has a blob).
 - **The account itself**: an email address, an optional display name, an authentication verifier (a keyed hash of a keyed hash of the passphrase — see §5.8), the account's KDF parameters, and whether the address has been confirmed.
 - **Session metadata**: how many active sessions exist, when each was created, and when tokens were last rotated or revoked. Token values themselves are stored only as digests.
+- **The study graph**, on a deployment with `SYNC_RESEARCH` set (§5.18): which
+  account contributes to which study, when, how often, and how large each
+  contribution is. An edge here says "this person's health data is in study Y",
+  which is health-adjacent personal data of the same class as the care edge
+  below. It is **unavoidable**, and withdrawal is the proof: erasing a
+  contributor's row requires locating it, account deletion must cascade through
+  it, and both the compare-and-swap and abuse control key on the account. A
+  scheme that blinded the server would break one of those and traffic analysis
+  would un-blind it anyway, so this is disclosed rather than half-avoided. The
+  researcher never receives the mapping (§5.18 carries no account id),
+  withdrawal hard-deletes the edge and leaves only a pseudonym, and a deployment
+  without the flag has no table to hold a study graph.
 - **The sharing graph**, on a deployment with `SYNC_SHARING` set (§5.16): which account has granted read access to which other account, when the grant was made, and when the grantee exercises it. That is a relationship graph, and a genuine expansion of what this service knows, and in the setting the feature was built for — a patient and their dietician — an edge in that graph is itself health-adjacent personal data, because it says someone is under care. It is the minimum needed to authorise the read; both ends consent, since the grantor creates the row and the grantee can delete their side; and the edge is hard-deleted on revocation and cascades away when either account is deleted. A deployment that does not set `SYNC_SHARING` stores no such graph and has no table to put one in.
 
 Not knowable from the above: what was eaten, when, how much, or anything else inside the payload.
