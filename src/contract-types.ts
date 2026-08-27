@@ -175,3 +175,59 @@ export interface SyncShareHostContext {
   storage: SyncStorageAdapter;
   resolveEntitledUser: (req: Request) => Promise<SyncEntitledUser | null>;
 }
+
+// =============================================================================
+// Atomic DEK rotation (ADR-0002 Tier 2)
+// =============================================================================
+
+/** One re-wrapped key record inside a rotation. Same rules as PROTOCOL.md §5.4, minus the per-record CAS token. */
+export interface RotateDekKeyRecordInput {
+  kind: SyncKeyRecordKind;
+  kdfDescriptor: JsonObject | null;
+  wrappedDek: Uint8Array;
+}
+
+/** One share the grantor is KEEPING, re-wrapped to the same recipient key under the new DEK. */
+export interface RotateDekShareInput {
+  granteeAccountId: number;
+  wrappedDek: Uint8Array;
+  recipientKeyFingerprint: string;
+}
+
+/**
+ * A whole rotation, as one submission. Everything here lands together or
+ * nothing does — see {@link SyncRotationStore}.
+ *
+ * `shares` is the KEEP list, and that inverts PROTOCOL.md §5.14's
+ * untouched-means-kept rule deliberately: these rows are somebody else's
+ * capability on the grantor's diary, so silence must be the safe answer.
+ */
+export interface RotateDekInput {
+  accountId: number;
+  blob: { baseVersion: number; envelopeVersion: number; ciphertext: Uint8Array };
+  /** Both kinds, always — a missing kind is refused before the store is reached. */
+  keyRecords: RotateDekKeyRecordInput[];
+  /** Only the shares to keep. Every other share row owned by `accountId` is deleted in the same transaction. */
+  shares: RotateDekShareInput[];
+}
+
+export type RotateDekResult =
+  | { ok: true; newVersion: number; keptShares: number; revokedShares: number }
+  /** The blob CAS did not hold — same meaning as {@link PutBlobResult}'s conflict, and nothing was written. */
+  | { ok: false; reason: 'blob-conflict'; currentVersion: number }
+  /** A share named in the keep list does not exist. Rolled back rather than treated as a grant. */
+  | { ok: false; reason: 'unknown-share'; granteeAccountId: number };
+
+/**
+ * The atomic rotation, kept in its OWN store rather than added to
+ * {@link SyncStorageAdapter} or {@link SyncShareStore}: it is the one
+ * operation that writes across both of their tables, and it can only be
+ * correct if it does so in a single transaction (ADR-0002 prohibition 8 —
+ * `rotate-dek` is atomic or it does not exist).
+ *
+ * Splitting it across the two existing stores would produce exactly the
+ * sequence of individually-committing writes that prohibition forbids.
+ */
+export interface SyncRotationStore {
+  rotateDek(input: RotateDekInput): Promise<RotateDekResult>;
+}

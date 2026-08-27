@@ -25,6 +25,7 @@ import { createDrizzleAccountStore } from './db/account-store.js';
 import { createDrizzleStorageAdapter } from './db/storage-adapter.js';
 import { createDrizzleAdminStore } from './db/admin-store.js';
 import { createDrizzleShareStore } from './db/share-store.js';
+import { createDrizzleRotationStore } from './db/rotation-store.js';
 import { deriveServerSecrets } from './lib/server-secrets.js';
 import { createThrottleStore } from './lib/throttle.js';
 import { generateFamilyId, generateToken } from './lib/tokens.js';
@@ -81,6 +82,7 @@ async function main(): Promise<void> {
   const app = createApp({
     authContext,
     storage: createDrizzleStorageAdapter(database.db),
+    rotation: createDrizzleRotationStore(database.db),
     throttle: createThrottleStore(),
     logger,
     trustProxy: config.trustProxy,

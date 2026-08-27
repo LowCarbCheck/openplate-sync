@@ -18,6 +18,7 @@ import { createDrizzleAccountStore } from '../../src/db/account-store.js';
 import { createDrizzleStorageAdapter } from '../../src/db/storage-adapter.js';
 import { createDrizzleAdminStore } from '../../src/db/admin-store.js';
 import { createDrizzleShareStore } from '../../src/db/share-store.js';
+import { createDrizzleRotationStore } from '../../src/db/rotation-store.js';
 import { createSilentLogger } from '../../src/logger.js';
 import { createThrottleStore, type ThrottleConfig } from '../../src/lib/throttle.js';
 import { generateFamilyId, generateToken } from '../../src/lib/tokens.js';
@@ -109,6 +110,7 @@ export async function startService(options: StartServiceOptions): Promise<Servic
   const app = createApp({
     authContext,
     storage: createDrizzleStorageAdapter(options.db),
+    rotation: createDrizzleRotationStore(options.db),
     throttle: createThrottleStore(options.throttleConfig ?? PERMISSIVE_THROTTLE),
     logger: createSilentLogger(),
     trustProxy: false,

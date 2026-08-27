@@ -22,6 +22,7 @@ import type { LogFields, Logger } from '../../src/logger.js';
 import type { AccountStore } from '../../src/accounts/account-store.js';
 import { createAuthFixture } from './auth-context-fixture.js';
 import { createFakeStorageAdapter } from './fake-storage-adapter.js';
+import { createFakeRotationStore } from './fake-rotation-store.js';
 import { createFakeAdminStore, type FakeAdminStore } from './fake-admin-store.js';
 import type { FakeAccountStore } from './fake-account-store.js';
 
@@ -91,6 +92,7 @@ export async function startAdminHarness(options: StartAdminHarnessOptions): Prom
   const app = createApp({
     authContext: { ...fixture.ctx, store: accounts },
     storage: createFakeStorageAdapter(),
+    rotation: createFakeRotationStore(),
     throttle: createThrottleStore({ freeAttempts: 10_000, baseLockoutMs: 1, maxLockoutMs: 1, attemptResetMs: 1 }),
     logger: capturing.logger,
     trustProxy: false,

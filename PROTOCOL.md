@@ -440,6 +440,75 @@ pair, and that is what survives a DEK rotation.
 - Unknown, foreign and never-pushed all answer the **same** `404`. Absence of a
   share must not confirm that an account exists.
 
+### 5.17 `POST /v1/sync/rotate-dek` — atomic DEK rotation (ADR-0002)
+
+Bearer, as the account **owner**. One submission, one transaction:
+
+```json
+{
+  "blob": { "baseVersion": 3, "envelopeVersion": 1, "ciphertext": "<base64>" },
+  "keyRecords": [{ "kind": "passphrase", "kdfDescriptor": { "...": "..." }, "wrappedDek": "<base64>" }],
+  "shares": [{ "granteeAccountId": 7, "wrappedDek": "<base64>", "recipientKeyFingerprint": "<string>" }]
+}
+```
+
+The client generates a new DEK, re-encrypts its whole snapshot under it,
+re-wraps it under both KEKs, and re-wraps it to every share it is keeping. The
+service stores the result **all or nothing**.
+
+**Present on every deployment**, unlike §5.16. Rotation is not part of the
+sharing surface: it rewrites the caller's own blob and their own two key
+records, rows that exist on every account everywhere, and it is the answer to
+any belief that a DEK leaked — a restored backup, a lost device — on an
+instance that has never shared anything. Gating the only mechanism that can
+retire a compromised DEK behind an unrelated flag would leave such an operator
+with no way to retire one.
+
+- **All-or-nothing, in one database transaction.** ADR-0002 prohibition 8: a
+  rotation is atomic or it does not exist, and no sequence of individually
+  committing endpoints may be documented or used as one. A partial application
+  is the "logs in fine, decrypts nothing" brick §5.14 already refuses to
+  permit, with one more participant — a key record re-wrapped while the blob
+  write lost its CAS strands the owner, and a share re-wrapped while the blob
+  write lost its CAS strands the clinician.
+- **`blob` is compare-and-swapped on `baseVersion`**, exactly as §5.1. A stale
+  value is a `409` `{"currentVersion": n}` and nothing at all is written.
+- **`keyRecords` must carry BOTH kinds.** A missing kind is a `400`, never a
+  silent partial rotation: submitting only the `passphrase` wrap would leave
+  the `recovery` record wrapping a DEK that no longer opens anything, so the
+  recovery code would still log the account in and never again decrypt it.
+  Each entry obeys §5.4's rules (a `recovery` descriptor must be `null`, a
+  `passphrase` descriptor must not). There is no per-record
+  `expectedUpdatedAt`: the submission itself is the concurrency unit.
+- **`shares` is the KEEP list, and every share row not named in it is deleted
+  in the same transaction.** This inverts §5.14, where an untouched key record
+  is kept — deliberately, because these rows are somebody else's capability on
+  the caller's diary and silence must be the safe default. `shares: []`
+  therefore revokes everything, and is valid; an **absent** `shares` key is a
+  `400`, for the reason §5.4 requires `expectedUpdatedAt` to be written out.
+  On a deployment without `SYNC_SHARING` the list must be empty — a non-empty
+  one is a `400`, since it asserts state that instance cannot hold.
+- **A named share that does not exist is a `400`**, rolled back whole, never
+  treated as a grant. The grantee may have dropped their side; re-read
+  `GET /v1/sync/shares` and resubmit.
+- **The retained older blob versions (§8) stay sealed under the OLD DEK** and
+  become dead weight the moment a rotation commits — unreadable to everyone,
+  including their owner. They are not deleted here: pruning clears them within
+  five further pushes, and dropping them during a rotation would throw away
+  the owner's only defence against a bad client write in the same operation.
+
+| Status | Body |
+| ------ | ---- |
+| `200` | `{"newVersion": 4, "keptShares": 1, "revokedShares": 2}` |
+| `400` | `{"error": "..."}` — a missing key-record kind, a malformed or absent field, a keep list naming a share that is not there. |
+| `409` | `{"currentVersion": 5}` — the blob CAS did not hold. Nothing was written. |
+| `413` | `{"error": "..."}` — the new blob exceeds `MAX_BLOB_BYTES`. |
+
+**Rotation is Tier 2 revocation, and the wording rules of §5.16 still bind.**
+Deleting a share row stops the server serving; rotating adds that future
+entries are sealed with a key the revoked party never had. Neither repossesses
+what was already downloaded, and no client may say otherwise.
+
 ## 6. Version handshake — required, and required to fail closed
 
 **A client MUST read this document from the service and check it before its first sync of a session.**

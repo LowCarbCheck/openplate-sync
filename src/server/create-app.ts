@@ -39,13 +39,14 @@ import express from 'express';
 import type { Express } from 'express';
 import { ENVELOPE_VERSION, PROTOCOL_VERSION, SYNC_API_PREFIX } from '../protocol.js';
 import type { ProtocolHandshake } from '../protocol.js';
-import type { SyncShareStore, SyncStorageAdapter } from '../contract-types.js';
+import type { SyncRotationStore, SyncShareStore, SyncStorageAdapter } from '../contract-types.js';
 import type { AuthContext } from '../accounts/auth-handlers.js';
 import { registerAuthRoutes } from '../accounts/register-auth-routes.js';
 import { ADMIN_API_PREFIX, createAdminRoutes } from './admin-routes.js';
 import { createAdminAuthMiddleware } from './admin-auth.js';
 import { registerSyncRoutes } from './register-routes.js';
 import { SHARE_API_PREFIXES, registerShareRoutes } from './share-routes.js';
+import { registerRotateDekRoute } from './rotate-dek-route.js';
 import { createBearerAuthMiddleware, createEntitledUserResolver } from './bearer-auth.js';
 import { createCorsMiddleware } from './cors.js';
 import { createErrorMiddleware, handleNotFound } from './error-middleware.js';
@@ -69,6 +70,11 @@ export interface AdminSurfaceOptions {
 export interface CreateAppOptions {
   authContext: AuthContext;
   storage: SyncStorageAdapter;
+  /**
+   * The atomic DEK rotation of PROTOCOL.md §5.17. Required on every instance,
+   * deliberately unlike `shares` — see below, and `server/rotate-dek-route.ts`.
+   */
+  rotation: SyncRotationStore;
   throttle: ThrottleStore;
   logger: Logger;
   /** Express `trust proxy`. Wrong here means `req.ip` is the proxy's and the whole throttle is one shared bucket. */
@@ -147,6 +153,18 @@ export function createApp(options: CreateAppOptions): Express {
     storage: options.storage,
     resolveEntitledUser,
     logger: options.logger,
+  });
+
+  // `POST /v1/sync/rotate-dek`, on EVERY instance — it is not part of the
+  // dark share surface. It rewrites the caller's own blob and their own two
+  // key records, rows that exist on every account everywhere, and an owner
+  // who has never shared anything still needs a way to retire a DEK they
+  // believe leaked. `sharingEnabled` only decides whether a keep list may say
+  // anything; the route itself is never gated. See that module's header.
+  registerRotateDekRoute(app, {
+    rotation: options.rotation,
+    resolveEntitledUser,
+    sharingEnabled: shares !== null,
   });
 
   // The share family, when this instance has one. It is handed the same

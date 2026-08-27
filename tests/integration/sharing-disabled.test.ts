@@ -23,8 +23,10 @@ import assert from 'node:assert/strict';
 import { setupTestDatabase, type TestDatabase } from './db-harness.js';
 import {
   sampleAuthHash,
+  sampleCiphertext,
   sampleKdfDescriptor,
   sampleShareWrap,
+  sampleWrappedDek,
   startService,
   type ServiceHarness,
 } from './service-harness.js';
@@ -126,4 +128,63 @@ test('sharing disabled: the owner-only sync routes are untouched by the terminat
   });
   assert.equal(records.status, 200);
   assert.deepEqual(records.body.records, []);
+});
+
+test('sharing disabled: rotate-dek is NOT part of the dark surface, and refuses a keep list', async () => {
+  // Uses its OWN account, so the fresh-account assertions above stay true
+  // whatever order these run in.
+  const signup = await service.request<SessionBody>({
+    method: 'POST',
+    path: '/v1/auth/signup',
+    body: { email: 'rotator@example.test', authHash: sampleAuthHash(32), kdfDescriptor: sampleKdfDescriptor(2) },
+  });
+  assert.equal(signup.status, 201);
+  assert.ok(signup.body.tokens);
+  const owner = signup.body.tokens.accessToken;
+
+  const keyRecords = [
+    { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: sampleWrappedDek(51) },
+    { kind: 'recovery', kdfDescriptor: null, wrappedDek: sampleWrappedDek(52) },
+  ];
+
+  // THE RULING THIS TEST PINS: an owner who has never shared anything — on an
+  // instance that cannot share at all — still gets to retire a DEK they
+  // believe leaked. Gating the only mechanism that can do that behind an
+  // unrelated sharing flag would leave such a self-hoster with no way to
+  // rotate. The endpoint discloses nothing about a care graph: it rewrites
+  // the caller's own blob and their own two key records, rows every account
+  // on every deployment already has.
+  const rotated = await service.request<{ newVersion: number; revokedShares: number }>({
+    method: 'POST',
+    path: '/v1/sync/rotate-dek',
+    accessToken: owner,
+    body: {
+      blob: { baseVersion: 0, envelopeVersion: 1, ciphertext: sampleCiphertext(29, 128) },
+      keyRecords,
+      shares: [],
+    },
+  });
+  assert.equal(rotated.status, 200);
+  assert.equal(rotated.body.newVersion, 1);
+  assert.equal(rotated.body.revokedShares, 0);
+
+  // A keep list here asserts state that cannot exist. Accepting it silently
+  // would report clinicians re-wrapped on an instance that has never held a
+  // share row.
+  const withKeepList = await service.request({
+    method: 'POST',
+    path: '/v1/sync/rotate-dek',
+    accessToken: owner,
+    body: {
+      blob: { baseVersion: 1, envelopeVersion: 1, ciphertext: sampleCiphertext(30, 128) },
+      keyRecords,
+      shares: [{ granteeAccountId: 1, wrappedDek: sampleShareWrap(), recipientKeyFingerprint: 'ABCD' }],
+    },
+  });
+  assert.equal(withKeepList.status, 400);
+
+  // And it is an ORDINARY authenticated route, so an anonymous caller gets the
+  // 401 the rest of `/v1/sync` gives — deliberately not the share tree's 404.
+  const anonymous = await service.request({ method: 'POST', path: '/v1/sync/rotate-dek', body: {} });
+  assert.equal(anonymous.status, 401);
 });
