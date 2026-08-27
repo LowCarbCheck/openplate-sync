@@ -26,6 +26,7 @@ import { createDrizzleStorageAdapter } from './db/storage-adapter.js';
 import { createDrizzleAdminStore } from './db/admin-store.js';
 import { createDrizzleShareStore } from './db/share-store.js';
 import { createDrizzleRotationStore } from './db/rotation-store.js';
+import { createDrizzleResearchStore } from './db/research-store.js';
 import { deriveServerSecrets } from './lib/server-secrets.js';
 import { createThrottleStore } from './lib/throttle.js';
 import { generateFamilyId, generateToken } from './lib/tokens.js';
@@ -79,6 +80,12 @@ async function main(): Promise<void> {
   // answering the ordinary unknown-path 404 — see `server/create-app.ts`.
   const shares = config.sharingEnabled ? createDrizzleShareStore(database.db) : null;
 
+  // `null` unless SYNC_RESEARCH is on, which leaves both contribution
+  // subtrees answering the ordinary unknown-path 404 — see
+  // `server/create-app.ts`. Decided independently of `shares`: neither flag
+  // implies the other.
+  const research = config.researchEnabled ? createDrizzleResearchStore(database.db) : null;
+
   const app = createApp({
     authContext,
     storage: createDrizzleStorageAdapter(database.db),
@@ -88,6 +95,7 @@ async function main(): Promise<void> {
     trustProxy: config.trustProxy,
     admin,
     shares,
+    research,
   });
 
   const server = app.listen(config.port, () => {
@@ -99,6 +107,7 @@ async function main(): Promise<void> {
       // Whether the operator API exists on this instance, never its token.
       adminApi: admin !== null,
       sharing: shares !== null,
+      research: research !== null,
     });
   });
 

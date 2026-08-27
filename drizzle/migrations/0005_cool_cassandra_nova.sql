@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "research_contributions_study_pseudonym_idx" ON "research_contributions" USING btree ("study_account_id","pseudonym");

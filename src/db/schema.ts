@@ -344,6 +344,159 @@ export type InsertSyncShare = InferInsertModel<typeof syncShares>;
 export type SelectSyncShare = InferSelectModel<typeof syncShares>;
 
 // =============================================================================
+// Research contributions (ADR-0003 — pseudonymous, but never anonymous)
+// =============================================================================
+
+/**
+ * A REDUCED, DATE-BOUNDED SLICE of one contributor's diary, sealed to one
+ * study's public key. It is a different artifact from a share, not a narrower
+ * one: different payload, different key, different lifecycle, and NO DEK is
+ * involved at all — the wrap is over the payload directly (PROTOCOL.md §3.5).
+ *
+ * WHY THIS IS NOT A `kind` ON `sync_shares`. ADR-0003 opens by forbidding
+ * exactly that shortcut: "the researcher case must never be built as a share
+ * with a smaller UI. A scope enforced by the viewing client is not data
+ * minimisation." A share hands over a wrapped DEK and therefore a key to the
+ * whole diary; this row hands over a fixed, day-granular projection and
+ * nothing else. Reusing the share table would make the difference a UI
+ * decision.
+ *
+ * THE COLUMN THAT IS THE WHOLE PRIVACY DESIGN, AND THE ONE THAT IS NOT HERE.
+ * `pseudonym` is `HMAC-SHA-256(root, "openplate-sync:study-pseudonym:v1" ‖
+ * studyAccountId)` computed on the contributor's device from a root the
+ * server never holds. The server neither computes nor verifies it — it
+ * cannot. `contributor_account_id` sits beside it because erasure, cascade
+ * and CAS all need to find the row, and ADR-0003 discloses that edge in
+ * PROTOCOL.md §9.2 rather than pretending to avoid it. **It stops here: no
+ * study-side response, export or endpoint ever carries it** (prohibition 2).
+ * That is the deliberate inversion of §5.16's `grantorAccountId`, which is
+ * *required* there because §3.2's AAD binds it; §3.5's AAD was designed so
+ * this lane never needs one.
+ *
+ * `body` is opaque: `ephPub(65) ‖ iv(12) ‖ AES-256-GCM(KEK_research, payload,
+ * aad)`. Variable length, unlike the share wrap, because the payload is a
+ * window of days rather than a 32-byte DEK.
+ *
+ * WITHDRAWAL IS A HARD DELETE, and unlike the share case a tombstone DOES
+ * follow — into `research_withdrawals`, keyed by pseudonym alone. The two
+ * facts are written in one transaction (`db/research-store.ts`).
+ */
+export const researchContributions = pgTable(
+  'research_contributions',
+  {
+    id: serial('id').primaryKey(),
+    /** The contributor. Cascades: deleting the account erases every contribution it ever pushed, with no cleanup job. */
+    contributorAccountId: integer('contributor_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** The study — an ordinary account (ADR-0003 D6: no principal type, no registry). Cascades from its end too. */
+    studyAccountId: integer('study_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** Client-computed, server-unverifiable. See the table doc; this is the only identifier a researcher ever sees. */
+    pseudonym: text('pseudonym').notNull(),
+    /** The fixed tier the payload conforms to (`daily-intake:v1`). Frozen by protocol revision, never by configuration. */
+    schemaTier: text('schema_tier').notNull(),
+    /** The sealed payload. Opaque here — the service holds no key for it and never parses it. */
+    body: bytea('body').notNull(),
+    /**
+     * MONOTONIC per (contributor, study) — the CAS token of PROTOCOL.md
+     * §5.18, and an integer rather than a timestamp for the same reason the
+     * blob's is: it also rides in the AAD, so a rollback to an older
+     * contribution is what the check has to refuse.
+     */
+    contributionVersion: integer('contribution_version').notNull(),
+    /** Millisecond precision, for the reason recorded on `sync_key_records.updatedAt`. */
+    createdAt: timestamp('created_at', { precision: 3 }).defaultNow().notNull(),
+    /**
+     * Millisecond precision, DECLARED. This column is not itself a CAS token
+     * — `contribution_version` is — but it is served to the study client as
+     * an ISO-8601 string, and `scripts/assert-ms-precision.mts` holds the
+     * whole service to one rule rather than to a per-column judgement about
+     * which timestamps will one day be compared for equality. A bare
+     * `timestamp` is `timestamp(6)`; the wire carries milliseconds; the gap
+     * between those two already shipped once and made every CAS-gated
+     * rotation impossible.
+     */
+    updatedAt: timestamp('updated_at', { precision: 3 })
+      .defaultNow()
+      .$onUpdate(() => new Date())
+      .notNull(),
+  },
+  (table) => [
+    // One live contribution per (contributor, study): the row is a projection
+    // the client recomputes and re-pushes whole, never an append log.
+    uniqueIndex('research_contributions_pair_idx').on(table.contributorAccountId, table.studyAccountId),
+    // The study's cohort read, which is the only high-cardinality query here.
+    index('research_contributions_study_idx').on(table.studyAccountId),
+    // ONE PSEUDONYM PER STUDY, structurally. Two contributors submitting the
+    // same pseudonym would silently merge into one participant series, and a
+    // researcher would analyse two people as one without anything failing --
+    // the confident-wrong-number class this whole design exists to avoid.
+    //
+    // An accidental collision is ~2^-128 (§3.5 truncates an HMAC to 128 bits),
+    // and a deliberate one needs a pseudonym only the study can see, so this
+    // constraint should never fire. That is the point: it costs nothing and it
+    // makes the corruption impossible rather than improbable.
+    uniqueIndex('research_contributions_study_pseudonym_idx').on(table.studyAccountId, table.pseudonym),
+    // Contributing to yourself is nonsense the schema can refuse outright.
+    check('research_contributions_not_self', sql`${table.contributorAccountId} <> ${table.studyAccountId}`),
+  ],
+);
+
+export type InsertResearchContribution = InferInsertModel<typeof researchContributions>;
+export type SelectResearchContribution = InferSelectModel<typeof researchContributions>;
+
+/**
+ * THE TOMBSTONE, AND THE COLUMN THAT MUST NEVER EXIST HERE.
+ *
+ * ADR-0003 prohibition 6: withdrawal is one transaction — hard-delete the
+ * contribution, insert this row — and **no account id survives on any
+ * withdrawal record**. There is deliberately no `contributor_account_id`
+ * column below, and adding one would defeat the entire point: the live system
+ * forgets *who* withdrew and remembers only *that a pseudonym withdrew*. The
+ * account edge dies with the contribution row; what remains is exactly the
+ * payload the erasure obligation needs, which is which pseudonym the study
+ * client must purge.
+ *
+ * ADR-0002 rejected tombstones for shares and that argument does not transfer:
+ * there a tombstone defended nothing, here it carries the instruction.
+ *
+ * The study foreign key cascades, so deleting a study account takes its
+ * withdrawal ledger with it — a tombstone for a study that no longer exists
+ * instructs nobody.
+ */
+export const researchWithdrawals = pgTable(
+  'research_withdrawals',
+  {
+    id: serial('id').primaryKey(),
+    /** Which study must purge. The only account id on this table, and it is the RECIPIENT's, never the contributor's. */
+    studyAccountId: integer('study_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** The whole payload of the obligation: purge this pseudonym. Unlinkable to an account without the contributor's root. */
+    pseudonym: text('pseudonym').notNull(),
+    /** Millisecond precision, for the reason recorded on `researchContributions.updatedAt`. */
+    withdrawnAt: timestamp('withdrawn_at', { precision: 3 }).defaultNow().notNull(),
+  },
+  (table) => [
+    // Re-enrolling and withdrawing again is the same pseudonym (the derivation
+    // is deterministic), so this is an ordinary event, not a race: the store
+    // refreshes `withdrawn_at` on conflict.
+    uniqueIndex('research_withdrawals_pair_idx').on(table.studyAccountId, table.pseudonym),
+    // A blank pseudonym is an instruction to purge nothing, which is a
+    // withdrawal that erases nothing while reporting success. The database
+    // refuses to hold one — and that refusal is what makes the atomicity of
+    // `withdrawContribution` falsifiable with a LATE failure, after the
+    // contribution row has already been deleted inside the transaction.
+    check('research_withdrawals_pseudonym_present', sql`length(${table.pseudonym}) > 0`),
+  ],
+);
+
+export type InsertResearchWithdrawal = InferInsertModel<typeof researchWithdrawals>;
+export type SelectResearchWithdrawal = InferSelectModel<typeof researchWithdrawals>;
+
+// =============================================================================
 // Relations
 // =============================================================================
 
@@ -355,6 +508,10 @@ export const accountsRelations = relations(accounts, ({ many }) => ({
   // relation names say which end this account is standing at.
   sharesGranted: many(syncShares, { relationName: 'sharesGranted' }),
   sharesReceived: many(syncShares, { relationName: 'sharesReceived' }),
+  // Both ends of the study graph, named the same way. An account is a study
+  // purely by having contributions point at it (ADR-0003 D6).
+  contributionsMade: many(researchContributions, { relationName: 'contributionsMade' }),
+  contributionsReceived: many(researchContributions, { relationName: 'contributionsReceived' }),
 }));
 
 export const accountTokensRelations = relations(accountTokens, ({ one }) => ({
@@ -380,4 +537,21 @@ export const syncSharesRelations = relations(syncShares, ({ one }) => ({
     references: [accounts.id],
     relationName: 'sharesReceived',
   }),
+}));
+
+export const researchContributionsRelations = relations(researchContributions, ({ one }) => ({
+  contributor: one(accounts, {
+    fields: [researchContributions.contributorAccountId],
+    references: [accounts.id],
+    relationName: 'contributionsMade',
+  }),
+  study: one(accounts, {
+    fields: [researchContributions.studyAccountId],
+    references: [accounts.id],
+    relationName: 'contributionsReceived',
+  }),
+}));
+
+export const researchWithdrawalsRelations = relations(researchWithdrawals, ({ one }) => ({
+  study: one(accounts, { fields: [researchWithdrawals.studyAccountId], references: [accounts.id] }),
 }));

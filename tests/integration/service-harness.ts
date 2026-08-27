@@ -19,6 +19,7 @@ import { createDrizzleStorageAdapter } from '../../src/db/storage-adapter.js';
 import { createDrizzleAdminStore } from '../../src/db/admin-store.js';
 import { createDrizzleShareStore } from '../../src/db/share-store.js';
 import { createDrizzleRotationStore } from '../../src/db/rotation-store.js';
+import { createDrizzleResearchStore } from '../../src/db/research-store.js';
 import { createSilentLogger } from '../../src/logger.js';
 import { createThrottleStore, type ThrottleConfig } from '../../src/lib/throttle.js';
 import { generateFamilyId, generateToken } from '../../src/lib/tokens.js';
@@ -27,6 +28,7 @@ import type { AuthContext } from '../../src/accounts/auth-handlers.js';
 import type { MailMessage, MailResult } from '../../src/mail/transport.js';
 import type { Database } from '../../src/db/client.js';
 import { SHARE_WRAPPED_DEK_BYTES } from '../../src/server/share-routes.js';
+import { RESEARCH_BODY_MIN_BYTES } from '../../src/server/research-routes.js';
 
 export interface HttpResponse<T> {
   status: number;
@@ -83,6 +85,13 @@ export interface StartServiceOptions {
    * ordinary unknown-path 404. `sharing.test.ts` opts in.
    */
   sharing?: boolean;
+  /**
+   * Absent (the default) boots the service the way every deployment boots
+   * today: `SYNC_RESEARCH` unset, and both contribution subtrees answering
+   * the ordinary unknown-path 404. `research.test.ts` opts in. Independent of
+   * `sharing` — neither implies the other.
+   */
+  research?: boolean;
 }
 
 export async function startService(options: StartServiceOptions): Promise<ServiceHarness> {
@@ -119,6 +128,7 @@ export async function startService(options: StartServiceOptions): Promise<Servic
         ? null
         : { token: options.adminToken, metadata: createDrizzleAdminStore(options.db) },
     shares: options.sharing === true ? createDrizzleShareStore(options.db) : null,
+    research: options.research === true ? createDrizzleResearchStore(options.db) : null,
   });
 
   const server: Server = app.listen(0);
@@ -189,4 +199,14 @@ export function sampleCiphertext(seed = 3, bytes = 256): string {
  */
 export function sampleShareWrap(seed = 5): string {
   return Buffer.alloc(SHARE_WRAPPED_DEK_BYTES, seed).toString('base64');
+}
+
+/**
+ * A structurally plausible research envelope: ADR-0003's
+ * `ephPub(65) ‖ iv(12) ‖ AES-256-GCM(payload)`, which has no fixed size —
+ * unlike the share wrap — because the payload is a window of days. The
+ * service checks only the floor.
+ */
+export function sampleContributionBody(seed = 11, bytes = RESEARCH_BODY_MIN_BYTES + 64): string {
+  return Buffer.alloc(bytes, seed).toString('base64');
 }

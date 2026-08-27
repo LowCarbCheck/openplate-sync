@@ -29,6 +29,20 @@
       "when": 1787826498144,
       "tag": "0003_loving_the_enforcers",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1787841454721,
+      "tag": "0004_slippery_the_santerians",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1787841961162,
+      "tag": "0005_cool_cassandra_nova",
+      "breakpoints": true
     }
   ]
 }

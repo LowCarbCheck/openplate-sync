@@ -24,6 +24,11 @@ test('a minimal valid environment parses with sane defaults', () => {
   assert.equal(config.requireEmailVerification, false);
   assert.equal(config.trustProxy, false);
   assert.equal(config.logLevel, 'info');
+  // Both dark features are OFF unless an operator opts in. This is the
+  // default every deployment runs on, and it is what makes shipping the
+  // routes before anyone opts in safe (ADR-0002 / ADR-0003).
+  assert.equal(config.sharingEnabled, false);
+  assert.equal(config.researchEnabled, false);
   // Trailing slash stripped so link building never doubles the separator.
   assert.equal(config.clientBaseUrl, 'https://app.example.test');
 });
@@ -78,4 +83,21 @@ test('mail settings default to the console path and read pigeon/SMTP when presen
   assert.equal(configured.email.smtp.port, 465);
   assert.equal(configured.email.smtp.secure, true);
   assert.equal(configured.email.pigeon.baseUrl, 'https://pigeon.test');
+});
+
+test('SYNC_RESEARCH and SYNC_SHARING are independent flags', () => {
+  // PROTOCOL.md §5.18: neither implies the other. A clinic instance may want
+  // sharing and no cohort graph; a study host may want the reverse. Folding
+  // them into one variable would silently widen every sharing deployment into
+  // a research deployment, and vice versa.
+  const researchOnly = parseConfig(baseEnv({ SYNC_RESEARCH: 'true' }));
+  assert.equal(researchOnly.researchEnabled, true);
+  assert.equal(researchOnly.sharingEnabled, false);
+
+  const sharingOnly = parseConfig(baseEnv({ SYNC_SHARING: '1' }));
+  assert.equal(sharingOnly.sharingEnabled, true);
+  assert.equal(sharingOnly.researchEnabled, false);
+
+  // A typo must not silently mean "off" on a flag whose absence is a 404.
+  assert.throws(() => parseConfig(baseEnv({ SYNC_RESEARCH: 'yes' })), /SYNC_RESEARCH/);
 });

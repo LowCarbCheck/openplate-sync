@@ -34,18 +34,27 @@
  * `SYNC_API_PREFIX`: mounted after, an unconfigured tree would answer 401 to
  * an anonymous caller and announce that a credential exists worth guessing.
  * See `docs/adr/0002-sharing-a-diary-without-giving-the-server-a-key.md`.
+ *
+ * THE RESEARCH TREE IS THE SAME BARGAIN AGAIN, AND ON ITS OWN FLAG.
+ * `SYNC_RESEARCH` unset means `/v1/sync/contributions*` and
+ * `/v1/sync/study*` answer the ordinary unknown-path 404, to everybody, with
+ * the terminator mounted BEFORE the bearer middleware for the same reason.
+ * It is INDEPENDENT of `SYNC_SHARING` — neither flag implies the other, and
+ * a deployment may reasonably run either alone. See
+ * `docs/adr/0003-research-contributions-pseudonymous-but-never-anonymous.md`.
  */
 import express from 'express';
 import type { Express } from 'express';
 import { ENVELOPE_VERSION, PROTOCOL_VERSION, SYNC_API_PREFIX } from '../protocol.js';
 import type { ProtocolHandshake } from '../protocol.js';
-import type { SyncRotationStore, SyncShareStore, SyncStorageAdapter } from '../contract-types.js';
+import type { SyncResearchStore, SyncRotationStore, SyncShareStore, SyncStorageAdapter } from '../contract-types.js';
 import type { AuthContext } from '../accounts/auth-handlers.js';
 import { registerAuthRoutes } from '../accounts/register-auth-routes.js';
 import { ADMIN_API_PREFIX, createAdminRoutes } from './admin-routes.js';
 import { createAdminAuthMiddleware } from './admin-auth.js';
 import { registerSyncRoutes } from './register-routes.js';
 import { SHARE_API_PREFIXES, registerShareRoutes } from './share-routes.js';
+import { RESEARCH_API_PREFIXES, registerResearchRoutes } from './research-routes.js';
 import { registerRotateDekRoute } from './rotate-dek-route.js';
 import { createBearerAuthMiddleware, createEntitledUserResolver } from './bearer-auth.js';
 import { createCorsMiddleware } from './cors.js';
@@ -92,6 +101,14 @@ export interface CreateAppOptions {
    * mounted-but-refusing surface.
    */
   shares?: SyncShareStore | null;
+  /**
+   * The study graph's storage, or `null`/absent for "this instance does not
+   * host research contributions" — the default, and what every deployment
+   * without `SYNC_RESEARCH` gets. Absence is a 404 on both contribution
+   * subtrees, not a mounted-but-refusing surface, and it is decided
+   * independently of `shares`.
+   */
+  research?: SyncResearchStore | null;
 }
 
 export function createApp(options: CreateAppOptions): Express {
@@ -144,6 +161,28 @@ export function createApp(options: CreateAppOptions): Express {
     }
   }
 
+  // THE RESEARCH TERMINATOR — same placement, same reason, SEPARATE FLAG.
+  //
+  // `SYNC_RESEARCH` is unset on every deployment that has not deliberately
+  // turned research contributions on, and it is decided independently of
+  // `SYNC_SHARING`: neither flag implies the other. Both contribution
+  // subtrees then answer the ordinary unknown-path 404, to everybody,
+  // credentialed or not.
+  //
+  // Mounted HERE, ahead of the bearer middleware below, for exactly the
+  // reason the share terminator is: these paths live inside
+  // `SYNC_API_PREFIX`, so a merely-unmounted tree would be reached by
+  // `requireAuth` first and answer 401 to an anonymous probe — announcing
+  // that a credential exists worth guessing, on a tree whose very existence
+  // would tell a prober this deployment holds a cohort.
+  const research = options.research ?? null;
+  if (research === null) {
+    // No SYNC_RESEARCH on this instance: an explicit 404, never a bare absence.
+    for (const prefix of RESEARCH_API_PREFIXES) {
+      app.use(prefix, handleNotFound);
+    }
+  }
+
   // Every blob/key-record route is behind the bearer gate. `registerSyncRoutes`
   // still does its own `resolveEntitledUser` check — defence in depth, and the
   // seam a future entitlement rule would use.
@@ -173,6 +212,14 @@ export function createApp(options: CreateAppOptions): Express {
   // reusing this resolver for target selection would create.
   if (shares !== null) {
     registerShareRoutes(app, { shares, storage: options.storage, resolveEntitledUser });
+  }
+
+  // The research family, when this instance has one. It is deliberately NOT
+  // handed `storage`: this lane never reads a blob, and giving it the adapter
+  // would create the one seam a study-side route could use to reach a
+  // contributor's diary — the "share with a smaller UI" ADR-0003 forbids.
+  if (research !== null) {
+    registerResearchRoutes(app, { research, resolveEntitledUser });
   }
 
   // The admin API, or nothing that admits to being one.

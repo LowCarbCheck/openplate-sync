@@ -231,3 +231,116 @@ export type RotateDekResult =
 export interface SyncRotationStore {
   rotateDek(input: RotateDekInput): Promise<RotateDekResult>;
 }
+
+// =============================================================================
+// Research contributions (ADR-0003)
+// =============================================================================
+
+/**
+ * ONE CONTRIBUTION AS THE STUDY SEES IT — and the shape that proves the point
+ * of this whole lane, by what it does not have.
+ *
+ * There is NO contributor account id here, and there must never be one. This
+ * is the deliberate inversion of {@link SyncShare}, whose `accountId` is
+ * *required* on the grantee's read because PROTOCOL.md §3.2's AAD binds it
+ * and a grantee could not decrypt without it. §3.5's AAD was designed the
+ * other way: `{studyAccountId, pseudonym, contributionVersion, schemaTier,
+ * studyKeyFingerprint}`, every field of which the researcher already knows or
+ * computes locally from her own key. Anyone reusing the shared-blob response
+ * shape here imports a re-identification leak (ADR-0003 prohibition 2).
+ */
+export interface ResearchContribution {
+  /** The only identifier a researcher ever sees. Computed on the contributor's device; the server cannot verify it. */
+  pseudonym: string;
+  /** Monotonic per (contributor, study) — the CAS token, and an AAD field. */
+  contributionVersion: number;
+  /** The fixed tier the payload conforms to. Frozen by protocol revision, never by study configuration. */
+  schemaTier: string;
+  /** `ephPub(65) ‖ iv(12) ‖ AES-256-GCM(...)`. Opaque; the service holds no key for it. */
+  body: Uint8Array;
+  createdAt: Date;
+}
+
+/**
+ * A contribution WITHOUT its sealed body — the shape the CONTRIBUTOR is
+ * allowed to see of their own enrolments (PROTOCOL.md §5.18: "never returns
+ * `body`").
+ *
+ * A separate type rather than an `Omit<>` at the route, for the same reason
+ * {@link SyncShareSummary} is: the body is never SELECTed on this path at
+ * all. It is megabytes of ciphertext the contributor's own client can
+ * regenerate from the source it still holds, so it does not travel to where
+ * nobody needs it.
+ */
+export interface ResearchContributionSummary {
+  /** The counterpart, and the only account id on this side — the study's, which the contributor named itself. */
+  studyAccountId: number;
+  pseudonym: string;
+  schemaTier: string;
+  contributionVersion: number;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** A tombstone. Pseudonym and time, and nothing else — ADR-0003 prohibition 6 forbids an account id here. */
+export interface ResearchWithdrawal {
+  pseudonym: string;
+  withdrawnAt: Date;
+}
+
+/**
+ * Mirrors {@link PutBlobResult}'s conflict rather than {@link PutShareResult}'s:
+ * the CAS token in this lane is the monotonic integer `contributionVersion`,
+ * not a timestamp, because that integer also rides in the AAD and the attack
+ * it refuses is a rollback to an older contribution.
+ */
+export type PutContributionResult =
+  { ok: true; contribution: ResearchContributionSummary } | { ok: false; currentVersion: number };
+
+/**
+ * Storage for the study graph, kept OUT of both {@link SyncStorageAdapter} and
+ * {@link SyncShareStore} for the reason the share store is kept out of the
+ * storage adapter: the owner-only paths must not be able to reach this graph
+ * even by accident, and an instance booted without `SYNC_RESEARCH` never
+ * constructs this factory at all.
+ */
+export interface SyncResearchStore {
+  /**
+   * CAS write. `contributionVersion` must be STRICTLY GREATER than the stored
+   * one (`0` when no row exists); anything else reports the current value and
+   * writes nothing. `no-such-account` is the study foreign key refusing a
+   * contribution to an account that does not exist — reported rather than
+   * thrown, so the route can answer it without a 500.
+   */
+  putContribution(input: {
+    contributorAccountId: number;
+    studyAccountId: number;
+    pseudonym: string;
+    schemaTier: string;
+    body: Uint8Array;
+    contributionVersion: number;
+  }): Promise<PutContributionResult | { ok: false; reason: 'no-such-account' }>;
+  /** The contributor's own enrolments. Summaries — the sealed body is never selected here. */
+  listContributionsByContributor(contributorAccountId: number): Promise<ResearchContributionSummary[]>;
+  /** The cohort. Carries bodies, and carries no contributor account id — see {@link ResearchContribution}. */
+  listContributionsByStudy(studyAccountId: number): Promise<ResearchContribution[]>;
+  /**
+   * WITHDRAWAL, AND IT IS ONE TRANSACTION (ADR-0003 prohibition 6): hard-delete
+   * the contribution row and insert the pseudonym-keyed tombstone, together or
+   * not at all. Idempotent — withdrawing what is not there is not an error.
+   */
+  withdrawContribution(input: { contributorAccountId: number; studyAccountId: number }): Promise<void>;
+  /** The purge instructions a study client must honour before presenting or exporting anything. */
+  listWithdrawalsByStudy(studyAccountId: number): Promise<ResearchWithdrawal[]>;
+}
+
+/**
+ * What `registerResearchRoutes` needs. Deliberately NOT given `storage`: this
+ * lane never reads a blob, and handing it the storage adapter would create the
+ * one seam through which a study-side route could reach a contributor's
+ * diary — which is the shortcut ADR-0003's opening paragraph forbids.
+ */
+export interface SyncResearchHostContext {
+  research: SyncResearchStore;
+  resolveEntitledUser: (req: Request) => Promise<SyncEntitledUser | null>;
+}

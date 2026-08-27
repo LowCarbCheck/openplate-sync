@@ -589,6 +589,40 @@ not, with the terminator mounted ahead of authentication. Independent of
 | `GET` | `/study/contributions` | `{"pseudonym","contributionVersion","schemaTier","body","createdAt"}` per row. **No account id, ever.** |
 | `GET` | `/study/withdrawals` | Pseudonyms that withdrew, with timestamps. The study client must purge these before presenting or exporting anything. |
 
+`GET /study/contributions` echoes `studyAccountId` **once, at the top level of
+the envelope**, not on every row: it is the caller's own id, it authenticated as
+it, it is identical for every row, and it is not a contributor identifier. The
+researcher needs it to rebuild §3.5's AAD, and per-row it would be noise.
+
+**The `contributionVersion` compare-and-swap.** The submitted value **is the new
+version**, not a base — it binds into the AAD, so it must be the value the
+ciphertext was sealed under. The rule is **strictly greater than the stored
+one**: a client that recomputes and re-pushes the whole projection must never be
+wedged by a version that never left the device. A losing write is `409
+{"currentVersion": <int>}`, matching §5.1's shape.
+
+**The server validates `schemaTier` against the tiers this protocol defines.**
+The tier name is metadata, not content — it travels in the clear and the server
+already stores it — and without this check ADR-0003's prohibition 1 has no teeth
+anywhere but the client. An unknown tier is `400`.
+
+**The server does not validate the pseudonym's shape**, only that it is present
+and bounded. It cannot verify one — that would need the contributor's root — and
+a structural check would imply an authority it does not have.
+
+| Status | When |
+| --- | --- |
+| `400` | malformed body, unknown `schemaTier`, absent `contributionVersion` |
+| `404` | unknown study, unknown contribution, and any other not-found — one code path |
+| `409` | `contributionVersion` not strictly greater than the stored one |
+| `413` | contribution exceeds `MAX_CONTRIBUTION_BYTES` (256 KiB) |
+
+**One pseudonym per study, enforced by the database.** Two contributors
+submitting the same pseudonym would silently merge into one participant series,
+and a researcher would analyse two people as one with nothing failing. An
+accidental collision is about 2^-128, so the constraint should never fire —
+which is the point: it makes the corruption impossible rather than improbable.
+
 **Withdrawal is genuinely erasing on this side.** A contribution the study has
 not yet pulled reaches nobody. What the study already pulled cannot be
 repossessed — the tombstone carries the instruction, and honouring it is an

@@ -98,6 +98,18 @@ export interface ServiceConfig {
    * must be indistinguishable from one where the feature was never written.
    */
   sharingEnabled: boolean;
+  /**
+   * Whether this instance implements ADR-0003's research contributions.
+   *
+   * INDEPENDENT OF {@link ServiceConfig.sharingEnabled} — neither flag implies
+   * the other. A clinic instance may want sharing and no cohort graph; a study
+   * host may want the reverse. `false`, the default, is not "mounted but
+   * refusing": both contribution subtrees answer the ordinary unknown-path 404
+   * to everybody (`server/create-app.ts`), because this service auto-deploys
+   * on push and an instance that has not opted in must be indistinguishable
+   * from one where the feature was never written.
+   */
+  researchEnabled: boolean;
   logLevel: LogLevel;
   email: EmailSettings;
 }
@@ -193,6 +205,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
     trustProxy: parseTrustProxy(env),
     adminToken: parseAdminToken(env),
     sharingEnabled: parseBoolean(env, 'SYNC_SHARING', false),
+    researchEnabled: parseBoolean(env, 'SYNC_RESEARCH', false),
     logLevel: parseLogLevel(env),
     email: {
       from: optional(env, 'EMAIL_FROM', 'openplate-sync <noreply@localhost>'),
