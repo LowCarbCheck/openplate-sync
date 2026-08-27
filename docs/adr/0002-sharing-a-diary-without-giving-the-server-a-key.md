@@ -322,6 +322,87 @@ double cascade means the edge dies with either party.
 It is **not** acceptable for the graph to leak sideways, hence the prohibition
 below.
 
+## The snapshot is partitioned — amendment, 2026-08-27
+
+The precondition below was taken, passed, and **went stale the same day**. That
+is worth more than the fix.
+
+A share is full-DEK, and the blob is the *whole* snapshot (§3.2). So "share the
+DEK" silently meant "share the DEK's entire domain", and that domain had no
+boundary. When the client slice put the owner's share private key and their
+pinned peers into the snapshot — correctly, so they would survive a recovery
+restore and reach a second device — it put them into the very thing a share
+discloses.
+
+**That is a cascade, not a leak.** A grantee holding the grantor's share private
+key can decrypt every wrap addressed to that grantor. A clinician is an ordinary
+account here, so a dietician who is also somebody's patient would hand their own
+grantee the keys to *their* patients' shares — reaching a third party who never
+made any trust decision about the recipient. The counterargument, that the
+ciphertext is still gated because `/v1/sync/shared` authorises by bearer
+identity, is exactly the argument this service does not accept: §9.1's whole
+claim is that confidentiality does not rest on server policy. Material protected
+only by an authorisation check is treated here as disclosed.
+
+The pinned-peer list is the second half: it hands every grantee a subset of the
+care graph that §9.2 only admits the *server* learns.
+
+### The owner-private compartment
+
+The snapshot is now formally two regions.
+
+- **The shareable region** — diary and preferences. This is what a grant means.
+- **The owner-private compartment** — key material and trust pins. This is what
+  a grant must never mean.
+
+The compartment is the service's own key architecture, relocated one level down:
+
+```
+CDK ← random 256-bit compartment data key
+  wrapped under K_pp = HKDF(Argon2id hash, salt = account salt,
+                            info = "openplate-sync:private-store-kek:v1")
+  wrapped under K_pr = HKDF(recovery code, salt = empty,
+                            info = "openplate-sync:private-store-recovery-kek:v1")
+ciphertext ← iv ‖ AES-256-GCM(CDK, plaintext,
+                aad = {"accountId":<int>,"purpose":"private-store","v":1})
+```
+
+The indirection exists for the same reason the DEK's does: two independent
+unlock paths must open one ciphertext. Both slots use the same 60-byte wrap
+format as a key record. Both labels are frozen here.
+
+**This needs no protocol change.** §3.2 already declares everything inside
+`snapshot` opaque to the protocol, so a nested ciphertext field violates
+nothing. A second blob with its own key records would buy the same properties
+with new endpoints, new key-record kinds and a two-repo change, to store what is
+architecturally a mini key-record pair.
+
+Lifecycle is symmetric with what the client already does: a passphrase change
+rewraps the `K_pp` slot in the same moment it rewraps the key records, a
+recovery reset opens via `K_pr` and rewraps both, and a DEK rotation does not
+touch the CDK at all.
+
+**Residual disclosure, stated:** a grantee still sees that a compartment exists
+and roughly how large it is, which leaks an approximate peer count. Real, minor,
+and disclosed rather than discovered.
+
+### The rule this replaces the audit with
+
+A point-in-time audit of a moving structure is stale the day the structure
+moves, and this one proved it inside a single milestone, on the same team, in
+one day.
+
+**An invariant relied on across slices must be a test, not a review finding.**
+
+Concretely: a frozen map classifies every snapshot key as `shared` or
+`owner-private`. The test derives the actual key set from a fully populated
+fixture built by the **real** snapshot builder — never a hand-copied list — and
+fails on any key the map does not classify. Absent means fail, never means
+shared. And it asserts the *positive* structure: owner-private material appears
+only as the compartment's opaque ciphertext, and its known plaintext markers are
+recoverable through the CDK path and provably not from the grantee's view. A
+grep for absence passes on an empty snapshot.
+
 ## The Slice 0 precondition, and its finding
 
 The blob is the client's whole local-store snapshot, and openplate is BYOK. If
@@ -372,7 +453,10 @@ diary or preferences data re-opens this gate.
    revoked clinician can no longer read what they already downloaded.
 8. **`rotate-dek` is atomic or it does not exist.** No sequence of individually
    committing endpoints may be documented or used as a rotation procedure.
-9. **No share is creatable while the synced snapshot can contain credentials.**
+9. **The shareable region of the snapshot may never contain credentials or
+   trust pins.** Enforced by the classification test described in the
+   partition amendment above, whose map fails closed: a snapshot key that
+   nobody has classified is a red test, not a shared field.
 10. **`SYNC_SHARING` unset means both route trees answer the ordinary
     unknown-route 404**, to everybody, credentialed or not, from the first
     commit that adds a route. The terminator is mounted **before**
