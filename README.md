@@ -43,12 +43,40 @@ docker compose --project-directory . -f docker/compose.yml logs -f sync
 
 That is a supported way to run a personal or family instance, not a degraded one. Set `SMTP_HOST` and friends when you want real delivery. Every setting is documented in [`.env.example`](./.env.example).
 
-### Two settings that matter more than the rest
+### Four settings that matter more than the rest
 
-- **`SERVER_SECRET`** — back it up _with your database_. Two subkeys are derived from it: the pepper mixed into every stored auth verifier, and the key behind the anti-enumeration KDF responses. A restored database with a lost secret is a database nobody can log into, and every account would need a passphrase reset.
+- **`SERVER_SECRET`** — back it up _with your database_. Two subkeys are derived from it: the pepper mixed into every stored auth verifier, and the key behind the anti-enumeration KDF responses. A restored database with a lost secret is a database nobody can log into, and every account would need a passphrase reset. The same is true of a deliberate rotation: changing this value invalidates every stored verifier at once, so it cannot be rotated after a suspected leak without resetting every account's passphrase.
 - **`TRUST_PROXY`** — set it to the number of reverse proxies in front of the service (`1` behind a single nginx or Traefik). Left at `false` behind a proxy, every request appears to come from the proxy's address and the per-IP throttle becomes one global bucket a single attacker can lock for all your users. Set to `true` with nothing in front, anyone can spoof `X-Forwarded-For` and skip the throttle entirely.
 
+- **`CLIENT_BASE_URL`** — the URL of the openplate **client**, not of this service. Verification and reset emails link to `/verify-email` and `/reset-passphrase`, which only the client serves; point this at the sync server by mistake and every link in every email answers `404`.
+
+Your reverse proxy must also allow request bodies of about **2.75 MB**. Blobs are capped at 2 MB, base64 inflates them by a third, and nginx's default `client_max_body_size` is 1 MB — left at the default it rejects legitimate maximum-size syncs before this service ever sees or logs them. In nginx that is `client_max_body_size 3m;`.
+
+- **`SYNC_RESEARCH`** — off by default. Turning it on opens the `/v1/sync/contributions` and
+  `/v1/sync/study` endpoints, which is what brings the openplate client's `/study` console to
+  life, and makes this server hold a study graph of health-adjacent personal data.
+  Read [`.env.example`](./.env.example) before you set it; it is a different undertaking from
+  holding ciphertext you cannot read.
+
 Also worth knowing: **`SIGNUPS_OPEN=false`** closes registration on a family instance while leaving existing accounts working.
+
+### Backup and restore
+
+Two things must survive together: the Postgres data and `SERVER_SECRET`. Either one alone
+restores nothing usable.
+
+```bash
+# Back up
+docker compose --project-directory . -f docker/compose.yml exec -T postgres \
+  pg_dump -U openplate openplate_sync > sync-backup.sql
+
+# Restore, into a stopped-then-started stack, before users reconnect
+docker compose --project-directory . -f docker/compose.yml exec -T postgres \
+  psql -U openplate openplate_sync < sync-backup.sql
+```
+
+The database lives in the `postgres-data` volume declared by `docker/compose.yml`. Keep
+`SERVER_SECRET` with the dump, in whatever holds your other secrets — not in the dump itself.
 
 ### What your users should understand
 
@@ -67,6 +95,13 @@ whole `/v1/admin` tree answers the same `404` any unknown path does, to
 everybody — an instance that never configured it is indistinguishable from one
 built before the feature existed. A `401` there would announce that a
 credential exists and is merely locked.
+
+Under Compose, put the value in `.env` — `docker/compose.yml` already forwards
+`ADMIN_TOKEN` into the container. Compose passes only the variables that file's
+`environment:` block names, so a variable you add to `.env` and nowhere else
+never reaches the service. The same holds for `SYNC_SHARING`, `SYNC_RESEARCH`,
+`PIGEON_API_KEY`, `PIGEON_BASE_URL` and `DATABASE_SSL`, all of which are
+forwarded there too.
 
 What it can never do, by design rather than by default:
 

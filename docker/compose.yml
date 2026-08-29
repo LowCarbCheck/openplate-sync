@@ -64,6 +64,9 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      # Fixed: the published mapping below targets container port 3000, so a
+      # PORT set in .env would only move the listener away from it. Change the
+      # host side with SYNC_PORT instead.
       PORT: 3000
       DATABASE_URL: postgres://${POSTGRES_USER:-openplate}:${POSTGRES_PASSWORD:-openplate}@postgres:5432/${POSTGRES_DB:-openplate_sync}
       SERVER_SECRET: ${SERVER_SECRET:?set SERVER_SECRET in .env — see .env.example}
@@ -80,6 +83,17 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_SECURE: ${SMTP_SECURE:-false}
+      # Off by default, and each is inert until forwarded here — Compose passes
+      # only what this block names, so a variable set in `.env` alone never
+      # reaches the container.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      SYNC_SHARING: ${SYNC_SHARING:-false}
+      SYNC_RESEARCH: ${SYNC_RESEARCH:-false}
+      PIGEON_API_KEY: ${PIGEON_API_KEY:-}
+      PIGEON_BASE_URL: ${PIGEON_BASE_URL:-}
+      # Only for an EXTERNAL database. The bundled Postgres above speaks plain
+      # TCP on the compose network.
+      DATABASE_SSL: ${DATABASE_SSL:-false}
     ports:
       - '${SYNC_PORT:-3000}:3000'
 

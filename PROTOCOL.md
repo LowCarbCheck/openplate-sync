@@ -400,7 +400,7 @@ Unauthenticated, IP-throttled.
 | Status | Meaning                                                                                                                |
 | ------ | ---------------------------------------------------------------------------------------------------------------------- |
 | `201`  | `{"account": {...}, "tokens": {...} \| null}`. `tokens` is `null` when the server requires email verification.         |
-| `400`  | Malformed email, `authHash` not 32 decoded bytes, or a descriptor without a 16-byte salt and positive Argon2id params. |
+| `400`  | Malformed email, `authHash` not 32 decoded bytes, or a descriptor without a 16-byte salt and positive Argon2id params. An address is malformed unless its domain carries at least one dot, so a bare host like `admin@localhost` is rejected. |
 | `403`  | This instance is not accepting new accounts (`SIGNUPS_OPEN=false`).                                                    |
 | `409`  | An account already exists for this email.                                                                              |
 | `429`  | Throttled. `Retry-After` in seconds.                                                                                   |
@@ -417,7 +417,7 @@ Unauthenticated, throttled per IP **and** email.
 
 Request `{"email": "...", "authHash": "..."}` → `200` `{"account": {...}, "tokens": {...}}`.
 
-`401` for an unknown account and for a wrong auth-hash, with **identical** body text. `403` if verification is required and the address is unconfirmed. `429` when throttled.
+`400` when `email` is not a plausible address or `authHash` is not 32 base64-decoded bytes — the request never reaches the credential check, so this status carries no information about whether the account exists. `401` for an unknown account and for a wrong auth-hash, with **identical** body text. `403` if verification is required and the address is unconfirmed. `429` when throttled.
 
 ### 5.10 `POST /v1/auth/refresh`
 
