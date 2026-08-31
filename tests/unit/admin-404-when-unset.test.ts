@@ -29,6 +29,9 @@ const ADMIN_PATHS: readonly { method: string; path: string }[] = [
   { method: 'GET', path: '/v1/admin/accounts/1' },
   { method: 'DELETE', path: '/v1/admin/accounts/1' },
   { method: 'GET', path: '/v1/admin/stats' },
+  { method: 'GET', path: '/v1/admin/invites' },
+  { method: 'POST', path: '/v1/admin/invites' },
+  { method: 'DELETE', path: '/v1/admin/invites/1' },
   { method: 'GET', path: '/v1/admin' },
   { method: 'GET', path: '/v1/admin/anything-else' },
 ];

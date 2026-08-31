@@ -20,7 +20,7 @@ function baseEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 test('a minimal valid environment parses with sane defaults', () => {
   const config = parseConfig(baseEnv());
   assert.equal(config.port, 3000);
-  assert.equal(config.signupsOpen, true);
+  assert.equal(config.signupMode, 'open');
   assert.equal(config.requireEmailVerification, false);
   assert.equal(config.trustProxy, false);
   assert.equal(config.logLevel, 'info');
@@ -47,12 +47,22 @@ test('a short SERVER_SECRET is fatal', () => {
   assert.throws(() => parseConfig(baseEnv({ SERVER_SECRET: 'too-short' })), /SERVER_SECRET/);
 });
 
-test('SIGNUPS_OPEN accepts the documented spellings and rejects anything else', () => {
-  assert.equal(parseConfig(baseEnv({ SIGNUPS_OPEN: 'false' })).signupsOpen, false);
-  assert.equal(parseConfig(baseEnv({ SIGNUPS_OPEN: '0' })).signupsOpen, false);
-  assert.equal(parseConfig(baseEnv({ SIGNUPS_OPEN: 'true' })).signupsOpen, true);
+test('SIGNUP_MODE accepts its three values and rejects anything else', () => {
+  assert.equal(parseConfig(baseEnv({ SIGNUP_MODE: 'open' })).signupMode, 'open');
+  assert.equal(parseConfig(baseEnv({ SIGNUP_MODE: 'invite' })).signupMode, 'invite');
+  assert.equal(parseConfig(baseEnv({ SIGNUP_MODE: 'closed' })).signupMode, 'closed');
   // A typo must not silently mean "open".
-  assert.throws(() => parseConfig(baseEnv({ SIGNUPS_OPEN: 'yes' })), /SIGNUPS_OPEN/);
+  assert.throws(() => parseConfig(baseEnv({ SIGNUP_MODE: 'inviteonly' })), /SIGNUP_MODE/);
+});
+
+test('the removed SIGNUPS_OPEN is fatal rather than ignored', () => {
+  // The direction matters more than the rejection. SIGNUPS_OPEN defaulted to
+  // OPEN and is what has been holding the hosted instance shut; ignoring it
+  // would let a deploy that lands before the env change silently reopen public
+  // registration. Both spellings must throw, including the one an operator
+  // used to mean "closed".
+  assert.throws(() => parseConfig(baseEnv({ SIGNUPS_OPEN: 'false' })), /SIGNUP_MODE/);
+  assert.throws(() => parseConfig(baseEnv({ SIGNUPS_OPEN: 'true' })), /SIGNUP_MODE/);
 });
 
 test('TRUST_PROXY accepts a hop count as well as a boolean', () => {

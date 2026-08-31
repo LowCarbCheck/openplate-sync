@@ -41,12 +41,20 @@ export class CliError extends Error {
 }
 
 /** The verbs the admin API actually uses. Anything else is a typo, not a feature. */
-export type HttpMethod = 'GET' | 'DELETE';
+export type HttpMethod = 'GET' | 'POST' | 'DELETE';
+
+/** The body of a mint request. The only request in this CLI that sends one. */
+export interface MintInviteRequestBody {
+  note: string | null;
+  expiresInDays?: number;
+}
 
 export interface AdminRequest {
   readonly method: HttpMethod;
   /** Absolute path on the service, e.g. `/v1/admin/accounts`. */
   readonly path: string;
+  /** Sent as JSON on a `POST`. Never carries a credential — the token stays in the header. */
+  readonly body?: MintInviteRequestBody;
 }
 
 export interface AdminClientOptions {
@@ -75,10 +83,16 @@ function describeStatus(status: number, method: HttpMethod, path: string): strin
     return `The service rejected the admin token (401 on ${where}). Check ADMIN_TOKEN — it must be the same value the service was started with.`;
   }
   if (status === 404) {
-    return `The service answered 404 for ${where}. Either that account does not exist, or this instance has no admin API — /v1/admin answers 404 when ADMIN_TOKEN is unset on the server.`;
+    // The subject differs per resource, and on the invite tree 404 carries a
+    // third meaning worth naming: a REDEEMED invite refuses revocation,
+    // because the row is the audit record of where an account came from.
+    const subject = path.startsWith('/v1/admin/invites')
+      ? 'that invite does not exist or has already been redeemed (a redeemed invite is kept, and cannot be revoked)'
+      : 'that account does not exist';
+    return `The service answered 404 for ${where}. Either ${subject}, or this instance has no admin API — /v1/admin answers 404 when ADMIN_TOKEN is unset on the server.`;
   }
   if (status === 400) {
-    return `The service rejected ${where} as invalid (400). Check --limit and --offset: a limit is 0–200 and an offset a whole number.`;
+    return `The service rejected ${where} as invalid (400). Check --limit and --offset (a limit is 0–200, an offset a whole number) and --expires-in-days (1–365).`;
   }
   if (status === 429) {
     return `The service rate-limited ${where} (429). Wait a minute and try again.`;
@@ -107,7 +121,7 @@ export class AdminClient {
    */
   async request(request: AdminRequest): Promise<JsonValue> {
     const url = joinUrl(this.baseUrl, request.path);
-    const response = await this.send(url, request.method);
+    const response = await this.send(url, request.method, request.body);
 
     if (!response.ok) {
       // The body is NOT read. See the module header — this is the whole point.
@@ -116,15 +130,22 @@ export class AdminClient {
     return this.readJson(response, url);
   }
 
-  private async send(url: string, method: HttpMethod): Promise<Response> {
+  private async send(url: string, method: HttpMethod, body?: MintInviteRequestBody): Promise<Response> {
+    // Named rather than an open dictionary, so the one header that carries the
+    // credential is part of a fixed shape and cannot be joined by a key some
+    // later edit computes.
+    const headers = {
+      // THE ONLY PLACE THE ADMIN TOKEN IS EVER WRITTEN. See the module header.
+      Authorization: `Bearer ${this.adminToken}`,
+      Accept: 'application/json',
+      ...(body === undefined ? undefined : { 'Content-Type': 'application/json' }),
+    } satisfies HeadersInit;
+
     try {
       return await this.fetchImpl(url, {
         method,
-        headers: {
-          // THE ONLY PLACE THE ADMIN TOKEN IS EVER WRITTEN. See the module header.
-          Authorization: `Bearer ${this.adminToken}`,
-          Accept: 'application/json',
-        },
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch {
       // The transport error is discarded rather than quoted: undici's message

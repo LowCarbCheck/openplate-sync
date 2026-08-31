@@ -11,6 +11,10 @@
  *
  * It deliberately does NOT simulate a transaction rollback. Atomicity is a
  * property of Postgres, and the integration suite is where it is exercised.
+ * `redeemInviteAndCreateAccount` therefore reproduces the RULES the real
+ * transaction enforces (one redemption per invite; a taken email leaves the
+ * invite spendable) by ordering its writes, not by rolling anything back. The
+ * concurrency guarantee behind those rules is only testable against Postgres.
  */
 import type {
   AccountRecord,
@@ -19,6 +23,8 @@ import type {
   CreateAccountResult,
   KeyRecordSubmission,
   NewTokenInput,
+  RedeemInviteAndCreateAccountInput,
+  RedeemInviteResult,
   RotateCredentialInput,
   StoredToken,
 } from '../../src/accounts/account-store.js';
@@ -30,6 +36,12 @@ interface StoredTokenRow extends StoredToken {
   tokenHash: string;
 }
 
+interface FakeInviteRow {
+  tokenHash: string;
+  expiresAt: Date;
+  redeemedAt: Date | null;
+}
+
 export interface FakeAccountStore extends AccountStore {
   /** Test-only: the key records a rotation wrote, by account then kind. */
   keyRecordsFor(accountId: number): Map<SyncKeyRecordKind, KeyRecordSubmission>;
@@ -37,12 +49,17 @@ export interface FakeAccountStore extends AccountStore {
   allTokens(): StoredTokenRow[];
   /** Test-only: whether the account row still exists. */
   hasAccount(accountId: number): boolean;
+  /** Test-only: seeds an invite so a handler test can redeem one without an admin API. */
+  seedInvite(input: { tokenHash: string; expiresAt: Date }): void;
+  /** Test-only: whether the invite is still spendable — the assertion a "409 must not burn it" test makes. */
+  inviteIsRedeemable(tokenHash: string): boolean;
 }
 
 export function createFakeAccountStore(): FakeAccountStore {
   const accountsById = new Map<number, AccountRecord>();
   const tokens: StoredTokenRow[] = [];
   const keyRecords = new Map<number, Map<SyncKeyRecordKind, KeyRecordSubmission>>();
+  const invites: FakeInviteRow[] = [];
   let nextAccountId = 1;
   let nextTokenId = 1;
 
@@ -88,6 +105,35 @@ export function createFakeAccountStore(): FakeAccountStore {
       };
       accountsById.set(account.id, account);
       return { ok: true, account: { ...account } };
+    },
+
+    async redeemInviteAndCreateAccount(input: RedeemInviteAndCreateAccountInput): Promise<RedeemInviteResult> {
+      const invite = invites.find((row) => row.tokenHash === input.inviteTokenHash);
+      // Unknown, expired and already-spent collapse into one answer here for
+      // the same reason they do in the real store: the caller must not be able
+      // to tell them apart.
+      if (!invite || invite.redeemedAt !== null || invite.expiresAt.getTime() <= input.now.getTime()) {
+        return { ok: false, reason: 'invite-invalid' };
+      }
+
+      const created = await this.createAccount(input.account);
+      // The invite is marked spent ONLY on success. This fake cannot roll a
+      // transaction back, but it can honour the rule the transaction exists to
+      // enforce — a duplicate email must leave the invite redeemable — by
+      // simply not claiming it until the account exists.
+      if (!created.ok) return { ok: false, reason: 'email-taken' };
+
+      invite.redeemedAt = input.now;
+      return { ok: true, account: created.account };
+    },
+
+    seedInvite(input: { tokenHash: string; expiresAt: Date }): void {
+      invites.push({ tokenHash: input.tokenHash, expiresAt: input.expiresAt, redeemedAt: null });
+    },
+
+    inviteIsRedeemable(tokenHash: string): boolean {
+      const invite = invites.find((row) => row.tokenHash === tokenHash);
+      return invite !== undefined && invite.redeemedAt === null;
     },
 
     async deleteAccount(accountId: number): Promise<void> {

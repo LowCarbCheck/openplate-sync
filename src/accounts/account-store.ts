@@ -57,6 +57,23 @@ export interface CreateAccountInput {
 /** `email-taken` is the ONLY expected failure; anything else is a real fault and throws. */
 export type CreateAccountResult = { ok: true; account: AccountRecord } | { ok: false; reason: 'email-taken' };
 
+/**
+ * The outcome of an invited signup. `invite-invalid` is ONE member covering
+ * unknown, expired and already-redeemed tokens: the caller must not be able to
+ * tell those apart, and a single member makes that a type-level guarantee
+ * rather than three call sites remembering to say the same thing.
+ */
+export type RedeemInviteResult =
+  { ok: true; account: AccountRecord } | { ok: false; reason: 'email-taken' | 'invite-invalid' };
+
+export interface RedeemInviteAndCreateAccountInput {
+  /** SHA-256 hex of the token the caller presented. The raw token never reaches the store. */
+  inviteTokenHash: string;
+  /** The caller's clock, injected. Expiry is judged against this, never the database's `now()` — see the method's doc. */
+  now: Date;
+  account: CreateAccountInput;
+}
+
 /** A client-re-wrapped DEK submitted as part of a credential rotation. */
 export interface KeyRecordSubmission {
   kind: SyncKeyRecordKind;
@@ -112,6 +129,32 @@ export interface AccountStore {
    * again, and the user has no way to tell until they try.
    */
   rotateCredential(input: RotateCredentialInput): Promise<void>;
+
+  /**
+   * ATOMIC invited signup: consume one invite and create the account it paid
+   * for, in ONE transaction (M166).
+   *
+   * THIS METHOD EXISTS SO THE HANDLERS STAY PURE. `handleSignup` is policy over
+   * an injected context and owns no transaction — that is what lets every auth
+   * outcome be unit-tested with no database. Consuming an invite and creating
+   * an account is two writes that must succeed or fail together, so the
+   * atomicity lives here, in the store, exactly as `rotateCredential` does.
+   *
+   * IT NEEDS BOTH GUARDS, NOT EITHER:
+   *
+   *  - A conditional `UPDATE ... WHERE redeemed_at IS NULL` closes the
+   *    double-redeem race. Two concurrent redemptions of one invite: exactly
+   *    one of them updates a row, because the second finds the predicate false.
+   *  - The surrounding TRANSACTION is what gives the invite back when
+   *    `createAccount` then hits the unique violation on `email`. Without it,
+   *    probing a taken address would destroy a capability the person still
+   *    needs. A `409` must cost the invite nothing.
+   *
+   * Expiry is compared against `input.now`, never the database clock. A rule
+   * judged by `now()` inside SQL cannot be exercised by the pure test rig that
+   * every other expiry rule in this service is tested through.
+   */
+  redeemInviteAndCreateAccount(input: RedeemInviteAndCreateAccountInput): Promise<RedeemInviteResult>;
 
   /** Housekeeping: drops rows whose `expiresAt` is far enough in the past to be useless even for reuse detection. */
   purgeExpiredTokens(input: { before: Date }): Promise<number>;

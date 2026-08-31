@@ -353,8 +353,10 @@ Responses:
 Unauthenticated, deliberately: a client must be able to discover that it is incompatible _before_ it has credentials, and a healthcheck that needed a token would be reporting on the token.
 
 ```json
-{ "protocolVersion": 1, "envelopeVersion": 1, "serviceVersion": "0.1.0" }
+{ "protocolVersion": 1, "envelopeVersion": 1, "serviceVersion": "0.1.0", "signupMode": "invite" }
 ```
+
+`signupMode` is `open`, `invite` or `closed` (§5.8.1), and it is **optional**: a service older than the field omits it, and a client must treat its absence as "attempt the signup and handle the `403`" rather than as a refusal to talk. It is published because it is not a secret — `POST /v1/auth/signup` already discloses it to anyone who calls it — and it saves a client from provoking an error to decide which form to draw.
 
 ---
 
@@ -401,7 +403,7 @@ Unauthenticated, IP-throttled.
 | ------ | ---------------------------------------------------------------------------------------------------------------------- |
 | `201`  | `{"account": {...}, "tokens": {...} \| null}`. `tokens` is `null` when the server requires email verification.         |
 | `400`  | Malformed email, `authHash` not 32 decoded bytes, or a descriptor without a 16-byte salt and positive Argon2id params. An address is malformed unless its domain carries at least one dot, so a bare host like `admin@localhost` is rejected. |
-| `403`  | This instance is not accepting new accounts (`SIGNUPS_OPEN=false`).                                                    |
+| `403`  | Either this instance is not accepting new accounts (`SIGNUP_MODE=closed`), or it requires an invite and none was given, or the one given was not valid (`SIGNUP_MODE=invite`). The two carry different `error` text; show the message rather than infer a cause. |
 | `409`  | An account already exists for this email.                                                                              |
 | `429`  | Throttled. `Retry-After` in seconds.                                                                                   |
 
@@ -409,7 +411,21 @@ The server stores `HMAC-SHA-256(serverPepper, authHash)`, **not** a second slow 
 
 **The `409` is a genuine account-enumeration oracle — the only one in this protocol — and it is accepted rather than removed.** The usual fix (always `202`, move the truth into an email) requires guaranteed mail delivery, and this service's default configuration has none: with `REQUIRE_EMAIL_VERIFICATION` off and the console mail transport, a duplicate signup answered with `202` would tell the user their account was created when it was not, with no email arriving to correct it. The oracle-free variant is therefore unavailable in the configuration most self-hosters run, not merely inconvenient.
 
-It is bounded by the per-IP signup throttle, removed entirely by `SIGNUPS_OPEN=false`, and deliberately not repeated anywhere else: `kdf`, `login` and `request-reset` all stay indistinguishable. Full reasoning: [`SECURITY.md`](./SECURITY.md).
+It is bounded by the per-IP signup throttle, removed entirely by `SIGNUP_MODE=closed`, narrowed but NOT removed by `SIGNUP_MODE=invite`, and deliberately not repeated anywhere else: `kdf`, `login` and `request-reset` all stay indistinguishable. Full reasoning: [`SECURITY.md`](./SECURITY.md).
+
+#### 5.8.1 Invites
+
+On an instance running `SIGNUP_MODE=invite`, the signup body carries one extra field:
+
+```json
+{ "inviteToken": "<the token the operator gave you>" }
+```
+
+An invite is a single-use, expiring capability. It is **not** addressed to an email address, so anyone holding it may use it, once. Unknown, malformed, missing, expired and already-redeemed tokens all produce the SAME `403` and the same message: telling them apart would let a caller probe which tokens exist, and would disclose that a token had once been real.
+
+A signup that fails for any other reason does **not** consume the invite. In particular a `409` (address already registered) leaves it spendable, so a typo does not cost somebody their invitation. The service enforces this with a conditional update inside a transaction, so concurrent redemptions of one invite still produce exactly one account.
+
+Instances advertise their mode on the `/health` handshake as `signupMode` (§5.6). Treat it as a hint for rendering the right form; the `403` remains the contract, because an operator can change the mode between the handshake and the submit.
 
 ### 5.9 `POST /v1/auth/login`
 

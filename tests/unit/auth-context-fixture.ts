@@ -10,6 +10,7 @@
 import { createSilentLogger } from '../../src/logger.js';
 import { hashToken, type GeneratedToken } from '../../src/lib/tokens.js';
 import type { AuthContext } from '../../src/accounts/auth-handlers.js';
+import type { SignupMode } from '../../src/protocol.js';
 import type { MailMessage, MailResult } from '../../src/mail/transport.js';
 import { createFakeAccountStore, type FakeAccountStore } from './fake-account-store.js';
 
@@ -27,7 +28,7 @@ export interface AuthFixture {
 }
 
 export interface AuthFixtureOptions {
-  signupsOpen?: boolean;
+  signupMode?: SignupMode;
   requireEmailVerification?: boolean;
   startAt?: Date;
 }
@@ -50,7 +51,7 @@ export function createAuthFixture(options: AuthFixtureOptions = {}): AuthFixture
     store,
     pepper: 'unit-test-pepper',
     enumerationSecret: 'unit-test-enumeration-secret',
-    signupsOpen: options.signupsOpen ?? true,
+    signupMode: options.signupMode ?? 'open',
     requireEmailVerification: options.requireEmailVerification ?? false,
     clientBaseUrl: 'https://app.example.test',
     async sendMail(message: MailMessage): Promise<MailResult> {

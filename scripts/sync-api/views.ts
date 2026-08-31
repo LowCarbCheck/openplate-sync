@@ -97,6 +97,98 @@ export function decodeSingleAccount(value: JsonValue): AccountView {
   return decodeAccount(body.account);
 }
 
+export interface InviteView {
+  id: number;
+  note: string | null;
+  createdAt: string;
+  expiresAt: string;
+  redeemedAt: string | null;
+  redeemedAccountId: number | null;
+}
+
+export interface InvitePageView {
+  invites: InviteView[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** A freshly minted invite. The only decoded shape in this CLI that carries a secret. */
+export interface MintedInviteView {
+  invite: InviteView;
+  token: string;
+}
+
+function decodeInvite(value: JsonValue): InviteView {
+  const invite = asObject(value);
+  const id = asNumber(invite?.id);
+  const createdAt = asString(invite?.createdAt);
+  const expiresAt = asString(invite?.expiresAt);
+  if (id === null || createdAt === null || expiresAt === null) throw undocumentedResponse('invite');
+
+  return {
+    id,
+    note: asString(invite?.note),
+    createdAt,
+    expiresAt,
+    redeemedAt: asString(invite?.redeemedAt),
+    redeemedAccountId: asNumber(invite?.redeemedAccountId),
+  };
+}
+
+export function decodeInvitePage(value: JsonValue): InvitePageView {
+  const body = asObject(value);
+  const invites = asArray(body?.invites);
+  const total = asNumber(body?.total);
+  if (invites === null || total === null) throw undocumentedResponse('invite list');
+
+  return {
+    invites: invites.map(decodeInvite),
+    total,
+    limit: asNumber(body?.limit) ?? invites.length,
+    offset: asNumber(body?.offset) ?? 0,
+  };
+}
+
+export function decodeMintedInvite(value: JsonValue): MintedInviteView {
+  const body = asObject(value);
+  const token = asString(body?.token);
+  if (body?.invite === undefined || token === null) throw undocumentedResponse('minted invite');
+  return { invite: decodeInvite(body.invite), token };
+}
+
+/**
+ * Renders the one-time token, loudly.
+ *
+ * It is printed on its own line with nothing after it, so a copy-paste picks
+ * up the token and not a trailing word. The warning is above rather than below
+ * it: an operator who scrolls stops reading once they have the value.
+ */
+export function formatMintedInvite(minted: MintedInviteView, clientBaseUrl: string | null): string {
+  const link = clientBaseUrl === null ? null : `${clientBaseUrl.replace(/\/+$/, '')}/settings/sync#invite=${minted.token}`;
+  return [
+    `Invite ${minted.invite.id} minted${minted.invite.note === null ? '' : ` for "${minted.invite.note}"`}.`,
+    `Expires ${minted.invite.expiresAt}. It can create ONE account.`,
+    '',
+    'This token is shown once and is not stored. If you lose it, revoke the invite and mint another.',
+    '',
+    link === null ? minted.token : link,
+  ].join('\n');
+}
+
+export function formatInviteTable(page: InvitePageView): string {
+  if (page.invites.length === 0) return 'No invites.';
+
+  const header = `${pad('ID', 6)}${pad('NOTE', 28)}${pad('EXPIRES', 26)}${pad('STATE', 12)}ACCOUNT`;
+  const rows = page.invites.map((invite) => {
+    const state = invite.redeemedAt === null ? 'open' : 'redeemed';
+    const account = invite.redeemedAccountId === null ? '—' : String(invite.redeemedAccountId);
+    return `${pad(String(invite.id), 6)}${pad(invite.note ?? '—', 28)}${pad(invite.expiresAt, 26)}${pad(state, 12)}${account}`;
+  });
+  const shown = page.offset + page.invites.length;
+  return [header, ...rows, '', `${page.invites.length} of ${page.total} invites (through ${shown}).`].join('\n');
+}
+
 export function decodeStats(value: JsonValue): StatsView {
   const stats = asObject(asObject(value)?.stats);
   const accounts = asNumber(stats?.accounts);

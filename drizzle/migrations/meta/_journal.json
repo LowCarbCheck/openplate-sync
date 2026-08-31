@@ -43,6 +43,13 @@
       "when": 1787841961162,
       "tag": "0005_cool_cassandra_nova",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788209046499,
+      "tag": "0006_ambitious_glorian",
+      "breakpoints": true
     }
   ]
 }

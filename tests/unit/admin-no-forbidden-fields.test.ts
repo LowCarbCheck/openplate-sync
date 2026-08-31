@@ -28,6 +28,12 @@ import { asArray, asNumber, asObject, asString, type JsonValue } from '../../src
 import { startAdminHarness, type AdminHarness } from './admin-harness.js';
 import type { AdminSeedSecrets } from './fake-admin-store.js';
 
+/** The two invite values that must never appear in a read response. */
+interface InviteSeedSecrets {
+  token: string;
+  digest: string;
+}
+
 const ADMIN_TOKEN = 'admin-token-for-the-unit-suite-0123456789';
 
 /** Names that must not appear as a key — or anywhere else — in an admin body. */
@@ -35,6 +41,8 @@ const FORBIDDEN_NAMES = ['ciphertext', 'verifier', 'kdfDescriptor', 'kdf_descrip
 
 let harness: AdminHarness;
 let secrets: AdminSeedSecrets;
+/** A minted invite's raw token and digest — neither may appear in any READ body. */
+let inviteSecrets: InviteSeedSecrets;
 
 before(async () => {
   harness = await startAdminHarness({ adminToken: ADMIN_TOKEN });
@@ -48,13 +56,28 @@ before(async () => {
     blobSizeBytes: 4096,
     keyRecordKinds: ['passphrase', 'recovery'],
   });
+
+  // An invite exists too, and it is REDEEMED — the state that carries the most
+  // to leak, since it links a capability to an account. Its raw token is a
+  // secret the mint response legitimately returned once; every read after that
+  // must be free of both it and its digest.
+  const minted = await harness.invites.mint({ note: 'a person', expiresAt: new Date('2027-01-01T00:00:00.000Z') });
+  harness.invites.markRedeemed(minted.invite.id, 3);
+  const digest = harness.invites.digestOf(minted.invite.id);
+  if (digest === undefined) throw new Error('expected the fake store to hold a digest');
+  inviteSecrets = { token: minted.token, digest };
 });
 
 after(async () => {
   await harness.close();
 });
 
-const READ_ENDPOINTS: readonly string[] = ['/v1/admin/accounts', '/v1/admin/accounts/3', '/v1/admin/stats'];
+const READ_ENDPOINTS: readonly string[] = [
+  '/v1/admin/accounts',
+  '/v1/admin/accounts/3',
+  '/v1/admin/stats',
+  '/v1/admin/invites',
+];
 
 test('no admin response body names a forbidden field', async () => {
   for (const path of READ_ENDPOINTS) {
@@ -75,6 +98,11 @@ test('no admin response body contains the seeded secret values', async () => {
     secrets.wrappedDek,
     secrets.ciphertext,
     secrets.tokenHash,
+    // The invite carve-out has exactly one exception, and this is what pins it
+    // to that one place: the raw token may appear in the MINT response and
+    // nowhere else. See ADR-0001.
+    inviteSecrets.token,
+    inviteSecrets.digest,
   ];
 
   for (const path of READ_ENDPOINTS) {

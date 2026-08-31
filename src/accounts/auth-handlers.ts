@@ -16,7 +16,14 @@
  * HKDF branch; the passphrase-KEK is another, with a different `info` label.
  * `wrappedDek` bytes pass through as opaque input to the store.
  */
-import type { AccountRecord, AccountStore, KeyRecordSubmission, NewTokenInput } from './account-store.js';
+import type {
+  AccountRecord,
+  AccountStore,
+  CreateAccountInput,
+  KeyRecordSubmission,
+  NewTokenInput,
+  RedeemInviteResult,
+} from './account-store.js';
 import type { KdfDescriptor } from '../lib/kdf-descriptor.js';
 import { deriveDummyKdfDescriptor } from '../lib/kdf-descriptor.js';
 import { computeVerifier, verifierMatches } from '../lib/verifier.js';
@@ -41,6 +48,7 @@ import {
   parseTokenField,
 } from './auth-input.js';
 import type { JsonObject, JsonValue } from '../lib/json.js';
+import type { SignupMode } from '../protocol.js';
 
 /** Everything the handlers need from the outside world. All of it injected — none of it imported. */
 export interface AuthContext {
@@ -49,7 +57,8 @@ export interface AuthContext {
   pepper: string;
   /** `HMAC` key behind deterministic dummy KDF descriptors. */
   enumerationSecret: string;
-  signupsOpen: boolean;
+  /** How this instance treats new accounts. `'invite'` requires a token minted by the operator. */
+  signupMode: SignupMode;
   requireEmailVerification: boolean;
   clientBaseUrl: string;
   sendMail(message: MailMessage): Promise<MailResult>;
@@ -234,11 +243,45 @@ export async function handleGetKdfDescriptor(
 // Signup
 // ---------------------------------------------------------------------------
 
+/**
+ * Creates the account the way this instance's {@link SignupMode} demands.
+ *
+ * `'closed'` never reaches here — `handleSignup` refuses before parsing. The
+ * split exists so the invite rules live in one place instead of being threaded
+ * through the success path as conditionals.
+ */
+async function createAccountForMode(
+  ctx: AuthContext,
+  fields: Readonly<Record<string, JsonValue | undefined>>,
+  account: CreateAccountInput,
+): Promise<RedeemInviteResult> {
+  if (ctx.signupMode !== 'invite') {
+    const created = await ctx.store.createAccount(account);
+    return created.ok ? created : { ok: false, reason: 'email-taken' };
+  }
+
+  const inviteToken = parseTokenField(fields.inviteToken);
+  // A missing or malformed token is reported as `invite-invalid`, NOT as a
+  // `400`. A caller must not be able to learn what a well-formed invite looks
+  // like by watching the status code change.
+  if (!inviteToken.ok) return { ok: false, reason: 'invite-invalid' };
+
+  return await ctx.store.redeemInviteAndCreateAccount({
+    inviteTokenHash: hashToken(inviteToken.value),
+    now: ctx.now(),
+    account,
+  });
+}
+
 export async function handleSignup(
   body: JsonValue | undefined,
   ctx: AuthContext,
 ): Promise<AuthOutcome<SessionResponse>> {
-  if (!ctx.signupsOpen) {
+  // Mode is checked BEFORE any field is parsed, and the order is deliberate: a
+  // closed instance must answer the same `403` to a well-formed body and a
+  // malformed one. Parsing first would leak, through the difference between a
+  // `400` and a `403`, which submissions were structurally valid.
+  if (ctx.signupMode === 'closed') {
     return { status: 'forbidden', reason: 'this instance is not accepting new accounts' };
   }
 
@@ -252,12 +295,25 @@ export async function handleSignup(
   const displayName = parseDisplayName(fields.displayName);
   if (!displayName.ok) return invalid(displayName.reason);
 
-  const created = await ctx.store.createAccount({
+  const accountInput = {
     email: email.value,
     displayName: displayName.value,
     verifier: computeVerifier({ authHash: authHash.value, pepper: ctx.pepper }),
     kdfDescriptor: kdfDescriptor.value,
-  });
+  };
+
+  // Two paths to one result. In invite mode the account and the invite must be
+  // written together, so the store owns the transaction (see
+  // `redeemInviteAndCreateAccount`); this handler stays free of one, which is
+  // what keeps every outcome here testable without a database.
+  const created = await createAccountForMode(ctx, fields, accountInput);
+  if (created.ok === false && created.reason === 'invite-invalid') {
+    // ONE message for unknown, expired, already-spent and missing. Telling
+    // them apart would turn a mistyped token into a probe for which tokens
+    // exist, and would let a spent invite be distinguished from a fictional
+    // one.
+    return { status: 'forbidden', reason: 'a valid invite is required to create an account here' };
+  }
   if (!created.ok) {
     // ACCEPTED ENUMERATION ORACLE, not an oversight. This 409 tells the caller
     // the address is registered — the one place in this service that does.
@@ -267,7 +323,17 @@ export async function handleSignup(
     // matches Bitwarden's behaviour, and it is bounded by the per-IP signup
     // throttle in `register-auth-routes.ts`. Every OTHER path — kdf, login,
     // request-reset — stays indistinguishable.
-    // Full reasoning: docs/adr/002-signup-enumeration-tradeoff.md
+    //
+    // In INVITE mode this 409 is reachable only by someone holding a valid
+    // invite, and it does NOT consume it (see
+    // `AccountStore.redeemInviteAndCreateAccount`) — so one invite holder can
+    // probe many addresses. That widening is accepted and bounded by the same
+    // per-IP throttle; invite mode still exposes the oracle to strictly fewer
+    // people than open mode does.
+    //
+    // Full reasoning: SECURITY.md and PROTOCOL.md §5.8. (Until M166 this
+    // comment cited an ADR under `docs/adr/` that was never written. The
+    // argument it promised is real and lives in those two documents.)
     return { status: 'conflict', reason: 'an account already exists for this email' };
   }
 

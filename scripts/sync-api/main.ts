@@ -29,7 +29,7 @@
  * command in this tool that cannot be undone.
  */
 import { parseArgs } from 'node:util';
-import { AdminClient, CliError } from './client.js';
+import { AdminClient, CliError, type MintInviteRequestBody } from './client.js';
 import {
   decodeAccountPage,
   decodeHandshake,
@@ -38,6 +38,10 @@ import {
   formatAccountDetail,
   formatAccountTable,
   formatStats,
+  decodeInvitePage,
+  decodeMintedInvite,
+  formatInviteTable,
+  formatMintedInvite,
 } from './views.js';
 
 const DEFAULT_BASE_URL = 'http://localhost:3000';
@@ -52,13 +56,19 @@ const USAGE = `sync-api — the openplate-sync admin CLI
     accounts list              List accounts (metadata only)
     accounts get <id>          One account's metadata
     accounts delete <id> --yes Erase an account and everything attached to it
+    invites list               Outstanding and spent signup invites
+    invites create             Mint one invite; prints the token ONCE
+    invites revoke <id> --yes  Withdraw an unredeemed invite
 
   Options:
     --url <base>   Service base URL (default: SYNC_SERVER_URL, else ${DEFAULT_BASE_URL})
     --limit <n>    Page size for "accounts list" (default 50, max 200)
     --offset <n>   Page offset for "accounts list" (default 0)
     --json         Print the decoded response as JSON (read commands only)
-    --yes          Required by "accounts delete"; without it nothing is sent
+    --yes          Required by "accounts delete" and "invites revoke"
+    --note <text>  Who an invite is for. Stored as an operator label only
+    --expires-in-days <n>  Invite lifetime, 1–365 (default 14)
+    --client-url <base>    Render the invite as a sign-up link on this origin
 
   Authentication:
     ADMIN_TOKEN must be set in the environment. There is no --token flag, on
@@ -70,6 +80,9 @@ interface Invocation {
   baseUrl: string;
   limit: string | null;
   offset: string | null;
+  note: string | null;
+  expiresInDays: string | null;
+  clientUrl: string | null;
   json: boolean;
   yes: boolean;
   help: boolean;
@@ -83,6 +96,9 @@ function parseInvocation(argv: string[]): Invocation {
       url: { type: 'string' },
       limit: { type: 'string' },
       offset: { type: 'string' },
+      note: { type: 'string' },
+      'expires-in-days': { type: 'string' },
+      'client-url': { type: 'string' },
       json: { type: 'boolean', default: false },
       yes: { type: 'boolean', default: false },
       help: { type: 'boolean', default: false },
@@ -95,6 +111,9 @@ function parseInvocation(argv: string[]): Invocation {
     baseUrl: parsed.values.url ?? process.env.SYNC_SERVER_URL ?? DEFAULT_BASE_URL,
     limit: parsed.values.limit ?? null,
     offset: parsed.values.offset ?? null,
+    note: parsed.values.note ?? null,
+    expiresInDays: parsed.values['expires-in-days'] ?? null,
+    clientUrl: parsed.values['client-url'] ?? process.env.CLIENT_BASE_URL ?? null,
     json: parsed.values.json === true,
     yes: parsed.values.yes === true,
     help: parsed.values.help === true,
@@ -110,6 +129,14 @@ function requireAdminToken(): string {
     );
   }
   return token;
+}
+
+function inviteIdArgument(invocation: Invocation): string {
+  const raw = invocation.command[2];
+  if (raw === undefined || raw === '') {
+    throw new CliError('That command needs an invite id, e.g. `pnpm sync-api invites revoke 3 --yes`.');
+  }
+  return encodeURIComponent(raw);
 }
 
 function accountIdArgument(invocation: Invocation): string {
@@ -166,6 +193,53 @@ async function runAccounts(client: AdminClient, invocation: Invocation): Promise
   throw new CliError(`Unknown accounts subcommand "${subcommand}". Try: list, get, delete.`);
 }
 
+async function runInvites(client: AdminClient, invocation: Invocation): Promise<void> {
+  const subcommand = invocation.command[1] ?? '';
+
+  if (subcommand === 'list') {
+    const page = decodeInvitePage(
+      await client.request({ method: 'GET', path: `/v1/admin/invites${listQuery(invocation)}` }),
+    );
+    print(invocation.json ? JSON.stringify(page, null, 2) : formatInviteTable(page));
+    return;
+  }
+
+  if (subcommand === 'create') {
+    const body: MintInviteRequestBody = { note: invocation.note };
+    if (invocation.expiresInDays !== null) {
+      const days = Number(invocation.expiresInDays);
+      // Rejected here as well as by the service, so an obvious typo costs no
+      // round trip and cannot mint an invite with a lifetime nobody meant.
+      if (!Number.isInteger(days) || days <= 0) {
+        throw new CliError('--expires-in-days must be a whole number of days, 1–365.');
+      }
+      body.expiresInDays = days;
+    }
+
+    const minted = decodeMintedInvite(await client.request({ method: 'POST', path: '/v1/admin/invites', body }));
+    // The token IS printed — this is the one command whose whole purpose is to
+    // hand the operator a secret. It is not logged by the service and cannot
+    // be fetched again.
+    print(invocation.json ? JSON.stringify(minted, null, 2) : formatMintedInvite(minted, invocation.clientUrl));
+    return;
+  }
+
+  if (subcommand === 'revoke') {
+    const id = inviteIdArgument(invocation);
+    // Checked BEFORE the request is built, as with `accounts delete`.
+    if (!invocation.yes) {
+      throw new CliError(
+        `Refusing to revoke invite ${decodeURIComponent(id)} without --yes. Anyone already holding that token loses it.`,
+      );
+    }
+    await client.request({ method: 'DELETE', path: `/v1/admin/invites/${id}` });
+    print(`Revoked invite ${decodeURIComponent(id)}.`);
+    return;
+  }
+
+  throw new CliError(`Unknown invites subcommand "${subcommand}". Try: list, create, revoke.`);
+}
+
 async function runStatus(client: AdminClient, invocation: Invocation): Promise<void> {
   const handshake = decodeHandshake(await client.request({ method: 'GET', path: '/health' }));
   // The second call is the one that proves the ADMIN surface is reachable and
@@ -196,6 +270,11 @@ async function run(argv: string[]): Promise<void> {
   // Before the client exists, so a missing credential can never become a request.
   const client = new AdminClient({ baseUrl: invocation.baseUrl, adminToken: requireAdminToken() });
   const command = invocation.command[0] ?? '';
+
+  if (command === 'invites') {
+    await runInvites(client, invocation);
+    return;
+  }
 
   if (command === 'accounts') {
     await runAccounts(client, invocation);

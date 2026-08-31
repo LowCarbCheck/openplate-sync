@@ -150,6 +150,63 @@ export type InsertAccountToken = InferInsertModel<typeof accountTokens>;
 export type SelectAccountToken = InferSelectModel<typeof accountTokens>;
 
 // =============================================================================
+// Signup invites (M166)
+// =============================================================================
+
+/**
+ * One single-use capability to create an account on an instance running
+ * `SIGNUP_MODE=invite`.
+ *
+ * DELIBERATELY NOT ADDRESSED TO ANYBODY. There is no `email` column, and that
+ * is the design rather than an omission. Binding an invite to an address would
+ * make this service store the email of a person who has NO account and gave no
+ * consent — a class of personal data it otherwise never holds. It would also
+ * break the ordinary case where somebody registers with a different address
+ * than the operator guessed. `note` carries who the invite was for, in the
+ * operator's own words; the service does not need to know.
+ *
+ * NOT IN `account_tokens`, though the lifecycle rhymes. Every row in that
+ * table belongs to an account (`account_id` is `NOT NULL`), and an invite by
+ * definition exists before one does. Widening that column to nullable to fit
+ * this in would weaken a constraint that protects every session token.
+ */
+export const signupInvites = pgTable(
+  'signup_invites',
+  {
+    id: serial('id').primaryKey(),
+    /** SHA-256 hex of the raw token, exactly as `account_tokens` stores its own. The raw value is shown once, at mint, and never persisted. */
+    tokenHash: text('token_hash').notNull(),
+    /** The operator's own label — who this was for, and why. Never parsed; never matched against a signup. */
+    note: text('note'),
+    expiresAt: timestamp('expires_at').notNull(),
+    /** Set once, by the transaction that also creates the account. NULL means still redeemable. */
+    redeemedAt: timestamp('redeemed_at'),
+    /**
+     * The account this invite produced.
+     *
+     * `set null`, NOT `cascade`. Deleting an account must not delete the
+     * evidence that an invite was spent: a cascade would silently return a
+     * used invite to a clean, unredeemed-looking state in every audit, and
+     * `redeemed_at` would be the only survivor of a row that no longer
+     * explains itself.
+     */
+    redeemedAccountId: integer('redeemed_account_id').references(() => accounts.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    // Lookup is always by digest, and a collision would let one invite redeem
+    // as another — so uniqueness here is a security property, as it is on
+    // `account_tokens`.
+    uniqueIndex('signup_invites_hash_idx').on(table.tokenHash),
+    // Supports the operator listing outstanding invites newest-first.
+    index('signup_invites_created_idx').on(table.createdAt),
+  ],
+);
+
+export type InsertSignupInvite = InferInsertModel<typeof signupInvites>;
+export type SelectSignupInvite = InferSelectModel<typeof signupInvites>;
+
+// =============================================================================
 // Sync blobs (relocated from the openplate app, M128 spec 02)
 // =============================================================================
 

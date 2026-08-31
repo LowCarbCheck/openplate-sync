@@ -60,6 +60,7 @@ import { createBearerAuthMiddleware, createEntitledUserResolver } from './bearer
 import { createCorsMiddleware } from './cors.js';
 import { createErrorMiddleware, handleNotFound } from './error-middleware.js';
 import type { AdminMetadataStore } from '../admin/admin-store.js';
+import type { InviteStore } from '../admin/invite-store.js';
 import type { ThrottleStore } from '../lib/throttle.js';
 import type { Logger } from '../logger.js';
 import { SERVICE_VERSION } from '../version.js';
@@ -74,6 +75,13 @@ export interface AdminSurfaceOptions {
   token: string;
   /** Metadata reads. Erasure goes through `authContext.store`, the same method the self-service path calls. */
   metadata: AdminMetadataStore;
+  /**
+   * Invite minting and revocation. Bound to the admin surface rather than to
+   * `SIGNUP_MODE`: an operator may want to mint invites ahead of switching the
+   * mode, and an instance that leaves invite mode still has spent invites
+   * worth listing.
+   */
+  invites: InviteStore;
 }
 
 export interface CreateAppOptions {
@@ -132,6 +140,10 @@ export function createApp(options: CreateAppOptions): Express {
       protocolVersion: PROTOCOL_VERSION,
       envelopeVersion: ENVELOPE_VERSION,
       serviceVersion: SERVICE_VERSION,
+      // Published so the client can render the right sign-up form instead of
+      // provoking a 403 to find out. Not a secret: `POST /v1/auth/signup`
+      // already tells anyone who asks. See `SignupMode`.
+      signupMode: options.authContext.signupMode,
     };
     res.status(200).json(handshake);
   });
@@ -235,7 +247,12 @@ export function createApp(options: CreateAppOptions): Express {
     app.use(
       ADMIN_API_PREFIX,
       createAdminAuthMiddleware({ adminToken: admin.token, logger: options.logger }),
-      createAdminRoutes({ metadata: admin.metadata, accounts: options.authContext.store, logger: options.logger }),
+      createAdminRoutes({
+        metadata: admin.metadata,
+        invites: admin.invites,
+        accounts: options.authContext.store,
+        logger: options.logger,
+      }),
     );
   }
 

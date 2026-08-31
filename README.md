@@ -58,7 +58,28 @@ Your reverse proxy must also allow request bodies of about **2.75 MB**. Blobs ar
   Read [`.env.example`](./.env.example) before you set it; it is a different undertaking from
   holding ciphertext you cannot read.
 
-Also worth knowing: **`SIGNUPS_OPEN=false`** closes registration on a family instance while leaving existing accounts working.
+Also worth knowing: **`SIGNUP_MODE`** decides who may register, and existing accounts keep
+working whichever you pick.
+
+| Value            | Who can create an account                            |
+| ---------------- | ---------------------------------------------------- |
+| `open` (default) | Anybody who can reach the service.                   |
+| `invite`         | Only somebody holding a single-use token you minted. |
+| `closed`         | Nobody.                                              |
+
+Invite mode needs `ADMIN_TOKEN` set, because that is what mints the tokens:
+
+```bash
+pnpm sync-api invites create --note "who it is for" --client-url https://your-app.example
+```
+
+The token is printed **once** and is not stored — only its digest is. If you lose it, revoke
+the invite and mint another. One invite creates one account, and a failed attempt (a taken
+email address, say) does not spend it.
+
+> The older **`SIGNUPS_OPEN`** variable was removed. The service now refuses to start if it is
+> set, rather than ignoring it: it defaulted to _open_, so an instance that had it set to
+> `false` would silently start accepting registrations again on the upgrade that ignored it.
 
 ### Backup and restore
 

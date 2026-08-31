@@ -12,6 +12,7 @@
  * kept in step with it.
  */
 import { isLogLevel, type LogLevel } from './logger.js';
+import { isSignupMode, SIGNUP_MODES, type SignupMode } from './protocol.js';
 
 /**
  * Minimum accepted `SERVER_SECRET` length. 32 characters is the shortest
@@ -58,7 +59,13 @@ export interface ServiceConfig {
   databaseSsl: boolean;
   /** Root secret; `lib/server-secrets.ts` derives the domain-separated subkeys from it. Never used directly. */
   serverSecret: string;
-  signupsOpen: boolean;
+  /**
+   * Whether this instance accepts new accounts, and on what terms — see
+   * {@link SignupMode}. Replaced the `SIGNUPS_OPEN` boolean in M166, which is
+   * now a boot-time error rather than a silently ignored name (see
+   * `parseSignupMode`).
+   */
+  signupMode: SignupMode;
   requireEmailVerification: boolean;
   /**
    * Where the CLIENT app lives — verification and reset links point here, not
@@ -126,6 +133,34 @@ function parseAdminToken(env: NodeJS.ProcessEnv): string | null {
     throw new Error(
       `ADMIN_TOKEN must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters — generate it, do not choose it (see .env.example)`,
     );
+  }
+  return raw;
+}
+
+/**
+ * `SIGNUP_MODE` is `open`, `invite` or `closed`, defaulting to `open` — a
+ * self-hosted family instance should work with no signup configuration at all.
+ *
+ * THE OLD NAME IS FATAL, AND THE ASYMMETRY IS THE ARGUMENT. `SIGNUPS_OPEN` also
+ * defaulted to open, and on the hosted instance it is the only thing that has
+ * been holding registration shut. If it were merely ignored, a deploy that
+ * shipped this binary before the environment was updated would silently reopen
+ * public registration on a zero-knowledge service — a door quietly unlocked,
+ * discovered by whoever walks through it first. Refusing to boot is loud, is
+ * fixed by one deploy, and cannot be missed. So the removed name throws.
+ */
+function parseSignupMode(env: NodeJS.ProcessEnv): SignupMode {
+  if (env.SIGNUPS_OPEN !== undefined) {
+    throw new Error(
+      'SIGNUPS_OPEN was replaced by SIGNUP_MODE (open|invite|closed). ' +
+        'It is rejected rather than ignored because it defaults to OPEN: ' +
+        'ignoring it would silently reopen registration on an instance that set it to false.',
+    );
+  }
+  const raw = env.SIGNUP_MODE?.trim().toLowerCase();
+  if (raw === undefined || raw === '') return 'open';
+  if (!isSignupMode(raw)) {
+    throw new Error(`Invalid SIGNUP_MODE: expected ${SIGNUP_MODES.join('/')}, got "${raw}"`);
   }
   return raw;
 }
@@ -199,7 +234,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
     databaseUrl: required(env, 'DATABASE_URL'),
     databaseSsl: parseBoolean(env, 'DATABASE_SSL', false),
     serverSecret,
-    signupsOpen: parseBoolean(env, 'SIGNUPS_OPEN', true),
+    signupMode: parseSignupMode(env),
     requireEmailVerification: parseBoolean(env, 'REQUIRE_EMAIL_VERIFICATION', false),
     clientBaseUrl: normalizeBaseUrl(required(env, 'CLIENT_BASE_URL')),
     trustProxy: parseTrustProxy(env),

@@ -108,6 +108,32 @@ export function isSyncKeyRecordKind(value: JsonValue | undefined): value is Sync
 }
 
 // ---------------------------------------------------------------------------
+// Signup policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether, and on what terms, an instance accepts new accounts.
+ *
+ *  - `'open'` — anyone may register. The default for a self-hosted instance.
+ *  - `'invite'` — registration requires a single-use token the operator minted
+ *    (`POST /v1/admin/invites`). What the hosted instance runs.
+ *  - `'closed'` — nobody may register. Existing accounts keep working.
+ *
+ * This is deliberately NOT a secret. `POST /v1/auth/signup` already discloses
+ * it to anyone who calls it, and any instance with a sign-up page shows it to
+ * every visitor. Publishing it on the handshake only saves the client from
+ * having to provoke a `403` to render the right form.
+ */
+export type SignupMode = 'open' | 'invite' | 'closed';
+
+/** Every valid {@link SignupMode}, for validation and exhaustive iteration. */
+export const SIGNUP_MODES: readonly SignupMode[] = ['open', 'invite', 'closed'];
+
+export function isSignupMode(value: JsonValue | undefined): value is SignupMode {
+  return value === 'open' || value === 'invite' || value === 'closed';
+}
+
+// ---------------------------------------------------------------------------
 // Version handshake
 // ---------------------------------------------------------------------------
 
@@ -125,6 +151,20 @@ export interface ProtocolHandshake {
   envelopeVersion: number;
   /** Human-readable build identifier — diagnostics only, never compared. */
   serviceVersion: string;
+  /**
+   * How this instance treats new accounts — see {@link SignupMode}.
+   *
+   * OPTIONAL, and it must stay optional. A service older than this field
+   * omits it entirely, and a client that required it would refuse to talk to
+   * every such instance: a compatibility break wearing the clothes of an
+   * additive change. Absent means "ask by trying" — attempt the signup and
+   * handle the `403`.
+   *
+   * It is a HINT, never the contract. An operator can close signups between
+   * the handshake and the submit, so the client keeps its `403` handling even
+   * when this said `'open'`.
+   */
+  signupMode?: SignupMode;
 }
 
 /** Result of {@link checkProtocolCompatibility} — `reason` is a user-presentable sentence. */
@@ -133,6 +173,8 @@ export type ProtocolCompatibility = { status: 'compatible' } | { status: 'incomp
 export function isProtocolHandshake(value: JsonValue | undefined): boolean {
   const candidate = asObject(value);
   if (candidate === null) return false;
+  // `signupMode` is deliberately absent from this check. It is optional on the
+  // wire, so demanding it here would reject every service older than the field.
   return (
     asNumber(candidate.protocolVersion) !== null &&
     asNumber(candidate.envelopeVersion) !== null &&

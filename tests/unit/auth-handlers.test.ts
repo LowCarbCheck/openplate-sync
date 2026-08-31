@@ -26,7 +26,7 @@ import {
   type SessionResponse,
   type SessionTokens,
 } from '../../src/accounts/auth-handlers.js';
-import { REFRESH_TOKEN_TTL_MS, ACCESS_TOKEN_TTL_MS, AUTH_RESET_TTL_MS } from '../../src/lib/tokens.js';
+import { REFRESH_TOKEN_TTL_MS, ACCESS_TOKEN_TTL_MS, AUTH_RESET_TTL_MS, hashToken } from '../../src/lib/tokens.js';
 import type { JsonObject } from '../../src/lib/json.js';
 import {
   createAuthFixture,
@@ -127,10 +127,101 @@ test('signup creates an account, sends verification mail and returns a session',
   requireTokens(session);
 });
 
-test('signup is refused when SIGNUPS_OPEN is off', async () => {
-  const fixture = createAuthFixture({ signupsOpen: false });
+test('signup is refused when the instance is closed', async () => {
+  const fixture = createAuthFixture({ signupMode: 'closed' });
   const outcome = await handleSignup(signupBody(), fixture.ctx);
   assert.equal(outcome.status, 'forbidden');
+});
+
+// ---------------------------------------------------------------------------
+// Invite-only signup (M166)
+// ---------------------------------------------------------------------------
+
+const INVITE_TOKEN = 'invite-token-for-tests';
+
+/** A fixture in invite mode with one live invite already minted. */
+function inviteFixture(options: { expiresInMs?: number } = {}) {
+  const fixture = createAuthFixture({ signupMode: 'invite' });
+  fixture.store.seedInvite({
+    tokenHash: hashToken(INVITE_TOKEN),
+    expiresAt: new Date(fixture.now().getTime() + (options.expiresInMs ?? 7 * 24 * 60 * 60 * 1000)),
+  });
+  return fixture;
+}
+
+test('an invited signup succeeds and spends the invite', async () => {
+  const fixture = inviteFixture();
+  const outcome = await handleSignup(signupBody({ inviteToken: INVITE_TOKEN }), fixture.ctx);
+  assert.equal(outcome.status, 'created');
+  assert.equal(fixture.store.inviteIsRedeemable(hashToken(INVITE_TOKEN)), false);
+});
+
+test('one invite cannot create a second account', async () => {
+  const fixture = inviteFixture();
+  const first = await handleSignup(signupBody({ inviteToken: INVITE_TOKEN }), fixture.ctx);
+  assert.equal(first.status, 'created');
+
+  const second = await handleSignup(
+    signupBody({ email: 'someone-else@example.test', inviteToken: INVITE_TOKEN }),
+    fixture.ctx,
+  );
+  assert.equal(second.status, 'forbidden');
+});
+
+test('a signup that hits a taken address leaves the invite redeemable', async () => {
+  const fixture = inviteFixture();
+  // Burn the address first, using a SECOND invite, so the address exists.
+  fixture.store.seedInvite({
+    tokenHash: hashToken('first-invite'),
+    expiresAt: new Date(fixture.now().getTime() + 60_000),
+  });
+  const first = await handleSignup(signupBody({ inviteToken: 'first-invite' }), fixture.ctx);
+  assert.equal(first.status, 'created');
+
+  const duplicate = await handleSignup(signupBody({ inviteToken: INVITE_TOKEN }), fixture.ctx);
+  assert.equal(duplicate.status, 'conflict');
+  // The 409 must cost the holder nothing.
+  assert.equal(fixture.store.inviteIsRedeemable(hashToken(INVITE_TOKEN)), true);
+});
+
+test('an expired invite is refused, and is refused as invalid rather than as expired', async () => {
+  const fixture = inviteFixture({ expiresInMs: 1000 });
+  fixture.advance(2000);
+  const outcome = await handleSignup(signupBody({ inviteToken: INVITE_TOKEN }), fixture.ctx);
+  assert.equal(outcome.status, 'forbidden');
+  if (outcome.status !== 'forbidden') throw new Error('unreachable');
+  // Same words as an unknown token — see the next test for why.
+  assert.match(outcome.reason, /valid invite is required/i);
+});
+
+test('unknown, missing and expired invites are indistinguishable', async () => {
+  // A caller who can tell these apart can probe which tokens exist, and can
+  // learn that a token WAS real before it was spent.
+  const reasons = new Set<string>();
+  for (const inviteToken of [undefined, '', 'never-minted', 12345]) {
+    const fixture = inviteFixture({ expiresInMs: 1000 });
+    fixture.advance(2000);
+    const body = inviteToken === undefined ? signupBody() : signupBody({ inviteToken });
+    const outcome = await handleSignup(body, fixture.ctx);
+    assert.equal(outcome.status, 'forbidden');
+    if (outcome.status !== 'forbidden') throw new Error('unreachable');
+    reasons.add(outcome.reason);
+  }
+  assert.equal(reasons.size, 1, `expected one shared rejection, got: ${[...reasons].join(' | ')}`);
+});
+
+test('a closed instance refuses before parsing, so a malformed body still gets 403', async () => {
+  // Ordering guard. If the mode check moved below field parsing, this would be
+  // a 400 and the status code would disclose which bodies were well formed.
+  const fixture = createAuthFixture({ signupMode: 'closed' });
+  const outcome = await handleSignup({ email: 'not-an-email' }, fixture.ctx);
+  assert.equal(outcome.status, 'forbidden');
+});
+
+test('invite mode is not consulted when the instance is open', async () => {
+  const fixture = createAuthFixture({ signupMode: 'open' });
+  const outcome = await handleSignup(signupBody(), fixture.ctx);
+  assert.equal(outcome.status, 'created');
 });
 
 test('signup withholds the session when email verification is required', async () => {

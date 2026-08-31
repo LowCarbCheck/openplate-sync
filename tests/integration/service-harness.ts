@@ -17,6 +17,7 @@ import { createApp } from '../../src/server/create-app.js';
 import { createDrizzleAccountStore } from '../../src/db/account-store.js';
 import { createDrizzleStorageAdapter } from '../../src/db/storage-adapter.js';
 import { createDrizzleAdminStore } from '../../src/db/admin-store.js';
+import { createDrizzleInviteStore } from '../../src/db/invite-store.js';
 import { createDrizzleShareStore } from '../../src/db/share-store.js';
 import { createDrizzleRotationStore } from '../../src/db/rotation-store.js';
 import { createDrizzleResearchStore } from '../../src/db/research-store.js';
@@ -25,6 +26,7 @@ import { createThrottleStore, type ThrottleConfig } from '../../src/lib/throttle
 import { generateFamilyId, generateToken } from '../../src/lib/tokens.js';
 import { deriveServerSecrets } from '../../src/lib/server-secrets.js';
 import type { AuthContext } from '../../src/accounts/auth-handlers.js';
+import type { SignupMode } from '../../src/protocol.js';
 import type { MailMessage, MailResult } from '../../src/mail/transport.js';
 import type { Database } from '../../src/db/client.js';
 import { SHARE_WRAPPED_DEK_BYTES } from '../../src/server/share-routes.js';
@@ -70,7 +72,7 @@ export const PERMISSIVE_THROTTLE: ThrottleConfig = {
 
 export interface StartServiceOptions {
   db: Database;
-  signupsOpen?: boolean;
+  signupMode?: SignupMode;
   requireEmailVerification?: boolean;
   throttleConfig?: ThrottleConfig;
   /**
@@ -103,7 +105,7 @@ export async function startService(options: StartServiceOptions): Promise<Servic
     store: createDrizzleAccountStore(options.db),
     pepper: secrets.verifierPepper,
     enumerationSecret: secrets.enumerationSecret,
-    signupsOpen: options.signupsOpen ?? true,
+    signupMode: options.signupMode ?? 'open',
     requireEmailVerification: options.requireEmailVerification ?? false,
     clientBaseUrl: 'https://app.example.test',
     async sendMail(message: MailMessage): Promise<MailResult> {
@@ -126,7 +128,11 @@ export async function startService(options: StartServiceOptions): Promise<Servic
     admin:
       options.adminToken === undefined || options.adminToken === null
         ? null
-        : { token: options.adminToken, metadata: createDrizzleAdminStore(options.db) },
+        : {
+            token: options.adminToken,
+            metadata: createDrizzleAdminStore(options.db),
+            invites: createDrizzleInviteStore(options.db),
+          },
     shares: options.sharing === true ? createDrizzleShareStore(options.db) : null,
     research: options.research === true ? createDrizzleResearchStore(options.db) : null,
   });

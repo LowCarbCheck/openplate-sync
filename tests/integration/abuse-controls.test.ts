@@ -5,7 +5,7 @@
  * 127.0.0.1 and would otherwise lock itself out after five accounts).
  *
  * Four properties, each a way a public instance gets abused:
- *  - `SIGNUPS_OPEN=false` actually closes signups
+ *  - `SIGNUP_MODE=closed` actually closes signups
  *  - repeated signups from one IP lock out with a `429` and a `Retry-After`
  *  - repeated failed logins lock out, and a *different* IP-scoped bucket is
  *    unaffected, so a throttle cannot be turned into an account-lockout DoS
@@ -36,8 +36,8 @@ function signupBody(email: string) {
   return { email, authHash: sampleAuthHash(11), kdfDescriptor: sampleKdfDescriptor() };
 }
 
-test('SIGNUPS_OPEN=false closes signups with a 403', async () => {
-  const service: ServiceHarness = await startService({ db: database.db, signupsOpen: false });
+test('SIGNUP_MODE=closed closes signups with a 403', async () => {
+  const service: ServiceHarness = await startService({ db: database.db, signupMode: 'closed' });
   try {
     const response = await service.request<{ error: string }>({
       method: 'POST',

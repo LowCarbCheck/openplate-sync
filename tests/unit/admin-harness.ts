@@ -24,6 +24,7 @@ import { createAuthFixture } from './auth-context-fixture.js';
 import { createFakeStorageAdapter } from './fake-storage-adapter.js';
 import { createFakeRotationStore } from './fake-rotation-store.js';
 import { createFakeAdminStore, type FakeAdminStore } from './fake-admin-store.js';
+import { createFakeInviteStore, type FakeInviteStore } from './fake-invite-store.js';
 import type { FakeAccountStore } from './fake-account-store.js';
 
 /** One emitted log line, kept whole so a test can assert on the message AND the fields. */
@@ -54,6 +55,7 @@ export function createCapturingLogger(): CapturingLogger {
 export interface AdminHarness {
   baseUrl: string;
   admin: FakeAdminStore;
+  invites: FakeInviteStore;
   /** The store the app holds — the spying wrapper below. */
   accounts: AccountStore;
   /** The store underneath it, with the test-only inspectors (`hasAccount`, `allTokens`). */
@@ -61,7 +63,7 @@ export interface AdminHarness {
   logLines: CapturedLogLine[];
   /** Every account id passed to the shared `AccountStore.deleteAccount`, in order. */
   deletedAccountIds: number[];
-  request(input: { method: string; path: string; token?: string | null }): Promise<Response>;
+  request(input: { method: string; path: string; token?: string | null; body?: unknown }): Promise<Response>;
   close(): Promise<void>;
 }
 
@@ -73,6 +75,7 @@ export interface StartAdminHarnessOptions {
 export async function startAdminHarness(options: StartAdminHarnessOptions): Promise<AdminHarness> {
   const fixture = createAuthFixture();
   const adminStore = createFakeAdminStore();
+  const inviteStore = createFakeInviteStore();
   const capturing = createCapturingLogger();
   const deletedAccountIds: number[] = [];
 
@@ -96,7 +99,7 @@ export async function startAdminHarness(options: StartAdminHarnessOptions): Prom
     throttle: createThrottleStore({ freeAttempts: 10_000, baseLockoutMs: 1, maxLockoutMs: 1, attemptResetMs: 1 }),
     logger: capturing.logger,
     trustProxy: false,
-    admin: options.adminToken === null ? null : { token: options.adminToken, metadata: adminStore },
+    admin: options.adminToken === null ? null : { token: options.adminToken, metadata: adminStore, invites: inviteStore },
   });
 
   const server: Server = app.listen(0);
@@ -111,15 +114,26 @@ export async function startAdminHarness(options: StartAdminHarnessOptions): Prom
   return {
     baseUrl,
     admin: adminStore,
+    invites: inviteStore,
     accounts,
     fakeAccounts: fixture.store,
     logLines: capturing.lines,
     deletedAccountIds,
-    async request(input: { method: string; path: string; token?: string | null }): Promise<Response> {
+    async request(input: {
+      method: string;
+      path: string;
+      token?: string | null;
+      body?: unknown;
+    }): Promise<Response> {
       const headers: Record<string, string> = {};
       const token = input.token ?? null;
       if (token !== null) headers.authorization = `Bearer ${token}`;
-      return fetch(`${baseUrl}${input.path}`, { method: input.method, headers });
+      if (input.body !== undefined) headers['content-type'] = 'application/json';
+      return fetch(`${baseUrl}${input.path}`, {
+        method: input.method,
+        headers,
+        body: input.body === undefined ? undefined : JSON.stringify(input.body),
+      });
     },
     async close(): Promise<void> {
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));

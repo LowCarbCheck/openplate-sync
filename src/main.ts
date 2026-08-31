@@ -24,6 +24,7 @@ import { createDatabase, runMigrations, waitForDatabase } from './db/client.js';
 import { createDrizzleAccountStore } from './db/account-store.js';
 import { createDrizzleStorageAdapter } from './db/storage-adapter.js';
 import { createDrizzleAdminStore } from './db/admin-store.js';
+import { createDrizzleInviteStore } from './db/invite-store.js';
 import { createDrizzleShareStore } from './db/share-store.js';
 import { createDrizzleRotationStore } from './db/rotation-store.js';
 import { createDrizzleResearchStore } from './db/research-store.js';
@@ -61,7 +62,7 @@ async function main(): Promise<void> {
     store: createDrizzleAccountStore(database.db),
     pepper: secrets.verifierPepper,
     enumerationSecret: secrets.enumerationSecret,
-    signupsOpen: config.signupsOpen,
+    signupMode: config.signupMode,
     requireEmailVerification: config.requireEmailVerification,
     clientBaseUrl: config.clientBaseUrl,
     sendMail: (message) => mailTransport.send(message),
@@ -74,7 +75,25 @@ async function main(): Promise<void> {
   // `null` unless ADMIN_TOKEN is set, which leaves the whole `/v1/admin` tree
   // answering the ordinary unknown-path 404 — see `server/create-app.ts`.
   const admin =
-    config.adminToken === null ? null : { token: config.adminToken, metadata: createDrizzleAdminStore(database.db) };
+    config.adminToken === null
+      ? null
+      : {
+          token: config.adminToken,
+          metadata: createDrizzleAdminStore(database.db),
+          invites: createDrizzleInviteStore(database.db),
+        };
+
+  // An invite-only instance with no admin API can never mint an invite, so
+  // nobody can ever register on it. That is a misconfiguration worth shouting
+  // about — and deliberately NOT fatal: invites minted before the token was
+  // removed are still valid, and refusing to boot would lock out people who
+  // are already holding one.
+  if (config.signupMode === 'invite' && admin === null) {
+    logger.warn(
+      'SIGNUP_MODE=invite with no ADMIN_TOKEN: no new invite can be minted on this instance. ' +
+        'Existing invites still work. Set ADMIN_TOKEN to mint more.',
+    );
+  }
 
   // `null` unless SYNC_SHARING is on, which leaves both share subtrees
   // answering the ordinary unknown-path 404 — see `server/create-app.ts`.
@@ -102,7 +121,7 @@ async function main(): Promise<void> {
     logger.info('openplate-sync listening', {
       port: config.port,
       serviceVersion: SERVICE_VERSION,
-      signupsOpen: config.signupsOpen,
+      signupMode: config.signupMode,
       requireEmailVerification: config.requireEmailVerification,
       // Whether the operator API exists on this instance, never its token.
       adminApi: admin !== null,
