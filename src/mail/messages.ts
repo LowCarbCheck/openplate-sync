@@ -38,7 +38,7 @@ export function buildVerificationEmail(input: { to: string; clientBaseUrl: strin
       '',
       'This link is valid for 24 hours.',
       '',
-      "If you didn't create an account, you can ignore this message — nothing was set up.",
+      "If you didn't create an account, you can ignore this message. Nothing was set up.",
     ].join('\n'),
   };
 }
@@ -64,7 +64,7 @@ export function buildResetEmail(input: { to: string; clientBaseUrl: string; toke
       'will use the code to keep your data.',
       '',
       'If you do NOT have your recovery code, this link restores your login only.',
-      'Everything already synced becomes permanently unreadable — by you and by us.',
+      'Everything already synced becomes permanently unreadable, by you and by us.',
       '',
       "If you didn't request this, ignore this message. Nothing has changed yet.",
     ].join('\n'),
