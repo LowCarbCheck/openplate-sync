@@ -23,7 +23,7 @@
  *
  * WHAT THE GRANTEE CAN REACH, EXHAUSTIVELY: their own share row (with its
  * wrap), the grantor's current blob ciphertext, and `grantorAccountId`. Never
- * the grantor's key records, KDF descriptor, verifier, email or display name,
+ * the grantor's key records, KDF descriptor, verifier, handle or display name,
  * and never blob history — a grantee who could pull the grantor's `recovery`
  * wrapped DEK would be one brute-forced recovery code away from rotation
  * authority over the account they were merely allowed to read. There is no

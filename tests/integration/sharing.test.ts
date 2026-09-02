@@ -71,21 +71,21 @@ beforeEach(async () => {
   await database.reset();
 });
 
-async function signUp(email: string, seed: number): Promise<Party> {
+async function signUp(handle: string, seed: number): Promise<Party> {
   const response = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
+    body: { handle, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
   });
-  assert.equal(response.status, 201, `signup for ${email}`);
+  assert.equal(response.status, 201, `signup for ${handle}`);
   assert.ok(response.body.tokens);
   return { accountId: response.body.account.id, accessToken: response.body.tokens.accessToken };
 }
 
 /** A patient who has pushed one blob, and a clinician holding a grant on it. */
 async function grantedPair(): Promise<{ patient: Party; clinician: Party; ciphertext: string }> {
-  const patient = await signUp('patient@example.test', 41);
-  const clinician = await signUp('clinician@example.test', 42);
+  const patient = await signUp('patient', 41);
+  const clinician = await signUp('clinician', 42);
   const ciphertext = sampleCiphertext(17, 512);
 
   const push = await service.request({
@@ -162,8 +162,8 @@ test('a grantor grants, lists and re-wraps a share under compare-and-swap', asyn
 });
 
 test('an absent expectedUpdatedAt is a 400, and a self-share is refused', async () => {
-  const patient = await signUp('cas@example.test', 43);
-  const clinician = await signUp('cas-grantee@example.test', 44);
+  const patient = await signUp('cas', 43);
+  const clinician = await signUp('cas-grantee', 44);
 
   // PROTOCOL.md §5.4's rule, transplanted: a caller must not be able to skip
   // the concurrency check by forgetting a field.
@@ -342,10 +342,10 @@ test('both cascades: deleting either account removes the share row', async () =>
 
 test('a missing share, a foreign share and an un-pushed grantor are indistinguishable', async () => {
   const { patient, clinician } = await grantedPair();
-  const stranger = await signUp('stranger@example.test', 45);
+  const stranger = await signUp('stranger', 45);
 
   // A grantor who exists and has pushed, but granted nothing to this caller.
-  const unpushed = await signUp('quiet@example.test', 46);
+  const unpushed = await signUp('quiet', 46);
   const quietGrant = await service.request({
     method: 'PUT',
     path: `/v1/sync/shares/${clinician.accountId}`,

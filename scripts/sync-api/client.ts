@@ -17,7 +17,7 @@
  * This service's own error bodies are scrubbed sentences, but `--url` points
  * wherever the operator says: a reverse proxy, a captive portal, a typo that
  * lands on something else entirely. Those quote the request they rejected, and
- * on THIS API a quoted request or response can carry an email address. An
+ * on THIS API a quoted request or response can carry an account handle. An
  * operator pastes a CLI error into a chat window without thinking about it.
  *
  * So the status code is the only thing taken from a non-2xx response. The body

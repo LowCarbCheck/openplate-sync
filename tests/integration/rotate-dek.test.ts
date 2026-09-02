@@ -87,13 +87,13 @@ beforeEach(async () => {
   await database.reset();
 });
 
-async function signUp(email: string, seed: number): Promise<Party> {
+async function signUp(handle: string, seed: number): Promise<Party> {
   const response = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
+    body: { handle, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
   });
-  assert.equal(response.status, 201, `signup for ${email}`);
+  assert.equal(response.status, 201, `signup for ${handle}`);
   assert.ok(response.body.tokens);
   return { accountId: response.body.account.id, accessToken: response.body.tokens.accessToken };
 }
@@ -110,7 +110,7 @@ const NEW_CIPHERTEXT = sampleCiphertext(23, 512);
 
 /** An account set up the way a real one is: one blob, both key records. */
 async function setUpOwner(): Promise<Party> {
-  const owner = await signUp('patient@example.test', 41);
+  const owner = await signUp('patient', 41);
 
   const push = await service.request({
     method: 'POST',
@@ -182,7 +182,7 @@ async function readKeyRecords(party: Party): Promise<Map<string, { wrappedDek: s
 
 test('rotation is atomic: a submission refused part-way leaves the account exactly as it was', async () => {
   const owner = await setUpOwner();
-  const clinician = await signUp('clinician@example.test', 42);
+  const clinician = await signUp('clinician', 42);
   await grant(owner, clinician, OLD_SHARE_WRAP);
 
   const beforeRotation = await readKeyRecords(owner);
@@ -191,7 +191,7 @@ test('rotation is atomic: a submission refused part-way leaves the account exact
   // fails INSIDE the transaction, and it fails LATE — after the new blob
   // version has been inserted and both key records have been re-wrapped.
   // Everything those two steps wrote must be gone when this returns.
-  const stranger = await signUp('stranger@example.test', 43);
+  const stranger = await signUp('stranger', 43);
   const refused = await service.request({
     method: 'POST',
     path: '/v1/sync/rotate-dek',
@@ -234,8 +234,8 @@ test('rotation is atomic: a submission refused part-way leaves the account exact
 
 test('rotation revokes omitted shares and re-wraps the ones it keeps', async () => {
   const owner = await setUpOwner();
-  const kept = await signUp('kept@example.test', 42);
-  const dropped = await signUp('dropped@example.test', 43);
+  const kept = await signUp('kept', 42);
+  const dropped = await signUp('dropped', 43);
   await grant(owner, kept, OLD_SHARE_WRAP);
   await grant(owner, dropped, OLD_SHARE_WRAP);
 
@@ -279,8 +279,8 @@ test('rotation revokes omitted shares and re-wraps the ones it keeps', async () 
 
 test('old DEK opens nothing after rotation: every wrap the server held for it is gone', async () => {
   const owner = await setUpOwner();
-  const revoked = await signUp('revoked@example.test', 42);
-  const kept = await signUp('kept@example.test', 43);
+  const revoked = await signUp('revoked', 42);
+  const kept = await signUp('kept', 43);
   await grant(owner, revoked, OLD_SHARE_WRAP);
   await grant(owner, kept, OLD_SHARE_WRAP);
 
@@ -335,7 +335,7 @@ test('old DEK opens nothing after rotation: every wrap the server held for it is
 
 test('rotation CAS: a stale baseVersion is refused, and the tokens a rotation writes survive the wire', async () => {
   const owner = await setUpOwner();
-  const clinician = await signUp('clinician@example.test', 42);
+  const clinician = await signUp('clinician', 42);
   await grant(owner, clinician, OLD_SHARE_WRAP);
 
   // A second push moves the blob to version 2 while the client still believes 1.

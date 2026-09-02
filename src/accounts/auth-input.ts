@@ -15,7 +15,7 @@
  * in that module; nothing here re-inspects a representation.
  */
 import { isSyncKeyRecordKind, type SyncKeyRecordKind } from '../protocol.js';
-import { isPlausibleEmail, normalizeEmail, parseAuthHash } from '../lib/verifier.js';
+import { normalizeHandle, parseAuthHash } from '../lib/verifier.js';
 import { parseKdfDescriptor, type KdfDescriptor } from '../lib/kdf-descriptor.js';
 import { asArray, asObject, asString, asTrimmedString, type JsonObject, type JsonValue } from '../lib/json.js';
 import type { KeyRecordSubmission } from './account-store.js';
@@ -24,21 +24,40 @@ export type ParseResult<T> = { ok: true; value: T } | { ok: false; reason: strin
 
 /** Bounded so a display name can never be used as free storage on a service that stores nothing else in the clear. */
 export const MAX_DISPLAY_NAME_LENGTH = 64;
-/** Bounded to keep a malformed client from posting a megabyte of address. */
-export const MAX_EMAIL_LENGTH = 254;
+/**
+ * Bounded to keep a malformed client from posting a megabyte of identifier.
+ * 64 characters is far more than the client's generated handle needs and
+ * still leaves room for a name somebody chose.
+ */
+export const MAX_HANDLE_LENGTH = 64;
 
 function fail(reason: string): ParseResult<never> {
   return { ok: false, reason };
 }
 
-/** Normalizes and structurally validates an email. The normalized form is what every store lookup uses. */
-export function parseEmail(value: JsonValue | undefined): ParseResult<string> {
+/**
+ * Normalizes and structurally validates a handle. The normalized form
+ * ({@link normalizeHandle}: NFKC, trim, lowercase) is what every store lookup
+ * uses, so two spellings of the same handle collide on the unique index.
+ *
+ * THE `'@'` REJECTION IS LOAD BEARING, AND THIS IS THE ONLY PLACE IT LIVES.
+ * It is what stops the handle column drifting back into being an address
+ * register. A user who types their email into the handle box gets a `400` that
+ * names the rule, and this service never stores a mailbox — which is the whole
+ * point of M181, and is impossible to add later once the column holds
+ * addresses. The service has no other opinion about the shape of a handle:
+ * non-empty, no `'@'`, length-bounded, and unique. Handles are minted by the
+ * client (never here), and the user may edit them.
+ */
+export function parseHandle(value: JsonValue | undefined): ParseResult<string> {
   const raw = asString(value);
-  if (raw === null) return fail('email must be a string');
-  const email = normalizeEmail(raw);
-  if (email.length === 0 || email.length > MAX_EMAIL_LENGTH) return fail('email has an implausible length');
-  if (!isPlausibleEmail(email)) return fail('email is not a valid address');
-  return { ok: true, value: email };
+  if (raw === null) return fail('handle must be a string');
+  const handle = normalizeHandle(raw);
+  if (handle.length === 0 || handle.length > MAX_HANDLE_LENGTH) return fail('handle has an implausible length');
+  if (handle.includes('@')) {
+    return fail('handle must not contain "@": this service identifies accounts by handle, never by email address');
+  }
+  return { ok: true, value: handle };
 }
 
 /** The client's base64 auth-hash, kept as the ORIGINAL string: it is the HMAC input, so re-encoding it would change the verifier. */
@@ -68,7 +87,7 @@ export function parseDisplayName(value: JsonValue | undefined): ParseResult<stri
   return { ok: true, value: trimmed };
 }
 
-/** A raw opaque token as it arrives from a link or a request body. */
+/** A raw opaque token as it arrives in a request body — a refresh token, or an invite. */
 export function parseTokenField(value: JsonValue | undefined, field = 'token'): ParseResult<string> {
   const token = asTrimmedString(value);
   if (token === null) return fail(`${field} is required`);

@@ -9,8 +9,8 @@
  *
  *  - A JWT is *stateless*, which is exactly the property this service must
  *    not have. Revocation is the load-bearing feature here: PROTOCOL.md
- *    requires that a passphrase change and both reset paths invalidate every
- *    outstanding session immediately. A stateless token can only be made to
+ *    requires that a passphrase change invalidates every outstanding session
+ *    immediately. A stateless token can only be made to
  *    expire, never to stop working, without adding the same server-side
  *    denylist that a database-backed opaque token already is.
  *  - Only the SHA-256 digest of a token is persisted. A dumped
@@ -27,34 +27,37 @@
 import { createHash, randomBytes } from 'node:crypto';
 
 /**
- * Every kind of opaque token this service issues. Session tokens
- * (`access`/`refresh`) and single-use link tokens (`email-verification`,
- * `auth-reset`) share one table because they share an identical lifecycle
- * (hashed at rest, expiring, revocable) — the discriminator is what keeps
- * `revokeAllSessions` from also nuking a pending verification link.
+ * Every kind of opaque token this service issues.
+ *
+ * SESSION TOKENS ARE NOW THE ONLY KIND. Until M181 this union also carried
+ * two single-use LINK kinds, minted to be put in a message: one confirmed an
+ * address, the other redeemed a mailed recovery link. Both went with the
+ * mailer. A service that holds no address cannot send a link, and the mailed
+ * link was an account-takeover path that bought no recovery — it restored a
+ * LOGIN to data that stays sealed, because the server never held a key that
+ * unwraps a DEK. `account_tokens` therefore holds sessions and nothing else.
  */
-export type AccountTokenKind = 'access' | 'refresh' | 'email-verification' | 'auth-reset';
+export type AccountTokenKind = 'access' | 'refresh';
 
-/** The kinds that constitute a logged-in session — exactly what a credential change revokes. */
+/**
+ * The kinds that constitute a logged-in session — exactly what a credential
+ * change revokes. Every kind, since the link tokens went; kept as a named
+ * list because the revocation rule is about SESSIONS, not about "all rows",
+ * and a future non-session kind must not silently join it.
+ */
 export const SESSION_TOKEN_KINDS: readonly AccountTokenKind[] = ['access', 'refresh'];
 
 /** Short — a leaked access token is useful for minutes, not weeks. */
 export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
 /** Long, but rotating: every use mints a replacement and revokes the presented one (see `server/auth-handlers.ts`). */
 export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-/** Email-verification links stay valid for a day — long enough to survive a delayed inbox. */
-export const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
-/** Reset links are deliberately much shorter-lived: they are the strongest capability this service emails anyone. */
-export const AUTH_RESET_TTL_MS = 60 * 60 * 1000;
 
 export const TOKEN_TTL_MS = {
   access: ACCESS_TOKEN_TTL_MS,
   refresh: REFRESH_TOKEN_TTL_MS,
-  'email-verification': EMAIL_VERIFICATION_TTL_MS,
-  'auth-reset': AUTH_RESET_TTL_MS,
 } satisfies Record<AccountTokenKind, number>;
 
-/** A freshly minted token: `raw` goes to the client (or into an email), `hash` goes in the DB. Never store `raw`. */
+/** A freshly minted token: `raw` goes to the client, `hash` goes in the DB. Never store `raw`. */
 export interface GeneratedToken {
   raw: string;
   hash: string;

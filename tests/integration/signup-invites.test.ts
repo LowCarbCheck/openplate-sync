@@ -13,7 +13,7 @@
  *  - Concurrent redemptions of ONE invite produce exactly one account. If the
  *    store did a SELECT-then-UPDATE, both callers would see it unredeemed and
  *    two people would get in on one invitation.
- *  - A duplicate-email signup leaves the invite spendable. That is the
+ *  - A duplicate-handle signup leaves the invite spendable. That is the
  *    transaction's rollback, observed from outside: the conditional UPDATE has
  *    already run and been undone by the time the caller sees the 409.
  */
@@ -39,16 +39,16 @@ beforeEach(async () => {
 
 /** The signup request as this service's wire contract defines it (PROTOCOL.md §5.8). */
 interface SignupRequest {
-  email: string;
+  handle: string;
   authHash: string;
   kdfDescriptor: ReturnType<typeof sampleKdfDescriptor>;
   /** Absent on an open instance; required on an invite-only one. */
   inviteToken?: string;
 }
 
-function signupBody(email: string, inviteToken?: string): SignupRequest {
+function signupBody(handle: string, inviteToken?: string): SignupRequest {
   const body: SignupRequest = {
-    email,
+    handle,
     authHash: sampleAuthHash(11),
     kdfDescriptor: sampleKdfDescriptor(),
   };
@@ -73,8 +73,8 @@ test('an invite admits exactly one account, even under concurrent redemption', a
     // Fired together, deliberately not awaited in sequence. With a
     // SELECT-then-UPDATE both would find the invite unredeemed.
     const attempts = await Promise.all(
-      ['one@example.test', 'two@example.test', 'three@example.test'].map((email) =>
-        service.request<{ error?: string }>({ method: 'POST', path: '/v1/auth/signup', body: signupBody(email, token) }),
+      ['one-otter', 'two-otter', 'three-otter'].map((handle) =>
+        service.request<{ error?: string }>({ method: 'POST', path: '/v1/auth/signup', body: signupBody(handle, token) }),
       ),
     );
 
@@ -87,7 +87,7 @@ test('an invite admits exactly one account, even under concurrent redemption', a
   }
 });
 
-test('a duplicate email is refused and the invite is NOT consumed', async () => {
+test('a duplicate handle is refused and the invite is NOT consumed', async () => {
   const service: ServiceHarness = await startService({ db: database.db, signupMode: 'invite' });
   try {
     const first = await mintInvite();
@@ -96,7 +96,7 @@ test('a duplicate email is refused and the invite is NOT consumed', async () => 
     const created = await service.request({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('taken@example.test', first),
+      body: signupBody('taken', first),
     });
     assert.equal(created.status, 201);
 
@@ -104,7 +104,7 @@ test('a duplicate email is refused and the invite is NOT consumed', async () => 
     const conflict = await service.request({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('taken@example.test', second),
+      body: signupBody('taken', second),
     });
     assert.equal(conflict.status, 409);
 
@@ -114,7 +114,7 @@ test('a duplicate email is refused and the invite is NOT consumed', async () => 
     const retry = await service.request({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('fresh@example.test', second),
+      body: signupBody('fresh', second),
     });
     assert.equal(retry.status, 201);
   } finally {
@@ -131,7 +131,7 @@ test('an expired invite is refused', async () => {
     const response = await service.request({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('late@example.test', minted.token),
+      body: signupBody('late', minted.token),
     });
     assert.equal(response.status, 403);
   } finally {
@@ -145,7 +145,7 @@ test('an open instance ignores the invite requirement entirely', async () => {
     const response = await service.request({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('anyone@example.test'),
+      body: signupBody('anyone'),
     });
     assert.equal(response.status, 201);
   } finally {

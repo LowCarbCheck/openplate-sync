@@ -51,8 +51,7 @@ before(async () => {
   // would leak.
   secrets = harness.admin.seed({
     id: 3,
-    email: 'has-everything@example.test',
-    emailVerified: true,
+    handle: 'has-everything',
     blobSizeBytes: 4096,
     keyRecordKinds: ['passphrase', 'recovery'],
   });
@@ -122,14 +121,7 @@ test('the account body carries exactly the documented metadata fields and nothin
   const body: JsonValue = await response.json();
   const account = asObject(asObject(body)?.account);
 
-  assert.deepEqual(Object.keys(account ?? {}).toSorted(), [
-    'blob',
-    'createdAt',
-    'email',
-    'emailVerifiedAt',
-    'id',
-    'keyRecordKinds',
-  ]);
+  assert.deepEqual(Object.keys(account ?? {}).toSorted(), ['blob', 'createdAt', 'handle', 'id', 'keyRecordKinds']);
   assert.deepEqual(Object.keys(asObject(account?.blob) ?? {}).toSorted(), ['sizeBytes', 'updatedAt']);
 });
 
@@ -140,7 +132,7 @@ test('the responses are not empty, so the absence assertions above mean somethin
   const accountBody: JsonValue = await accountResponse.json();
   const account = asObject(asObject(accountBody)?.account);
   assert.equal(asNumber(account?.id), 3);
-  assert.equal(asString(account?.email), 'has-everything@example.test');
+  assert.equal(asString(account?.handle), 'has-everything');
   assert.deepEqual(asArray(account?.keyRecordKinds), ['passphrase', 'recovery']);
 
   const statsResponse = await harness.request({ method: 'GET', path: '/v1/admin/stats', token: ADMIN_TOKEN });

@@ -23,7 +23,7 @@
  * `IN (...)` each. A page is at most `MAX_ADMIN_PAGE_LIMIT` rows, and this
  * endpoint is called by one operator at human speed.
  */
-import { count, countDistinct, desc, eq, inArray, isNotNull, sum } from 'drizzle-orm';
+import { count, countDistinct, desc, eq, inArray, sum } from 'drizzle-orm';
 import type {
   AdminAccountPage,
   AdminAccountSummary,
@@ -39,9 +39,8 @@ import { accounts, syncBlobs, syncKeyRecords } from './schema.js';
 /** The identity columns — deliberately enumerated, never `select()`. See the module header. */
 interface AccountIdentityRow {
   id: number;
-  email: string;
+  handle: string;
   createdAt: Date;
-  emailVerifiedAt: Date | null;
 }
 
 /** `sum()` comes back as a numeric string (or `null` on an empty table), because a Postgres `bigint` does not fit a JS number by contract. */
@@ -100,9 +99,8 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
 
     return identities.map((identity) => ({
       id: identity.id,
-      email: identity.email,
+      handle: identity.handle,
       createdAt: identity.createdAt,
-      emailVerifiedAt: identity.emailVerifiedAt,
       blob: blobs.get(identity.id) ?? null,
       keyRecordKinds: (kinds.get(identity.id) ?? []).toSorted(),
     }));
@@ -113,9 +111,8 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
       const identities = await db
         .select({
           id: accounts.id,
-          email: accounts.email,
+          handle: accounts.handle,
           createdAt: accounts.createdAt,
-          emailVerifiedAt: accounts.emailVerifiedAt,
         })
         .from(accounts)
         // A stable order, or two pages of the same list can show the same
@@ -133,9 +130,8 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
       const [identity] = await db
         .select({
           id: accounts.id,
-          email: accounts.email,
+          handle: accounts.handle,
           createdAt: accounts.createdAt,
-          emailVerifiedAt: accounts.emailVerifiedAt,
         })
         .from(accounts)
         .where(eq(accounts.id, accountId))
@@ -149,11 +145,6 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
     async stats(): Promise<AdminStats> {
       const [accountTotals] = await db.select({ total: count() }).from(accounts);
 
-      const [verifiedTotals] = await db
-        .select({ verified: count() })
-        .from(accounts)
-        .where(isNotNull(accounts.emailVerifiedAt));
-
       const [blobTotals] = await db
         .select({
           versions: count(),
@@ -166,7 +157,6 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
 
       return {
         accounts: accountTotals?.total ?? 0,
-        verifiedAccounts: verifiedTotals?.verified ?? 0,
         accountsWithBlob: blobTotals?.owners ?? 0,
         blobVersions: blobTotals?.versions ?? 0,
         keyRecords: keyRecordTotals?.total ?? 0,

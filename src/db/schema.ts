@@ -66,7 +66,15 @@ export const accounts = pgTable(
   'accounts',
   {
     id: serial('id').primaryKey(),
-    email: text('email').notNull(),
+    /**
+     * The account identifier, and the ONLY thing this service knows that a
+     * person chose. An opaque per-server string: the client mints a short one
+     * at signup and the user may edit it, the service never generates or
+     * suggests one, and an `'@'` is refused at the input layer
+     * (`accounts/auth-input.ts`) so this column cannot drift back into being
+     * an address register. Stored already-normalized — see the index below.
+     */
+    handle: text('handle').notNull(),
     /** Optional, cosmetic, and the ONLY non-authentication field here on purpose (see the table doc). */
     displayName: text('display_name'),
     /**
@@ -83,17 +91,18 @@ export const accounts = pgTable(
      * published in the protocol anyway.
      */
     kdfDescriptor: jsonb('kdf_descriptor').$type<KdfDescriptor>().notNull(),
-    /** NULL means unverified. Only enforced at login when `REQUIRE_EMAIL_VERIFICATION` is on. */
-    emailVerifiedAt: timestamp('email_verified_at'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at')
       .defaultNow()
       .$onUpdate(() => new Date())
       .notNull(),
   },
-  // Emails are stored already-normalized (`lib/verifier.ts`'s `normalizeEmail`),
-  // so a plain unique index is a true case-insensitive uniqueness guarantee.
-  (table) => [uniqueIndex('accounts_email_idx').on(table.email)],
+  // Handles are stored already-normalized (`lib/verifier.ts`'s
+  // `normalizeHandle`: NFKC, trim, lowercase), so a plain unique index is a
+  // true case-insensitive AND Unicode-form-insensitive uniqueness guarantee.
+  // This index is also what makes concurrent signups for the same handle safe
+  // — never a read-then-insert check.
+  (table) => [uniqueIndex('accounts_handle_idx').on(table.handle)],
 );
 
 export type InsertAccount = InferInsertModel<typeof accounts>;
@@ -104,8 +113,9 @@ export type SelectAccount = InferSelectModel<typeof accounts>;
 // =============================================================================
 
 /**
- * Every opaque token this service issues — session pairs and single-use link
- * tokens alike (`lib/tokens.ts` owns the kinds and their TTLs).
+ * Every opaque token this service issues. Since M181 that is session pairs and
+ * nothing else: the two single-use link kinds went with the mailer
+ * (`lib/tokens.ts` owns the kinds and their TTLs).
  *
  * Only digests are stored, so this table is not replayable if dumped. Rows
  * are retained after revocation rather than deleted: a presented-but-revoked
@@ -120,13 +130,14 @@ export const accountTokens = pgTable(
       .notNull()
       .references(() => accounts.id, { onDelete: 'cascade' }),
     kind: text('kind').$type<AccountTokenKind>().notNull(),
-    /** SHA-256 hex of the raw token. The raw value exists only in the client's memory or in one email. */
+    /** SHA-256 hex of the raw token. The raw value exists only in the client's memory. */
     tokenHash: text('token_hash').notNull(),
     /**
      * Links an access token to the refresh token that minted it, and survives
      * rotation. `logout` revokes one family (one device); reuse detection
-     * revokes the family of a replayed refresh token. NULL for link tokens,
-     * which have no lineage.
+     * revokes the family of a replayed refresh token. Nullable because the
+     * column outlived the link tokens, which had no lineage; every row written
+     * today carries one.
      */
     familyId: text('family_id'),
     expiresAt: timestamp('expires_at').notNull(),
@@ -157,13 +168,13 @@ export type SelectAccountToken = InferSelectModel<typeof accountTokens>;
  * One single-use capability to create an account on an instance running
  * `SIGNUP_MODE=invite`.
  *
- * DELIBERATELY NOT ADDRESSED TO ANYBODY. There is no `email` column, and that
- * is the design rather than an omission. Binding an invite to an address would
- * make this service store the email of a person who has NO account and gave no
- * consent — a class of personal data it otherwise never holds. It would also
- * break the ordinary case where somebody registers with a different address
- * than the operator guessed. `note` carries who the invite was for, in the
- * operator's own words; the service does not need to know.
+ * DELIBERATELY NOT ADDRESSED TO ANYBODY. There is no column naming the person
+ * it is for, and that is the design rather than an omission. Binding an invite
+ * to an identifier would make this service store something about a person who
+ * has NO account and gave no consent, and it would break the ordinary case
+ * where somebody registers under a different name than the operator guessed.
+ * `note` carries who the invite was for, in the operator's own words; the
+ * service does not need to know.
  *
  * NOT IN `account_tokens`, though the lifecycle rhymes. Every row in that
  * table belongs to an account (`account_id` is `NOT NULL`), and an invite by

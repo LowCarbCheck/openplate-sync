@@ -1,6 +1,6 @@
 /**
  * Account handler cores — the `/v1/auth/*` policy, written against injected
- * dependencies (`AuthContext`) rather than a database, a clock, or a mailer.
+ * dependencies (`AuthContext`) rather than a database or a clock.
  *
  * Same discipline as the sync handler cores (`server/push-handler.ts` and
  * friends), for the same reason: everything interesting about authentication
@@ -27,22 +27,13 @@ import type {
 import type { KdfDescriptor } from '../lib/kdf-descriptor.js';
 import { deriveDummyKdfDescriptor } from '../lib/kdf-descriptor.js';
 import { computeVerifier, verifierMatches } from '../lib/verifier.js';
-import {
-  classifyToken,
-  computeExpiry,
-  hashToken,
-  TOKEN_TTL_MS,
-  type AccountTokenKind,
-  type GeneratedToken,
-} from '../lib/tokens.js';
-import { buildResetEmail, buildVerificationEmail } from '../mail/messages.js';
-import type { MailMessage, MailResult } from '../mail/transport.js';
+import { classifyToken, computeExpiry, hashToken, TOKEN_TTL_MS, type GeneratedToken } from '../lib/tokens.js';
 import type { Logger } from '../logger.js';
 import {
   asFields,
   parseAuthHashField,
   parseDisplayName,
-  parseEmail,
+  parseHandle,
   parseKdfDescriptorField,
   parseKeyRecordSubmissions,
   parseTokenField,
@@ -59,9 +50,6 @@ export interface AuthContext {
   enumerationSecret: string;
   /** How this instance treats new accounts. `'invite'` requires a token minted by the operator. */
   signupMode: SignupMode;
-  requireEmailVerification: boolean;
-  clientBaseUrl: string;
-  sendMail(message: MailMessage): Promise<MailResult>;
   now(): Date;
   mintToken(): GeneratedToken;
   mintFamilyId(): string;
@@ -77,15 +65,13 @@ export interface SessionTokens {
 
 export interface AccountSummary {
   id: number;
-  email: string;
+  handle: string;
   displayName: string | null;
-  emailVerified: boolean;
 }
 
 export interface SessionResponse {
   account: AccountSummary;
-  /** `null` when `REQUIRE_EMAIL_VERIFICATION` is on and the address is still unconfirmed — verify, then log in. */
-  tokens: SessionTokens | null;
+  tokens: SessionTokens;
 }
 
 /**
@@ -96,8 +82,6 @@ export interface SessionResponse {
 export type AuthOutcome<T> =
   | { status: 'ok'; body: T }
   | { status: 'created'; body: T }
-  /** `202` — the request was taken, and whether anything happened is deliberately not disclosed. */
-  | { status: 'accepted' }
   | { status: 'no-content' }
   | { status: 'invalid'; reason: string }
   | { status: 'unauthorized'; reason: string }
@@ -105,7 +89,7 @@ export type AuthOutcome<T> =
   | { status: 'conflict'; reason: string };
 
 /**
- * Compared against when no account exists, so an unknown email costs the same
+ * Compared against when no account exists, so an unknown handle costs the same
  * constant-time comparison as a wrong auth-hash. 64 hex characters — the exact
  * width of a real verifier, because `verifierMatches` short-circuits on a
  * length mismatch.
@@ -113,14 +97,13 @@ export type AuthOutcome<T> =
 const ABSENT_ACCOUNT_VERIFIER = '0'.repeat(64);
 
 /** A single generic message for every login failure — never "no such account" vs "wrong passphrase". */
-const LOGIN_REJECTED = 'invalid email or passphrase';
+const LOGIN_REJECTED = 'invalid handle or passphrase';
 
 function summarize(account: AccountRecord): AccountSummary {
   return {
     id: account.id,
-    email: account.email,
+    handle: account.handle,
     displayName: account.displayName,
-    emailVerified: account.emailVerifiedAt !== null,
   };
 }
 
@@ -172,29 +155,6 @@ function mintSession(ctx: AuthContext, input: { accountId: number; familyId: str
   };
 }
 
-/** Mints, persists and returns a single-use link token (`email-verification` or `auth-reset`). */
-async function issueLinkToken(ctx: AuthContext, input: { accountId: number; kind: AccountTokenKind }): Promise<string> {
-  const token = ctx.mintToken();
-  await ctx.store.insertTokens([
-    {
-      accountId: input.accountId,
-      kind: input.kind,
-      tokenHash: token.hash,
-      familyId: null,
-      expiresAt: computeExpiry(ctx.now(), TOKEN_TTL_MS[input.kind]),
-    },
-  ]);
-  return token.raw;
-}
-
-/** Fail-soft send: a dead relay must never turn a committed signup into a 500. */
-async function sendOrLog(ctx: AuthContext, message: MailMessage, purpose: string): Promise<void> {
-  const result = await ctx.sendMail(message);
-  if (!result.success) {
-    ctx.logger.error('Failed to send account email', { purpose, error: result.error ?? 'unknown' });
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Pre-login: KDF descriptor
 // ---------------------------------------------------------------------------
@@ -203,13 +163,15 @@ async function sendOrLog(ctx: AuthContext, message: MailMessage, purpose: string
  * `POST /v1/auth/kdf` — the salt and cost parameters a new device needs BEFORE
  * it can authenticate.
  *
- * POST rather than GET, for a read: a GET would put the email in the request
+ * POST rather than GET, for a read: a GET would put the handle in the request
  * line, and from there into access logs, proxy logs, `Referer` headers and
  * browser history. An endpoint whose entire purpose is not disclosing who has
- * an account should not scatter the address it was asked about.
+ * an account should not scatter the identifier it was asked about.
  *
- * Unknown emails get a deterministic dummy (`lib/kdf-descriptor.ts`), produced
- * on this same code path with this same response shape.
+ * Unknown handles get a deterministic dummy (`lib/kdf-descriptor.ts`),
+ * produced on this same code path with this same response shape. The move from
+ * addresses to handles changed nothing here: the derivation is over an opaque
+ * string, and a handle is one.
  *
  * BOTH BRANCHES DO IDENTICAL WORK, and that is deliberate. The dummy is
  * derived unconditionally — including for accounts that exist and will never
@@ -225,15 +187,17 @@ async function sendOrLog(ctx: AuthContext, message: MailMessage, purpose: string
  * denies an attacker those samples.
  */
 export async function handleGetKdfDescriptor(
-  input: { email: JsonValue | undefined },
+  input: { handle: JsonValue | undefined },
   ctx: AuthContext,
 ): Promise<AuthOutcome<{ kdfDescriptor: KdfDescriptor }>> {
-  const email = parseEmail(input.email);
-  if (!email.ok) return invalid(email.reason);
+  const handle = parseHandle(input.handle);
+  if (!handle.ok) return invalid(handle.reason);
 
-  const account = await ctx.store.findAccountByEmail(email.value);
-  // Computed before the branch, never inside it — see the header.
-  const dummy = deriveDummyKdfDescriptor({ email: email.value, enumerationSecret: ctx.enumerationSecret });
+  const account = await ctx.store.findAccountByHandle(handle.value);
+  // Computed before the branch, never inside it — see the header. Derived over
+  // the CANONICAL handle, so two spellings of one unknown handle cannot be told
+  // apart by their descriptors.
+  const dummy = deriveDummyKdfDescriptor({ handle: handle.value, enumerationSecret: ctx.enumerationSecret });
   const kdfDescriptor = account === null ? dummy : account.kdfDescriptor;
 
   return { status: 'ok', body: { kdfDescriptor } };
@@ -257,7 +221,7 @@ async function createAccountForMode(
 ): Promise<RedeemInviteResult> {
   if (ctx.signupMode !== 'invite') {
     const created = await ctx.store.createAccount(account);
-    return created.ok ? created : { ok: false, reason: 'email-taken' };
+    return created.ok ? created : { ok: false, reason: 'handle-taken' };
   }
 
   const inviteToken = parseTokenField(fields.inviteToken);
@@ -286,8 +250,8 @@ export async function handleSignup(
   }
 
   const fields = asFields(body);
-  const email = parseEmail(fields.email);
-  if (!email.ok) return invalid(email.reason);
+  const handle = parseHandle(fields.handle);
+  if (!handle.ok) return invalid(handle.reason);
   const authHash = parseAuthHashField(fields.authHash);
   if (!authHash.ok) return invalid(authHash.reason);
   const kdfDescriptor = parseKdfDescriptorField(fields.kdfDescriptor);
@@ -296,7 +260,7 @@ export async function handleSignup(
   if (!displayName.ok) return invalid(displayName.reason);
 
   const accountInput = {
-    email: email.value,
+    handle: handle.value,
     displayName: displayName.value,
     verifier: computeVerifier({ authHash: authHash.value, pepper: ctx.pepper }),
     kdfDescriptor: kdfDescriptor.value,
@@ -316,42 +280,31 @@ export async function handleSignup(
   }
   if (!created.ok) {
     // ACCEPTED ENUMERATION ORACLE, not an oversight. This 409 tells the caller
-    // the address is registered — the one place in this service that does.
-    // It is unavoidable in the mail-free configuration (with
-    // REQUIRE_EMAIL_VERIFICATION off, a duplicate signup MUST fail loudly
-    // rather than silently not create the account the user asked for), it
-    // matches Bitwarden's behaviour, and it is bounded by the per-IP signup
-    // throttle in `register-auth-routes.ts`. Every OTHER path — kdf, login,
-    // request-reset — stays indistinguishable.
+    // the handle is registered — the one place in this service that does. It
+    // is unavoidable: a duplicate signup MUST fail loudly rather than silently
+    // not create the account the user asked for, and with no address to write
+    // to there is no channel that could carry the news instead. It matches
+    // Bitwarden's behaviour, and it is bounded by the per-IP signup throttle in
+    // `register-auth-routes.ts`. Every OTHER path — kdf, login — stays
+    // indistinguishable.
+    //
+    // M181 made this leak STRICTLY LESS. What it discloses is now an opaque
+    // per-server handle rather than a person's email address, so a confirmed
+    // hit no longer hands anybody a way to contact, correlate or phish the
+    // account holder.
     //
     // In INVITE mode this 409 is reachable only by someone holding a valid
     // invite, and it does NOT consume it (see
     // `AccountStore.redeemInviteAndCreateAccount`) — so one invite holder can
-    // probe many addresses. That widening is accepted and bounded by the same
+    // probe many handles. That widening is accepted and bounded by the same
     // per-IP throttle; invite mode still exposes the oracle to strictly fewer
     // people than open mode does.
     //
-    // Full reasoning: SECURITY.md and PROTOCOL.md §5.8. (Until M166 this
-    // comment cited an ADR under `docs/adr/` that was never written. The
-    // argument it promised is real and lives in those two documents.)
-    return { status: 'conflict', reason: 'an account already exists for this email' };
+    // Full reasoning: SECURITY.md and PROTOCOL.md §5.8.
+    return { status: 'conflict', reason: 'an account already exists for this handle' };
   }
 
   const account = created.account;
-  const verificationToken = await issueLinkToken(ctx, { accountId: account.id, kind: 'email-verification' });
-  await sendOrLog(
-    ctx,
-    buildVerificationEmail({ to: account.email, clientBaseUrl: ctx.clientBaseUrl, token: verificationToken }),
-    'email-verification',
-  );
-
-  // With verification required, an unconfirmed account gets no session at all
-  // — otherwise the requirement would be trivially bypassed by never leaving
-  // the tab open after signup.
-  if (ctx.requireEmailVerification) {
-    return { status: 'created', body: { account: summarize(account), tokens: null } };
-  }
-
   const session = mintSession(ctx, { accountId: account.id, familyId: ctx.mintFamilyId() });
   await ctx.store.insertTokens(session.rows);
   ctx.logger.info('Account created', { accountId: account.id });
@@ -367,22 +320,19 @@ export async function handleLogin(
   ctx: AuthContext,
 ): Promise<AuthOutcome<SessionResponse>> {
   const fields = asFields(body);
-  const email = parseEmail(fields.email);
-  if (!email.ok) return invalid(email.reason);
+  const handle = parseHandle(fields.handle);
+  if (!handle.ok) return invalid(handle.reason);
   const authHash = parseAuthHashField(fields.authHash);
   if (!authHash.ok) return invalid(authHash.reason);
 
-  const account = await ctx.store.findAccountByEmail(email.value);
-  // Computed and compared unconditionally: an unknown email must not return
+  const account = await ctx.store.findAccountByHandle(handle.value);
+  // Computed and compared unconditionally: an unknown handle must not return
   // faster than a wrong passphrase.
   const candidate = computeVerifier({ authHash: authHash.value, pepper: ctx.pepper });
   const matches = verifierMatches({ candidate, stored: account?.verifier ?? ABSENT_ACCOUNT_VERIFIER });
 
   if (account === null || !matches) {
     return { status: 'unauthorized', reason: LOGIN_REJECTED };
-  }
-  if (ctx.requireEmailVerification && account.emailVerifiedAt === null) {
-    return { status: 'forbidden', reason: 'email address is not verified' };
   }
 
   const session = mintSession(ctx, { accountId: account.id, familyId: ctx.mintFamilyId() });
@@ -473,59 +423,27 @@ export async function handleLogout(session: ResolvedSession, ctx: AuthContext): 
 }
 
 // ---------------------------------------------------------------------------
-// Email verification
-// ---------------------------------------------------------------------------
-
-export async function handleVerifyEmail(
-  body: JsonValue | undefined,
-  ctx: AuthContext,
-): Promise<AuthOutcome<{ verified: true }>> {
-  const fields = asFields(body);
-  const token = parseTokenField(fields.token);
-  if (!token.ok) return invalid(token.reason);
-
-  const stored = await ctx.store.findToken({ kind: 'email-verification', tokenHash: hashToken(token.value) });
-  const now = ctx.now();
-  if (stored === null || classifyToken(stored, now) !== 'valid') {
-    return { status: 'invalid', reason: 'this verification link is invalid or has expired' };
-  }
-
-  await ctx.store.markEmailVerified({ accountId: stored.accountId, verifiedAt: now });
-  // Consume it: a verification link is single-use.
-  await ctx.store.revokeToken({ tokenId: stored.id, revokedAt: now });
-  return { status: 'ok', body: { verified: true } };
-}
-
-// ---------------------------------------------------------------------------
-// Reset (login recovery) and change-passphrase
+// Change-passphrase
 // ---------------------------------------------------------------------------
 
 /**
- * `POST /v1/auth/request-reset` — always `202`, whether or not the address
- * has an account. The email is the only channel that reveals anything, and it
- * only reveals it to whoever controls the inbox.
+ * WHAT USED TO BE HERE, AND WHY IT IS NOT (M181).
  *
- * Any previously issued, still-live reset token is revoked first, so
- * requesting a second link cancels the first.
+ * `handleVerifyEmail`, `handleRequestReset` and `handleResetCredential` stood
+ * between `handleLogout` and the rotation below. All three are gone with the
+ * mailer, and the reset flow is the one worth explaining: it mailed a link
+ * whose holder could replace the account's verifier. On a zero-knowledge
+ * service that is an account-TAKEOVER path that returns no recovery — the DEK
+ * is wrapped under a passphrase-KEK and a recovery-KEK the server never sees,
+ * so whoever redeemed the link got a login to a diary they still could not
+ * read, and could destroy the real owner's access on the way.
+ *
+ * The recovery code, which the user already holds and the server never sees,
+ * becomes the second authenticator instead (M181 spec 02). It joins at
+ * `rotateCredential` below: the shape is already "prove something, then move
+ * the verifier and the key records together in one transaction", and only the
+ * proof differs.
  */
-export async function handleRequestReset(body: JsonValue | undefined, ctx: AuthContext): Promise<AuthOutcome<never>> {
-  const fields = asFields(body);
-  const email = parseEmail(fields.email);
-  if (!email.ok) return invalid(email.reason);
-
-  const account = await ctx.store.findAccountByEmail(email.value);
-  if (account === null) return { status: 'accepted' };
-
-  const now = ctx.now();
-  await ctx.store.revokeTokensOfKind({ accountId: account.id, kind: 'auth-reset', revokedAt: now });
-  const resetToken = await issueLinkToken(ctx, { accountId: account.id, kind: 'auth-reset' });
-  await sendOrLog(
-    ctx,
-    buildResetEmail({ to: account.email, clientBaseUrl: ctx.clientBaseUrl, token: resetToken }),
-    'auth-reset',
-  );
-  return { status: 'accepted' };
-}
 
 interface RotationFields {
   authHash: string;
@@ -533,7 +451,7 @@ interface RotationFields {
   keyRecords: KeyRecordSubmission[];
 }
 
-/** The three fields every credential rotation carries, parsed once for both the reset and the change path. */
+/** The three fields every credential rotation carries. */
 function parseRotationFields(fields: JsonObject, authHashField: string): ParseRotationResult {
   const authHash = parseAuthHashField(fields[authHashField], authHashField);
   if (!authHash.ok) return { ok: false, reason: authHash.reason };
@@ -550,64 +468,16 @@ function parseRotationFields(fields: JsonObject, authHashField: string): ParseRo
 type ParseRotationResult = { ok: true; value: RotationFields } | { ok: false; reason: string };
 
 /**
- * `POST /v1/auth/reset` — redeems a reset link into a NEW verifier, and, if
- * the client still had its recovery code, the re-wrapped DEK that keeps the
- * data readable.
+ * `POST /v1/auth/change-passphrase` — rotation for a user who still knows
+ * their current passphrase, and since M181 the only rotation this service has
+ * until the recovery-code path lands (spec 02).
  *
- * Reset restores LOGIN. It cannot restore DATA: the server never held a key.
- * A client that submits `keyRecords: []` gets a working account whose blob is
- * permanently undecryptable — which is why the email says so in those words
- * before the user clicks (`mail/messages.ts`).
+ * The atomic verifier + re-wrapped-DEK submission below is the shape every
+ * rotation on this service uses, which is why it shipped in v0.1.0 rather than
+ * "later": adding it after the protocol froze would have meant two
+ * incompatible shapes.
  *
- * Everything — token consumption, verifier swap, key-record upsert, and
- * revocation of every outstanding session — happens in ONE transaction inside
- * the store. A partial application here would be silent data loss.
- */
-export async function handleResetCredential(
-  body: JsonValue | undefined,
-  ctx: AuthContext,
-): Promise<AuthOutcome<{ tokens: SessionTokens }>> {
-  const fields = asFields(body);
-  const token = parseTokenField(fields.token);
-  if (!token.ok) return invalid(token.reason);
-  const rotation = parseRotationFields(fields, 'authHash');
-  if (!rotation.ok) return invalid(rotation.reason);
-
-  const stored = await ctx.store.findToken({ kind: 'auth-reset', tokenHash: hashToken(token.value) });
-  const now = ctx.now();
-  if (stored === null || classifyToken(stored, now) !== 'valid') {
-    return { status: 'invalid', reason: 'this reset link is invalid or has expired' };
-  }
-
-  const familyId = ctx.mintFamilyId();
-  const session = mintSession(ctx, { accountId: stored.accountId, familyId });
-  await ctx.store.rotateCredential({
-    accountId: stored.accountId,
-    verifier: computeVerifier({ authHash: rotation.value.authHash, pepper: ctx.pepper }),
-    kdfDescriptor: rotation.value.kdfDescriptor,
-    keyRecords: rotation.value.keyRecords,
-    issue: session.rows,
-    revokedAt: now,
-    consumeTokenId: stored.id,
-  });
-
-  ctx.logger.info('Credential reset completed', {
-    accountId: stored.accountId,
-    keyRecordsSubmitted: rotation.value.keyRecords.length,
-  });
-  return { status: 'ok', body: { tokens: session.tokens } };
-}
-
-/**
- * `POST /v1/auth/change-passphrase` — the authenticated sibling of reset, for
- * a user who still knows their current passphrase.
- *
- * It exists in v0.1.0 rather than "later" on purpose: bolting it on after the
- * protocol ships would be a breaking change, because the atomic
- * verifier + re-wrapped-DEK submission below is exactly the shape the reset
- * path already has, and adding it late would mean two incompatible shapes.
- *
- * Like reset, it revokes every outstanding session for the account and hands
+ * It revokes every outstanding session for the account and hands
  * back a fresh pair for the caller — a passphrase change should log out the
  * other devices, which is precisely what a user changing it under suspicion
  * expects.
@@ -639,7 +509,6 @@ export async function handleChangePassphrase(
     keyRecords: rotation.value.keyRecords,
     issue: session.rows,
     revokedAt: now,
-    consumeTokenId: null,
   });
 
   ctx.logger.info('Passphrase changed', { accountId: account.id });
@@ -652,8 +521,7 @@ export async function handleChangePassphrase(
 
 /**
  * `GET /v1/auth/account` — the caller's own summary. The client needs it to
- * know whether the address is verified without inferring it from a login
- * failure.
+ * show which account a device is signed in as without asking the user.
  *
  * `unauthorized` rather than `not-found` when the row is gone: the token
  * outlived the account (deleted from another device), and "log in again" is

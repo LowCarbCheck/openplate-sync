@@ -65,7 +65,7 @@ before(async () => {
   const signup = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email: 'dark@example.test', authHash: sampleAuthHash(31), kdfDescriptor: sampleKdfDescriptor() },
+    body: { handle: 'dark-otter', authHash: sampleAuthHash(31), kdfDescriptor: sampleKdfDescriptor() },
   });
   assert.equal(signup.status, 201);
   assert.ok(signup.body.tokens);
@@ -136,7 +136,7 @@ test('sharing disabled: rotate-dek is NOT part of the dark surface, and refuses 
   const signup = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email: 'rotator@example.test', authHash: sampleAuthHash(32), kdfDescriptor: sampleKdfDescriptor(2) },
+    body: { handle: 'rotator-otter', authHash: sampleAuthHash(32), kdfDescriptor: sampleKdfDescriptor(2) },
   });
   assert.equal(signup.status, 201);
   assert.ok(signup.body.tokens);

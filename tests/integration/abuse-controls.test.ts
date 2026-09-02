@@ -32,8 +32,8 @@ beforeEach(async () => {
   await database.reset();
 });
 
-function signupBody(email: string) {
-  return { email, authHash: sampleAuthHash(11), kdfDescriptor: sampleKdfDescriptor() };
+function signupBody(handle: string) {
+  return { handle, authHash: sampleAuthHash(11), kdfDescriptor: sampleKdfDescriptor() };
 }
 
 test('SIGNUP_MODE=closed closes signups with a 403', async () => {
@@ -42,7 +42,7 @@ test('SIGNUP_MODE=closed closes signups with a 403', async () => {
     const response = await service.request<{ error: string }>({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('closed@example.test'),
+      body: signupBody('closed'),
     });
     assert.equal(response.status, 403);
     assert.match(response.body.error, /not accepting/i);
@@ -61,7 +61,7 @@ test('signup throttles by IP after the free allowance, with a Retry-After', asyn
       const response = await service.request({
         method: 'POST',
         path: '/v1/auth/signup',
-        body: signupBody(`flood-${attempt}@example.test`),
+        body: signupBody(`flood-${attempt}`),
       });
       assert.equal(response.status, 201);
     }
@@ -69,7 +69,7 @@ test('signup throttles by IP after the free allowance, with a Retry-After', asyn
     const blocked = await service.request<{ error: string }>({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('flood-last@example.test'),
+      body: signupBody('flood-last'),
     });
     assert.equal(blocked.status, 429);
     // A client that cannot tell how long to wait retries immediately and
@@ -86,7 +86,7 @@ test('repeated failed logins lock the bucket, and a successful login clears it',
     const created = await service.request({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('target@example.test'),
+      body: signupBody('target-otter'),
     });
     assert.equal(created.status, 201);
 
@@ -97,7 +97,7 @@ test('repeated failed logins lock the bucket, and a successful login clears it',
       const failed = await service.request({
         method: 'POST',
         path: '/v1/auth/login',
-        body: { email: 'target@example.test', authHash: sampleAuthHash(99) },
+        body: { handle: 'target-otter', authHash: sampleAuthHash(99) },
       });
       assert.equal(failed.status, 401);
     }
@@ -105,7 +105,7 @@ test('repeated failed logins lock the bucket, and a successful login clears it',
     const success = await service.request({
       method: 'POST',
       path: '/v1/auth/login',
-      body: { email: 'target@example.test', authHash: sampleAuthHash(11) },
+      body: { handle: 'target-otter', authHash: sampleAuthHash(11) },
     });
     assert.equal(success.status, 200);
 
@@ -113,7 +113,7 @@ test('repeated failed logins lock the bucket, and a successful login clears it',
       const failed = await service.request({
         method: 'POST',
         path: '/v1/auth/login',
-        body: { email: 'target@example.test', authHash: sampleAuthHash(99) },
+        body: { handle: 'target-otter', authHash: sampleAuthHash(99) },
       });
       assert.equal(failed.status, 401);
     }
@@ -121,7 +121,7 @@ test('repeated failed logins lock the bucket, and a successful login clears it',
     const locked = await service.request({
       method: 'POST',
       path: '/v1/auth/login',
-      body: { email: 'target@example.test', authHash: sampleAuthHash(99) },
+      body: { handle: 'target-otter', authHash: sampleAuthHash(99) },
     });
     assert.equal(locked.status, 429);
 
@@ -130,7 +130,7 @@ test('repeated failed logins lock the bucket, and a successful login clears it',
     const otherAccount = await service.request({
       method: 'POST',
       path: '/v1/auth/login',
-      body: { email: 'someone-else@example.test', authHash: sampleAuthHash(11) },
+      body: { handle: 'someone-else', authHash: sampleAuthHash(11) },
     });
     assert.equal(otherAccount.status, 401);
   } finally {
@@ -142,13 +142,13 @@ test('bulk KDF probing locks out, and rotating the probed address does not evade
   const service = await startService({ db: database.db, throttleConfig: DEFAULT_THROTTLE_CONFIG });
   try {
     // A DIFFERENT address every time — this is exactly the enumeration attack,
-    // so the bucket must be keyed by source alone. A per-email bucket would
+    // so the bucket must be keyed by source alone. A per-handle bucket would
     // hand out a fresh allowance for every address probed and never fire.
     for (let attempt = 0; attempt <= DEFAULT_THROTTLE_CONFIG.freeAttempts; attempt += 1) {
       const response = await service.request<{ kdfDescriptor: unknown }>({
         method: 'POST',
         path: '/v1/auth/kdf',
-        body: { email: `probe-${attempt}@example.test` },
+        body: { handle: `probe-${attempt}` },
       });
       assert.equal(response.status, 200);
     }
@@ -156,7 +156,7 @@ test('bulk KDF probing locks out, and rotating the probed address does not evade
     const blocked = await service.request<{ error: string }>({
       method: 'POST',
       path: '/v1/auth/kdf',
-      body: { email: 'probe-last@example.test' },
+      body: { handle: 'probe-last' },
     });
     assert.equal(blocked.status, 429);
     assert.ok(Number(blocked.headers.get('retry-after')) >= 1);
@@ -170,10 +170,10 @@ test('the KDF throttle is independent of the login and signup buckets', async ()
   try {
     // Exhaust kdf...
     for (let attempt = 0; attempt <= DEFAULT_THROTTLE_CONFIG.freeAttempts; attempt += 1) {
-      await service.request({ method: 'POST', path: '/v1/auth/kdf', body: { email: `probe-${attempt}@example.test` } });
+      await service.request({ method: 'POST', path: '/v1/auth/kdf', body: { handle: `probe-${attempt}` } });
     }
     assert.equal(
-      (await service.request({ method: 'POST', path: '/v1/auth/kdf', body: { email: 'probe-x@example.test' } })).status,
+      (await service.request({ method: 'POST', path: '/v1/auth/kdf', body: { handle: 'probe-x' } })).status,
       429,
     );
 
@@ -182,7 +182,7 @@ test('the KDF throttle is independent of the login and signup buckets', async ()
     const created = await service.request({
       method: 'POST',
       path: '/v1/auth/signup',
-      body: signupBody('unaffected@example.test'),
+      body: signupBody('unaffected'),
     });
     assert.equal(created.status, 201);
   } finally {

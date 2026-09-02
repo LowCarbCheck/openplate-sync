@@ -18,7 +18,7 @@ import { createHmac } from 'node:crypto';
 
 /** Feeds `lib/verifier.ts` — the pepper mixed into every stored verifier. */
 export const VERIFIER_PEPPER_LABEL = 'openplate-sync:verifier-pepper:v1';
-/** Feeds `lib/kdf-descriptor.ts` — the key behind the deterministic dummy descriptors served for unknown emails. */
+/** Feeds `lib/kdf-descriptor.ts` — the key behind the deterministic dummy descriptors served for unknown handles. */
 export const ENUMERATION_SECRET_LABEL = 'openplate-sync:kdf-dummy:v1';
 
 export interface ServerSecrets {

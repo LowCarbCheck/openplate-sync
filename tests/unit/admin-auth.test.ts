@@ -26,7 +26,7 @@ let harness: AdminHarness;
 
 before(async () => {
   harness = await startAdminHarness({ adminToken: ADMIN_TOKEN });
-  harness.admin.seed({ id: 7, email: 'operator-can-see-me@example.test' });
+  harness.admin.seed({ id: 7, handle: 'operator-can-see-me' });
 });
 
 after(async () => {

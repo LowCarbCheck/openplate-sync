@@ -1,7 +1,7 @@
 /**
  * The verifier's security properties, asserted directly: peppering actually
  * binds (a stolen table is useless without `SERVER_SECRET`), comparison is
- * length-safe, email normalization is total, and a malformed auth-hash is
+ * length-safe, handle canonicalisation is total, and a malformed auth-hash is
  * refused rather than silently truncated.
  */
 import { test } from 'node:test';
@@ -9,8 +9,7 @@ import assert from 'node:assert/strict';
 import {
   AUTH_HASH_BYTES,
   computeVerifier,
-  isPlausibleEmail,
-  normalizeEmail,
+  normalizeHandle,
   parseAuthHash,
   verifierMatches,
 } from '../../src/lib/verifier.js';
@@ -50,16 +49,27 @@ test('parseAuthHash accepts exactly 32 decoded bytes', () => {
   assert.equal(parseAuthHash(42), null);
 });
 
-test('normalizeEmail trims and lowercases', () => {
-  assert.equal(normalizeEmail('  Person@Example.TEST '), 'person@example.test');
+test('normalizeHandle trims and lowercases', () => {
+  assert.equal(normalizeHandle('  Bright-Otter-42 '), 'bright-otter-42');
 });
 
-test('isPlausibleEmail rejects structurally impossible addresses', () => {
-  assert.equal(isPlausibleEmail('person@example.test'), true);
-  assert.equal(isPlausibleEmail('person@localhost'), false);
-  assert.equal(isPlausibleEmail('no-at-sign'), false);
-  assert.equal(isPlausibleEmail('two@@example.test'), false);
-  assert.equal(isPlausibleEmail('with space@example.test'), false);
+test('normalizeHandle applies NFKC before folding case', () => {
+  // Fullwidth Latin and a ligature are compatibility-equivalent to their ASCII
+  // forms. Without NFKC each would be a SEPARATE row on the unique index, and
+  // one account could be impersonated by a look-alike handle.
+  assert.equal(normalizeHandle('ＢＲＩＧＨＴ-ｏｔｔｅｒ'), 'bright-otter');
+  assert.equal(normalizeHandle('\uFB01nch'), 'finch');
+  // NFKC also maps a non-breaking space to an ordinary one, which the trim
+  // then removes — so a handle pasted out of a document still canonicalises.
+  assert.equal(normalizeHandle('\u00A0otter\u00A0'), 'otter');
+});
+
+test('normalizeHandle is idempotent', () => {
+  // The stored value is the normalized one, so normalizing it again on the way
+  // in must be a no-op or a lookup would miss its own row.
+  for (const raw of ['  Bright-Otter-42 ', 'ＢＲＩＧＨＴ', '\uFB01nch', 'plain']) {
+    assert.equal(normalizeHandle(normalizeHandle(raw)), normalizeHandle(raw));
+  }
 });
 
 test('the two derived server subkeys differ and are stable', () => {

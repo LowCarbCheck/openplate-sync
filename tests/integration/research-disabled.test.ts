@@ -78,7 +78,7 @@ before(async () => {
   const signup = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email: 'dark-study@example.test', authHash: sampleAuthHash(61), kdfDescriptor: sampleKdfDescriptor(6) },
+    body: { handle: 'dark-study', authHash: sampleAuthHash(61), kdfDescriptor: sampleKdfDescriptor(6) },
   });
   assert.equal(signup.status, 201);
   assert.ok(signup.body.tokens);

@@ -74,16 +74,14 @@ export const MAX_ADMIN_PAGE_LIMIT = 200;
 /** The wire shape of one account. Every field is named here; nothing is spread in from a row. */
 interface AdminAccountView {
   id: number;
-  email: string;
+  handle: string;
   createdAt: string;
-  emailVerifiedAt: string | null;
   blob: { sizeBytes: number; updatedAt: string } | null;
   keyRecordKinds: SyncKeyRecordKind[];
 }
 
 interface AdminStatsView {
   accounts: number;
-  verifiedAccounts: number;
   accountsWithBlob: number;
   blobVersions: number;
   keyRecords: number;
@@ -94,9 +92,8 @@ interface AdminStatsView {
 function toAccountView(summary: AdminAccountSummary): AdminAccountView {
   return {
     id: summary.id,
-    email: summary.email,
+    handle: summary.handle,
     createdAt: summary.createdAt.toISOString(),
-    emailVerifiedAt: summary.emailVerifiedAt === null ? null : summary.emailVerifiedAt.toISOString(),
     blob:
       summary.blob === null
         ? null
@@ -108,7 +105,6 @@ function toAccountView(summary: AdminAccountSummary): AdminAccountView {
 function toStatsView(stats: AdminStats): AdminStatsView {
   return {
     accounts: stats.accounts,
-    verifiedAccounts: stats.verifiedAccounts,
     accountsWithBlob: stats.accountsWithBlob,
     blobVersions: stats.blobVersions,
     keyRecords: stats.keyRecords,

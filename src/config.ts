@@ -34,25 +34,6 @@ export const MIN_SERVER_SECRET_LENGTH = 32;
  */
 export const MIN_ADMIN_TOKEN_LENGTH = 24;
 
-export interface SmtpSettings {
-  host: string;
-  port: number;
-  user: string;
-  password: string;
-  secure: boolean;
-}
-
-export interface PigeonSettings {
-  apiKey: string;
-  baseUrl: string;
-}
-
-export interface EmailSettings {
-  from: string;
-  smtp: SmtpSettings;
-  pigeon: PigeonSettings;
-}
-
 export interface ServiceConfig {
   port: number;
   databaseUrl: string;
@@ -66,13 +47,6 @@ export interface ServiceConfig {
    * `parseSignupMode`).
    */
   signupMode: SignupMode;
-  requireEmailVerification: boolean;
-  /**
-   * Where the CLIENT app lives — verification and reset links point here, not
-   * at this service. A sync service has no UI; the token in the link is
-   * redeemed by the client calling back into `/v1/auth/*`.
-   */
-  clientBaseUrl: string;
   /**
    * Express `trust proxy` setting. MUST be enabled behind a reverse proxy or
    * `req.ip` is the proxy's address and the per-IP throttle collapses into
@@ -118,7 +92,6 @@ export interface ServiceConfig {
    */
   researchEnabled: boolean;
   logLevel: LogLevel;
-  email: EmailSettings;
 }
 
 /**
@@ -171,10 +144,6 @@ function required(env: NodeJS.ProcessEnv, key: string): string {
   return value;
 }
 
-function optional(env: NodeJS.ProcessEnv, key: string, fallback = ''): string {
-  return env[key]?.trim() ?? fallback;
-}
-
 /** Parses a boolean env var. Anything other than the two accepted spellings is a config error, never a silent `false`. */
 function parseBoolean(env: NodeJS.ProcessEnv, key: string, fallback: boolean): boolean {
   const raw = env[key]?.trim().toLowerCase();
@@ -217,13 +186,62 @@ function parseLogLevel(env: NodeJS.ProcessEnv): LogLevel {
   return raw;
 }
 
-/** Strips trailing slashes so link building never produces a doubled separator. */
-function normalizeBaseUrl(value: string): string {
-  return value.replace(/\/+$/, '');
+/**
+ * A variable this service used to read and no longer does. Present in the
+ * environment, it is a BOOT FAILURE naming what happened, never a silent
+ * no-op.
+ *
+ * THE ASYMMETRY IS THE ARGUMENT, and it is the one M166 already wrote down for
+ * `SIGNUPS_OPEN` (see `parseSignupMode`). A container that refuses to boot is
+ * loud and costs one deploy. A variable that is quietly ignored lets an
+ * operator believe mail is configured on a service that has no mailer at all,
+ * and believe their users can reset a passphrase they cannot — a false belief
+ * discovered by whoever needs it most, on the day they need it.
+ */
+function throwIfRemoved(env: NodeJS.ProcessEnv, name: string, because: string): void {
+  if (env[name] === undefined) return;
+  throw new Error(
+    `${name} was removed in M181 and is rejected rather than ignored: ${because}. Delete it from the environment.`,
+  );
+}
+
+/** Why every mail variable went: there is no mailer left to configure. */
+const MAILER_DELETED =
+  'openplate-sync sends no mail — src/mail/ and all three transports were deleted, and the gateway is the only service left that mails anybody';
+
+/**
+ * Every variable M181 removed, refused one by one.
+ *
+ * All of them are about EMAIL, directly or as its plumbing. The service now
+ * identifies an account by a handle it cannot resolve to a person, and a lost
+ * passphrase is recovered with the recovery code the user already holds — so
+ * there is no address to verify, no link to send, and nowhere to link to.
+ */
+function rejectRemovedEnvVars(env: NodeJS.ProcessEnv): void {
+  throwIfRemoved(
+    env,
+    'REQUIRE_EMAIL_VERIFICATION',
+    'there is no email address on an account to verify, and login no longer has a verification gate',
+  );
+  throwIfRemoved(
+    env,
+    'CLIENT_BASE_URL',
+    'nothing in this service links into the client any more, so it had become a required variable nothing read',
+  );
+  throwIfRemoved(env, 'EMAIL_FROM', MAILER_DELETED);
+  throwIfRemoved(env, 'SMTP_HOST', MAILER_DELETED);
+  throwIfRemoved(env, 'SMTP_PORT', MAILER_DELETED);
+  throwIfRemoved(env, 'SMTP_USER', MAILER_DELETED);
+  throwIfRemoved(env, 'SMTP_PASSWORD', MAILER_DELETED);
+  throwIfRemoved(env, 'SMTP_SECURE', MAILER_DELETED);
+  throwIfRemoved(env, 'PIGEON_API_KEY', MAILER_DELETED);
+  throwIfRemoved(env, 'PIGEON_BASE_URL', MAILER_DELETED);
 }
 
 /** Pure: builds the config from an arbitrary env bag. Throws on anything invalid — see the module header. */
 export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
+  rejectRemovedEnvVars(env);
+
   const serverSecret = required(env, 'SERVER_SECRET');
   if (serverSecret.length < MIN_SERVER_SECRET_LENGTH) {
     throw new Error(`SERVER_SECRET must be at least ${MIN_SERVER_SECRET_LENGTH} characters (see .env.example)`);
@@ -235,26 +253,10 @@ export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
     databaseSsl: parseBoolean(env, 'DATABASE_SSL', false),
     serverSecret,
     signupMode: parseSignupMode(env),
-    requireEmailVerification: parseBoolean(env, 'REQUIRE_EMAIL_VERIFICATION', false),
-    clientBaseUrl: normalizeBaseUrl(required(env, 'CLIENT_BASE_URL')),
     trustProxy: parseTrustProxy(env),
     adminToken: parseAdminToken(env),
     sharingEnabled: parseBoolean(env, 'SYNC_SHARING', false),
     researchEnabled: parseBoolean(env, 'SYNC_RESEARCH', false),
     logLevel: parseLogLevel(env),
-    email: {
-      from: optional(env, 'EMAIL_FROM', 'openplate-sync <noreply@localhost>'),
-      smtp: {
-        host: optional(env, 'SMTP_HOST'),
-        port: parsePositiveInteger(env, 'SMTP_PORT', 587),
-        user: optional(env, 'SMTP_USER'),
-        password: optional(env, 'SMTP_PASSWORD'),
-        secure: parseBoolean(env, 'SMTP_SECURE', false),
-      },
-      pigeon: {
-        apiKey: optional(env, 'PIGEON_API_KEY'),
-        baseUrl: normalizeBaseUrl(optional(env, 'PIGEON_BASE_URL')),
-      },
-    },
   };
 }

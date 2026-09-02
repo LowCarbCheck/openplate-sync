@@ -31,10 +31,9 @@ import type { SyncKeyRecordKind } from '../protocol.js';
 /** What the admin surface knows about an account. Everything else about it is out of reach by construction. */
 export interface AdminAccountSummary {
   id: number;
-  email: string;
+  /** The account's opaque per-server identifier. It is not an address and cannot be resolved to a person. */
+  handle: string;
   createdAt: Date;
-  /** `null` means the address was never confirmed. */
-  emailVerifiedAt: Date | null;
   /**
    * The account's current blob, described and never handed over: how many
    * bytes it occupies, and when those bytes last changed. `null` when the
@@ -68,7 +67,6 @@ export interface AdminAccountPage {
 /** Aggregate counts for the whole instance. Sums and counts only — no row here is attributable to a person. */
 export interface AdminStats {
   accounts: number;
-  verifiedAccounts: number;
   accountsWithBlob: number;
   /** Every retained blob version, not just the newest one — this is what the disk actually holds. */
   blobVersions: number;

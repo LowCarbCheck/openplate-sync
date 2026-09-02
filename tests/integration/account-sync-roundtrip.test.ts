@@ -25,12 +25,12 @@ import {
   type ServiceHarness,
 } from './service-harness.js';
 
-const EMAIL = 'roundtrip@example.test';
+const HANDLE = 'roundtrip-otter';
 const AUTH_HASH = sampleAuthHash(11);
 const NEW_AUTH_HASH = sampleAuthHash(22);
 
 interface SessionBody {
-  account: { id: number; email: string; emailVerified: boolean };
+  account: { id: number; handle: string };
   tokens: { accessToken: string; refreshToken: string } | null;
 }
 
@@ -55,7 +55,7 @@ async function signUp(): Promise<{ accountId: number; accessToken: string; refre
   const response = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email: EMAIL, authHash: AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(), displayName: 'Round Trip' },
+    body: { handle: HANDLE, authHash: AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(), displayName: 'Round Trip' },
   });
   assert.equal(response.status, 201);
   assert.ok(response.body.tokens);
@@ -87,7 +87,7 @@ test('the full round trip: signup, login, key record, push, pull, conflict, dele
   const login = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/login',
-    body: { email: EMAIL, authHash: AUTH_HASH },
+    body: { handle: HANDLE, authHash: AUTH_HASH },
   });
   assert.equal(login.status, 200);
   assert.ok(login.body.tokens);
@@ -194,7 +194,7 @@ test('one account can never read another account blob', async () => {
   const second = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email: 'other@example.test', authHash: sampleAuthHash(33), kdfDescriptor: sampleKdfDescriptor(3) },
+    body: { handle: 'other-otter', authHash: sampleAuthHash(33), kdfDescriptor: sampleKdfDescriptor(3) },
   });
   assert.equal(second.status, 201);
   assert.ok(second.body.tokens);
@@ -226,23 +226,23 @@ test('blob versions are retained to the documented cap and pruned oldest-first',
   assert.deepEqual(versions, [3, 4, 5, 6, 7]);
 });
 
-test('the KDF endpoint answers for an unknown email in the same shape as a real one', async () => {
+test('the KDF endpoint answers for an unknown handle in the same shape as a real one', async () => {
   await signUp();
 
   const real = await service.request<{ kdfDescriptor: { salt: string } }>({
     method: 'POST',
     path: '/v1/auth/kdf',
-    body: { email: EMAIL },
+    body: { handle: HANDLE },
   });
   const dummy = await service.request<{ kdfDescriptor: { salt: string } }>({
     method: 'POST',
     path: '/v1/auth/kdf',
-    body: { email: 'never-registered@example.test' },
+    body: { handle: 'never-registered' },
   });
   const dummyAgain = await service.request<{ kdfDescriptor: { salt: string } }>({
     method: 'POST',
     path: '/v1/auth/kdf',
-    body: { email: 'never-registered@example.test' },
+    body: { handle: 'never-registered' },
   });
 
   assert.equal(real.status, 200);
@@ -284,7 +284,7 @@ test('change-passphrase commits verifier and key record together and revokes oth
   const otherLogin = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/login',
-    body: { email: EMAIL, authHash: AUTH_HASH },
+    body: { handle: HANDLE, authHash: AUTH_HASH },
   });
   assert.ok(otherLogin.body.tokens);
   const otherAccessToken = otherLogin.body.tokens.accessToken;
@@ -305,13 +305,18 @@ test('change-passphrase commits verifier and key record together and revokes oth
 
   // Verifier and key record moved together — the transaction's whole point.
   assert.equal(
-    (await service.request({ method: 'POST', path: '/v1/auth/login', body: { email: EMAIL, authHash: AUTH_HASH } }))
+    (await service.request({ method: 'POST', path: '/v1/auth/login', body: { handle: HANDLE, authHash: AUTH_HASH } }))
       .status,
     401,
   );
   assert.equal(
-    (await service.request({ method: 'POST', path: '/v1/auth/login', body: { email: EMAIL, authHash: NEW_AUTH_HASH } }))
-      .status,
+    (
+      await service.request({
+        method: 'POST',
+        path: '/v1/auth/login',
+        body: { handle: HANDLE, authHash: NEW_AUTH_HASH },
+      })
+    ).status,
     200,
   );
   const [record] = await database.db.select().from(syncKeyRecords).where(eq(syncKeyRecords.accountId, accountId));
@@ -330,38 +335,68 @@ test('change-passphrase commits verifier and key record together and revokes oth
   );
 });
 
-test('the reset link restores login and revokes every prior session', async () => {
-  const { accessToken } = await signUp();
-  service.sentMail.length = 0;
-
-  const requested = await service.request<Record<string, never>>({
+test("a handle containing '@' is refused by the real service, at signup and at login", async () => {
+  // The rule that keeps the `handle` column from becoming an address register,
+  // asserted against the real Express stack rather than the input parser alone.
+  const signup = await service.request<{ error: string }>({
     method: 'POST',
-    path: '/v1/auth/request-reset',
-    body: { email: EMAIL },
+    path: '/v1/auth/signup',
+    body: { handle: 'person@example.test', authHash: AUTH_HASH, kdfDescriptor: sampleKdfDescriptor() },
   });
-  assert.equal(requested.status, 202);
+  assert.equal(signup.status, 400);
+  assert.match(signup.body.error, /@/);
 
-  const token = /token=([^\s]+)/.exec(service.sentMail[0]?.text ?? '')?.[1];
-  assert.ok(token);
-
-  const reset = await service.request<{ tokens: { accessToken: string } }>({
+  const login = await service.request<{ error: string }>({
     method: 'POST',
-    path: '/v1/auth/reset',
-    body: {
-      token,
-      authHash: NEW_AUTH_HASH,
-      kdfDescriptor: sampleKdfDescriptor(5),
-      keyRecords: [{ kind: 'recovery', kdfDescriptor: null, wrappedDek: sampleWrappedDek(31) }],
-    },
+    path: '/v1/auth/login',
+    body: { handle: 'person@example.test', authHash: AUTH_HASH },
   });
-  assert.equal(reset.status, 200);
+  assert.equal(login.status, 400);
 
-  assert.equal((await service.request({ method: 'GET', path: '/v1/auth/account', accessToken })).status, 401);
-  assert.equal(
-    (await service.request({ method: 'POST', path: '/v1/auth/login', body: { email: EMAIL, authHash: NEW_AUTH_HASH } }))
-      .status,
-    200,
-  );
+  // And nothing was written: the address never reaches the table.
+  const rows = await database.db.select().from(accounts);
+  assert.equal(rows.length, 0);
+});
+
+test('case-folded and NFKC-equivalent handles collide on the unique index', async () => {
+  await signUp();
+
+  // Both spellings normalise to the SAME stored handle, so the second signup
+  // is the accepted 409 oracle and not a second account. Proven against
+  // Postgres because the guarantee is the unique index, not the parser: a
+  // read-then-insert check would race, and this is what makes the collision
+  // real rather than merely likely.
+  for (const spelling of ['  ROUNDTRIP-Otter ', 'ｒoundtrip-otter']) {
+    const duplicate = await service.request<{ error: string }>({
+      method: 'POST',
+      path: '/v1/auth/signup',
+      body: { handle: spelling, authHash: sampleAuthHash(44), kdfDescriptor: sampleKdfDescriptor(6) },
+    });
+    assert.equal(duplicate.status, 409, `${spelling} must be already taken`);
+  }
+
+  // ...and each spelling reaches the ORIGINAL account, rather than nothing.
+  for (const spelling of ['  ROUNDTRIP-Otter ', 'ｒoundtrip-otter']) {
+    const login = await service.request<SessionBody>({
+      method: 'POST',
+      path: '/v1/auth/login',
+      body: { handle: spelling, authHash: AUTH_HASH },
+    });
+    assert.equal(login.status, 200, `${spelling} must log in`);
+    assert.equal(login.body.account.handle, HANDLE);
+  }
+
+  const rows = await database.db.select().from(accounts);
+  assert.equal(rows.length, 1);
+});
+
+test('the removed link endpoints are gone, not merely unreachable', async () => {
+  // A 404 rather than a 400 or a 405: the routes do not exist, so an old
+  // client fails closed instead of half-working. See PROTOCOL.md §6.
+  for (const path of ['/v1/auth/verify-email', '/v1/auth/request-reset', '/v1/auth/reset']) {
+    const response = await service.request<{ error: string }>({ method: 'POST', path, body: {} });
+    assert.equal(response.status, 404, `${path} must not exist`);
+  }
 });
 
 test('an unknown endpoint returns the documented JSON error shape', async () => {

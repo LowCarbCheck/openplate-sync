@@ -9,24 +9,23 @@
  * a 2 MiB body limit has no business anywhere near a login endpoint.
  *
  * THROTTLE POLICY, per route and deliberately different:
- *  - **login** — keyed by IP **and** email, cleared on success. Slows a
+ *  - **login** — keyed by IP **and** handle, cleared on success. Slows a
  *    single-source brute force without letting anyone lock a victim out of
  *    their own account from a different IP.
- *  - **signup**, **request-reset** and **kdf** — keyed by IP ALONE, and every
- *    attempt counts, successful or not. These are volume controls
- *    (account-farming, mail-bombing a third party's inbox, bulk address
- *    probing), not credential guards, and keying them by the submitted email
- *    would let an attacker evade them by simply rotating addresses — which is
- *    precisely the attack, in the `kdf` case.
+ *  - **signup** and **kdf** — keyed by IP ALONE, and every attempt counts,
+ *    successful or not. These are volume controls (account-farming, bulk
+ *    handle probing), not credential guards, and keying them by the submitted
+ *    handle would let an attacker evade them by simply rotating handles —
+ *    which is precisely the attack, in the `kdf` case.
  *
  * `kdf` is throttled for two reasons that are easy to miss because its
- * RESPONSE already gives nothing away (unknown addresses get a real-shaped
+ * RESPONSE already gives nothing away (unknown handles get a real-shaped
  * dummy). First, it is an unauthenticated endpoint that hits the database on
  * every call, so without a bound it is free amplification. Second, the
  * indistinguishability is statistical, not absolute: `handleGetKdfDescriptor`
  * equalises the work both branches do, but no server-side measure makes two
  * paths bit-identical in wall-clock terms, and a timing signal that small only
- * emerges from many samples per address. Denying the samples is what closes
+ * emerges from many samples per handle. Denying the samples is what closes
  * the gap. Its traffic is genuinely low — a client fetches a descriptor on a
  * fresh login, and refresh tokens last 30 days — so the shared allowance is
  * not a burden on a household behind one NAT.
@@ -42,10 +41,7 @@ import {
   handleLogin,
   handleLogout,
   handleRefresh,
-  handleRequestReset,
-  handleResetCredential,
   handleSignup,
-  handleVerifyEmail,
 } from './auth-handlers.js';
 import { getRequestSession } from '../server/bearer-auth.js';
 import { throttleKey, type ThrottleStore } from '../lib/throttle.js';
@@ -73,9 +69,6 @@ function sendOutcome<T>(res: Response, outcome: AuthOutcome<T>): void {
       return;
     case 'created':
       res.status(201).json(outcome.body);
-      return;
-    case 'accepted':
-      res.status(202).json({});
       return;
     case 'no-content':
       res.status(204).end();
@@ -124,12 +117,12 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
         sendThrottled(res, decision.retryAfterMs);
         return;
       }
-      // Counts every attempt. Keying this by the submitted email would be
-      // worse than useless: probing many addresses is the attack, so a
-      // per-email bucket would hand the attacker a fresh allowance for each
+      // Counts every attempt. Keying this by the submitted handle would be
+      // worse than useless: probing many handles is the attack, so a
+      // per-handle bucket would hand the attacker a fresh allowance for each
       // one he wants to test.
       throttle.recordFailure(key);
-      sendOutcome(res, await handleGetKdfDescriptor({ email: asFields(req.body).email }, ctx));
+      sendOutcome(res, await handleGetKdfDescriptor({ handle: asFields(req.body).handle }, ctx));
     } catch (error) {
       next(error);
     }
@@ -153,11 +146,11 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
 
   router.post(`${AUTH_API_PREFIX}/login`, async (req, res, next) => {
     try {
-      const submittedEmail = asString(asFields(req.body).email);
+      const submittedHandle = asString(asFields(req.body).handle);
       const key = throttleKey({
         namespace: 'login',
         ip: clientIp(req),
-        identifier: submittedEmail ?? undefined,
+        identifier: submittedHandle ?? undefined,
       });
       const decision = throttle.check(key);
       if (decision.locked) {
@@ -193,39 +186,6 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
         return;
       }
       sendOutcome(res, await handleLogout(session, ctx));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  router.post(`${AUTH_API_PREFIX}/verify-email`, async (req, res, next) => {
-    try {
-      sendOutcome(res, await handleVerifyEmail(req.body, ctx));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  router.post(`${AUTH_API_PREFIX}/request-reset`, async (req, res, next) => {
-    try {
-      const key = throttleKey({ namespace: 'reset', ip: clientIp(req) });
-      const decision = throttle.check(key);
-      if (decision.locked) {
-        sendThrottled(res, decision.retryAfterMs);
-        return;
-      }
-      // Counts every attempt: this endpoint sends mail to an address the
-      // caller chose, so its abuse case is a third party's inbox.
-      throttle.recordFailure(key);
-      sendOutcome(res, await handleRequestReset(req.body, ctx));
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  router.post(`${AUTH_API_PREFIX}/reset`, async (req, res, next) => {
-    try {
-      sendOutcome(res, await handleResetCredential(req.body, ctx));
     } catch (error) {
       next(error);
     }

@@ -2,7 +2,7 @@
  * Behaviour tests for the account handler cores. Every security property this
  * service claims is asserted here, DB-free, against `fake-account-store.ts`:
  *
- *  - unknown emails get a stable, real-shaped KDF descriptor (no enumeration
+ *  - unknown handles get a stable, real-shaped KDF descriptor (no enumeration
  *    oracle on the one endpoint that must answer before authentication)
  *  - login rejects unknown accounts and wrong hashes identically
  *  - refresh rotates, and REUSING a rotated refresh token kills the family
@@ -18,15 +18,12 @@ import {
   handleLogin,
   handleLogout,
   handleRefresh,
-  handleRequestReset,
-  handleResetCredential,
   handleSignup,
-  handleVerifyEmail,
   resolveAccessToken,
   type SessionResponse,
   type SessionTokens,
 } from '../../src/accounts/auth-handlers.js';
-import { REFRESH_TOKEN_TTL_MS, ACCESS_TOKEN_TTL_MS, AUTH_RESET_TTL_MS, hashToken } from '../../src/lib/tokens.js';
+import { REFRESH_TOKEN_TTL_MS, ACCESS_TOKEN_TTL_MS, hashToken } from '../../src/lib/tokens.js';
 import type { JsonObject } from '../../src/lib/json.js';
 import {
   createAuthFixture,
@@ -36,13 +33,13 @@ import {
   type AuthFixture,
 } from './auth-context-fixture.js';
 
-const EMAIL = 'person@example.test';
+const HANDLE = 'bright-otter-42';
 const AUTH_HASH = sampleAuthHash(11);
 const OTHER_AUTH_HASH = sampleAuthHash(22);
 
 function signupBody(overrides: JsonObject = {}) {
   return {
-    email: EMAIL,
+    handle: HANDLE,
     authHash: AUTH_HASH,
     kdfDescriptor: sampleKdfDescriptor(),
     displayName: 'A Person',
@@ -59,24 +56,23 @@ async function signUp(fixture: AuthFixture): Promise<SessionResponse> {
 }
 
 function requireTokens(session: SessionResponse): SessionTokens {
-  assert.notEqual(session.tokens, null);
-  if (session.tokens === null) throw new Error('unreachable');
   return session.tokens;
 }
 
 // ── KDF descriptor / enumeration ───────────────────────────────────────────
 
-test('kdf descriptor for an unknown email is stable across calls', async () => {
+test('kdf descriptor for an unknown handle is stable across calls', async () => {
   const fixture = createAuthFixture();
-  const first = await handleGetKdfDescriptor({ email: 'nobody@example.test' }, fixture.ctx);
-  const second = await handleGetKdfDescriptor({ email: 'NOBODY@Example.test' }, fixture.ctx);
+  const first = await handleGetKdfDescriptor({ handle: 'nobody-at-all' }, fixture.ctx);
+  const second = await handleGetKdfDescriptor({ handle: '  NOBODY-At-All ' }, fixture.ctx);
 
   assert.equal(first.status, 'ok');
   assert.equal(second.status, 'ok');
   if (first.status !== 'ok' || second.status !== 'ok') throw new Error('unreachable');
   // Stability is the property: a random dummy would be distinguishable from a
-  // real descriptor by simply asking twice. Case-insensitivity matters for the
-  // same reason.
+  // real descriptor by simply asking twice. Canonicalisation matters for the
+  // same reason — the dummy is derived over the NORMALIZED handle, so casing
+  // and stray whitespace cannot become an oracle of their own.
   assert.deepEqual(first.body.kdfDescriptor, second.body.kdfDescriptor);
 });
 
@@ -84,8 +80,8 @@ test('dummy and real kdf descriptors are structurally indistinguishable', async 
   const fixture = createAuthFixture();
   await signUp(fixture);
 
-  const real = await handleGetKdfDescriptor({ email: EMAIL }, fixture.ctx);
-  const dummy = await handleGetKdfDescriptor({ email: 'nobody@example.test' }, fixture.ctx);
+  const real = await handleGetKdfDescriptor({ handle: HANDLE }, fixture.ctx);
+  const dummy = await handleGetKdfDescriptor({ handle: 'nobody-at-all' }, fixture.ctx);
   assert.equal(real.status, 'ok');
   assert.equal(dummy.status, 'ok');
   if (real.status !== 'ok' || dummy.status !== 'ok') throw new Error('unreachable');
@@ -97,34 +93,74 @@ test('dummy and real kdf descriptors are structurally indistinguishable', async 
   );
 });
 
-test('a different enumeration secret yields a different dummy for the same email', async () => {
+test('a different enumeration secret yields a different dummy for the same handle', async () => {
   const a = createAuthFixture();
   const b = createAuthFixture();
   b.ctx.enumerationSecret = 'a completely different secret';
 
-  const fromA = await handleGetKdfDescriptor({ email: 'nobody@example.test' }, a.ctx);
-  const fromB = await handleGetKdfDescriptor({ email: 'nobody@example.test' }, b.ctx);
+  const fromA = await handleGetKdfDescriptor({ handle: 'nobody-at-all' }, a.ctx);
+  const fromB = await handleGetKdfDescriptor({ handle: 'nobody-at-all' }, b.ctx);
   if (fromA.status !== 'ok' || fromB.status !== 'ok') throw new Error('unreachable');
   assert.notEqual(fromA.body.kdfDescriptor.salt, fromB.body.kdfDescriptor.salt);
 });
 
-test('a malformed email is a 400, not a dummy descriptor', async () => {
+test('a malformed handle is a 400, not a dummy descriptor', async () => {
   const fixture = createAuthFixture();
-  const outcome = await handleGetKdfDescriptor({ email: 'not-an-email' }, fixture.ctx);
+  assert.equal((await handleGetKdfDescriptor({ handle: '' }, fixture.ctx)).status, 'invalid');
+  assert.equal((await handleGetKdfDescriptor({ handle: 42 }, fixture.ctx)).status, 'invalid');
+});
+
+test("the kdf endpoint refuses an '@' rather than answering about an address", async () => {
+  // The rejection is what stops this endpoint being asked about mailboxes at
+  // all. It is structural, identical for every caller, and therefore not an
+  // oracle: nothing containing an '@' can ever be an account here.
+  const fixture = createAuthFixture();
+  const outcome = await handleGetKdfDescriptor({ handle: 'person@example.test' }, fixture.ctx);
   assert.equal(outcome.status, 'invalid');
+  if (outcome.status !== 'invalid') throw new Error('unreachable');
+  assert.match(outcome.reason, /@/);
 });
 
 // ── Signup ─────────────────────────────────────────────────────────────────
 
-test('signup creates an account, sends verification mail and returns a session', async () => {
+test('signup creates an account and returns a session immediately', async () => {
   const fixture = createAuthFixture();
   const session = await signUp(fixture);
 
-  assert.equal(session.account.email, EMAIL);
-  assert.equal(session.account.emailVerified, false);
-  assert.equal(fixture.sentMail.length, 1);
-  assert.match(fixture.sentMail[0]?.text ?? '', /https:\/\/app\.example\.test\/verify-email\?token=/);
+  assert.equal(session.account.handle, HANDLE);
+  // No withheld session any more: there is no address to confirm, so there is
+  // no state in which an account exists but cannot be used.
   requireTokens(session);
+});
+
+test("signup refuses a handle containing '@', and the reason names the rule", async () => {
+  // THE LOAD-BEARING REJECTION. Without it the handle column drifts back into
+  // being an address register, one user at a time, and M181 is undone.
+  const fixture = createAuthFixture();
+  const outcome = await handleSignup(signupBody({ handle: 'person@example.test' }), fixture.ctx);
+  assert.equal(outcome.status, 'invalid');
+  if (outcome.status !== 'invalid') throw new Error('unreachable');
+  assert.match(outcome.reason, /@/);
+});
+
+test('a handle is canonicalised, so casing and Unicode form cannot fork an account', async () => {
+  const fixture = createAuthFixture();
+  await signUp(fixture);
+
+  // NFKC folds the fullwidth Latin letters; lowercasing folds the casing; the
+  // trim folds the pasted whitespace. All three must reach the SAME account.
+  const fullwidth = 'ｂright-otter-42';
+  const duplicate = await handleSignup(signupBody({ handle: '  BRIGHT-Otter-42 ' }), fixture.ctx);
+  assert.equal(duplicate.status, 'conflict');
+
+  assert.equal((await handleLogin({ handle: fullwidth, authHash: AUTH_HASH }, fixture.ctx)).status, 'ok');
+  assert.equal((await handleLogin({ handle: '  BRIGHT-Otter-42 ', authHash: AUTH_HASH }, fixture.ctx)).status, 'ok');
+});
+
+test('an over-long handle is refused', async () => {
+  const fixture = createAuthFixture();
+  const outcome = await handleSignup(signupBody({ handle: 'x'.repeat(65) }), fixture.ctx);
+  assert.equal(outcome.status, 'invalid');
 });
 
 test('signup is refused when the instance is closed', async () => {
@@ -161,16 +197,13 @@ test('one invite cannot create a second account', async () => {
   const first = await handleSignup(signupBody({ inviteToken: INVITE_TOKEN }), fixture.ctx);
   assert.equal(first.status, 'created');
 
-  const second = await handleSignup(
-    signupBody({ email: 'someone-else@example.test', inviteToken: INVITE_TOKEN }),
-    fixture.ctx,
-  );
+  const second = await handleSignup(signupBody({ handle: 'someone-else', inviteToken: INVITE_TOKEN }), fixture.ctx);
   assert.equal(second.status, 'forbidden');
 });
 
-test('a signup that hits a taken address leaves the invite redeemable', async () => {
+test('a signup that hits a taken handle leaves the invite redeemable', async () => {
   const fixture = inviteFixture();
-  // Burn the address first, using a SECOND invite, so the address exists.
+  // Burn the handle first, using a SECOND invite, so the handle exists.
   fixture.store.seedInvite({
     tokenHash: hashToken('first-invite'),
     expiresAt: new Date(fixture.now().getTime() + 60_000),
@@ -214,7 +247,7 @@ test('a closed instance refuses before parsing, so a malformed body still gets 4
   // Ordering guard. If the mode check moved below field parsing, this would be
   // a 400 and the status code would disclose which bodies were well formed.
   const fixture = createAuthFixture({ signupMode: 'closed' });
-  const outcome = await handleSignup({ email: 'not-an-email' }, fixture.ctx);
+  const outcome = await handleSignup({ handle: 42 }, fixture.ctx);
   assert.equal(outcome.status, 'forbidden');
 });
 
@@ -224,28 +257,11 @@ test('invite mode is not consulted when the instance is open', async () => {
   assert.equal(outcome.status, 'created');
 });
 
-test('signup withholds the session when email verification is required', async () => {
-  const fixture = createAuthFixture({ requireEmailVerification: true });
-  const outcome = await handleSignup(signupBody(), fixture.ctx);
-  assert.equal(outcome.status, 'created');
-  if (outcome.status !== 'created') throw new Error('unreachable');
-  // Otherwise the requirement would be bypassed by never leaving the tab.
-  assert.equal(outcome.body.tokens, null);
-});
-
 test('a duplicate signup is a conflict', async () => {
   const fixture = createAuthFixture();
   await signUp(fixture);
   const outcome = await handleSignup(signupBody(), fixture.ctx);
   assert.equal(outcome.status, 'conflict');
-});
-
-test('signup succeeds even when the verification mail fails to send', async () => {
-  const fixture = createAuthFixture();
-  fixture.failNextMail();
-  const outcome = await handleSignup(signupBody(), fixture.ctx);
-  // Fail-soft: a dead relay must not turn a committed account into a 500.
-  assert.equal(outcome.status, 'created');
 });
 
 test('signup rejects a short auth hash', async () => {
@@ -273,7 +289,7 @@ test('signup rejects a descriptor with a wrong-length salt', async () => {
 test('login succeeds with the right auth hash', async () => {
   const fixture = createAuthFixture();
   await signUp(fixture);
-  const outcome = await handleLogin({ email: EMAIL, authHash: AUTH_HASH }, fixture.ctx);
+  const outcome = await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx);
   assert.equal(outcome.status, 'ok');
 });
 
@@ -281,35 +297,14 @@ test('login rejects an unknown account and a wrong hash with the same response',
   const fixture = createAuthFixture();
   await signUp(fixture);
 
-  const unknown = await handleLogin({ email: 'nobody@example.test', authHash: AUTH_HASH }, fixture.ctx);
-  const wrong = await handleLogin({ email: EMAIL, authHash: OTHER_AUTH_HASH }, fixture.ctx);
+  const unknown = await handleLogin({ handle: 'nobody-at-all', authHash: AUTH_HASH }, fixture.ctx);
+  const wrong = await handleLogin({ handle: HANDLE, authHash: OTHER_AUTH_HASH }, fixture.ctx);
 
   assert.equal(unknown.status, 'unauthorized');
   assert.equal(wrong.status, 'unauthorized');
   if (unknown.status !== 'unauthorized' || wrong.status !== 'unauthorized') throw new Error('unreachable');
   // Identical text: the message must not be the thing that says which one it was.
   assert.equal(unknown.reason, wrong.reason);
-});
-
-test('login is refused for an unverified account when verification is required', async () => {
-  const fixture = createAuthFixture({ requireEmailVerification: true });
-  await handleSignup(signupBody(), fixture.ctx);
-  const outcome = await handleLogin({ email: EMAIL, authHash: AUTH_HASH }, fixture.ctx);
-  assert.equal(outcome.status, 'forbidden');
-});
-
-test('verifying the emailed token unblocks login', async () => {
-  const fixture = createAuthFixture({ requireEmailVerification: true });
-  await handleSignup(signupBody(), fixture.ctx);
-
-  const link = fixture.sentMail[0]?.text ?? '';
-  const token = /token=([^\s]+)/.exec(link)?.[1];
-  assert.ok(token);
-
-  assert.equal((await handleVerifyEmail({ token }, fixture.ctx)).status, 'ok');
-  assert.equal((await handleLogin({ email: EMAIL, authHash: AUTH_HASH }, fixture.ctx)).status, 'ok');
-  // Single use.
-  assert.equal((await handleVerifyEmail({ token }, fixture.ctx)).status, 'invalid');
 });
 
 // ── Tokens ─────────────────────────────────────────────────────────────────
@@ -372,7 +367,7 @@ test('an expired refresh token is rejected without revoking anything', async () 
 test('logout revokes the caller family, leaving other devices signed in', async () => {
   const fixture = createAuthFixture();
   const deviceOne = requireTokens(await signUp(fixture));
-  const loginTwo = await handleLogin({ email: EMAIL, authHash: AUTH_HASH }, fixture.ctx);
+  const loginTwo = await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx);
   if (loginTwo.status !== 'ok') throw new Error('unreachable');
   const deviceTwo = requireTokens(loginTwo.body);
 
@@ -389,7 +384,7 @@ test('logout revokes the caller family, leaving other devices signed in', async 
 test('change-passphrase swaps the verifier, stores the re-wrapped DEK and logs other devices out', async () => {
   const fixture = createAuthFixture();
   const first = requireTokens(await signUp(fixture));
-  const secondLogin = await handleLogin({ email: EMAIL, authHash: AUTH_HASH }, fixture.ctx);
+  const secondLogin = await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx);
   if (secondLogin.status !== 'ok') throw new Error('unreachable');
   const otherDevice = requireTokens(secondLogin.body);
 
@@ -412,8 +407,8 @@ test('change-passphrase swaps the verifier, stores the re-wrapped DEK and logs o
   if (outcome.status !== 'ok') throw new Error('unreachable');
 
   // Old credential dead, new credential live.
-  assert.equal((await handleLogin({ email: EMAIL, authHash: AUTH_HASH }, fixture.ctx)).status, 'unauthorized');
-  assert.equal((await handleLogin({ email: EMAIL, authHash: OTHER_AUTH_HASH }, fixture.ctx)).status, 'ok');
+  assert.equal((await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx)).status, 'unauthorized');
+  assert.equal((await handleLogin({ handle: HANDLE, authHash: OTHER_AUTH_HASH }, fixture.ctx)).status, 'ok');
 
   // Every prior session gone; the caller's fresh pair works.
   assert.equal(await resolveAccessToken(otherDevice.accessToken, fixture.ctx), null);
@@ -442,7 +437,7 @@ test('change-passphrase rejects a wrong current passphrase and changes nothing',
     fixture.ctx,
   );
   assert.equal(outcome.status, 'unauthorized');
-  assert.equal((await handleLogin({ email: EMAIL, authHash: AUTH_HASH }, fixture.ctx)).status, 'ok');
+  assert.equal((await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx)).status, 'ok');
 });
 
 test('a rotation with an absent keyRecords field is a 400, never an implicit empty list', async () => {
@@ -460,102 +455,6 @@ test('a rotation with an absent keyRecords field is a 400, never an implicit emp
   );
   // Silence must never read as consent on a path that can strand data.
   assert.equal(outcome.status, 'invalid');
-});
-
-// ── Reset ──────────────────────────────────────────────────────────────────
-
-test('request-reset answers 202 for a known and an unknown address alike', async () => {
-  const fixture = createAuthFixture();
-  await signUp(fixture);
-  fixture.sentMail.length = 0;
-
-  assert.equal((await handleRequestReset({ email: EMAIL }, fixture.ctx)).status, 'accepted');
-  assert.equal((await handleRequestReset({ email: 'nobody@example.test' }, fixture.ctx)).status, 'accepted');
-  // Only the known address produced mail — and only the inbox owner sees that.
-  assert.equal(fixture.sentMail.length, 1);
-});
-
-test('the reset email states the data-loss consequence before the user clicks', async () => {
-  const fixture = createAuthFixture();
-  await signUp(fixture);
-  fixture.sentMail.length = 0;
-  await handleRequestReset({ email: EMAIL }, fixture.ctx);
-
-  const body = fixture.sentMail[0]?.text ?? '';
-  assert.match(body, /recovery code/i);
-  assert.match(body, /permanently unreadable/i);
-});
-
-test('reset restores login, revokes every session and is single-use', async () => {
-  const fixture = createAuthFixture();
-  const original = requireTokens(await signUp(fixture));
-  fixture.sentMail.length = 0;
-  await handleRequestReset({ email: EMAIL }, fixture.ctx);
-  const token = /token=([^\s]+)/.exec(fixture.sentMail[0]?.text ?? '')?.[1];
-  assert.ok(token);
-
-  const outcome = await handleResetCredential(
-    {
-      token,
-      authHash: OTHER_AUTH_HASH,
-      kdfDescriptor: sampleKdfDescriptor(5),
-      keyRecords: [{ kind: 'recovery', kdfDescriptor: null, wrappedDek: sampleWrappedDek(3) }],
-    },
-    fixture.ctx,
-  );
-  assert.equal(outcome.status, 'ok');
-  if (outcome.status !== 'ok') throw new Error('unreachable');
-
-  assert.equal(await resolveAccessToken(original.accessToken, fixture.ctx), null);
-  assert.notEqual(await resolveAccessToken(outcome.body.tokens.accessToken, fixture.ctx), null);
-  assert.equal((await handleLogin({ email: EMAIL, authHash: OTHER_AUTH_HASH }, fixture.ctx)).status, 'ok');
-
-  const replay = await handleResetCredential(
-    { token, authHash: sampleAuthHash(44), kdfDescriptor: sampleKdfDescriptor(6), keyRecords: [] },
-    fixture.ctx,
-  );
-  assert.equal(replay.status, 'invalid');
-});
-
-test('an expired reset token is refused', async () => {
-  const fixture = createAuthFixture();
-  await signUp(fixture);
-  fixture.sentMail.length = 0;
-  await handleRequestReset({ email: EMAIL }, fixture.ctx);
-  const token = /token=([^\s]+)/.exec(fixture.sentMail[0]?.text ?? '')?.[1];
-  assert.ok(token);
-
-  fixture.advance(AUTH_RESET_TTL_MS + 1000);
-  const outcome = await handleResetCredential(
-    { token, authHash: OTHER_AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(7), keyRecords: [] },
-    fixture.ctx,
-  );
-  assert.equal(outcome.status, 'invalid');
-});
-
-test('requesting a second reset link cancels the first', async () => {
-  const fixture = createAuthFixture();
-  await signUp(fixture);
-  fixture.sentMail.length = 0;
-
-  await handleRequestReset({ email: EMAIL }, fixture.ctx);
-  const firstToken = /token=([^\s]+)/.exec(fixture.sentMail[0]?.text ?? '')?.[1];
-  await handleRequestReset({ email: EMAIL }, fixture.ctx);
-  const secondToken = /token=([^\s]+)/.exec(fixture.sentMail[1]?.text ?? '')?.[1];
-  assert.ok(firstToken);
-  assert.ok(secondToken);
-
-  const stale = await handleResetCredential(
-    { token: firstToken, authHash: OTHER_AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(8), keyRecords: [] },
-    fixture.ctx,
-  );
-  assert.equal(stale.status, 'invalid');
-
-  const fresh = await handleResetCredential(
-    { token: secondToken, authHash: OTHER_AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(8), keyRecords: [] },
-    fixture.ctx,
-  );
-  assert.equal(fresh.status, 'ok');
 });
 
 // ── Deletion ───────────────────────────────────────────────────────────────

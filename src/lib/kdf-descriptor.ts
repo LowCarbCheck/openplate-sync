@@ -5,12 +5,12 @@
  *
  * THE ENUMERATION PROBLEM, stated plainly: a zero-knowledge login requires
  * the client to derive its auth-hash before authenticating, which requires
- * the salt, which requires an UNAUTHENTICATED endpoint keyed by email. Done
- * naively that endpoint answers "does this address have an account?" for
+ * the salt, which requires an UNAUTHENTICATED endpoint keyed by handle. Done
+ * naively that endpoint answers "does this handle have an account?" for
  * anyone who asks.
  *
- * THE FIX (decided in the M128 counsel, not left residual): an unknown email
- * gets a descriptor derived as `HMAC(enumerationSecret, email)` — stable
+ * THE FIX (decided in the M128 counsel, not left residual): an unknown handle
+ * gets a descriptor derived as `HMAC(enumerationSecret, handle)` — stable
  * across requests, indistinguishable from a real one, and produced by the
  * SAME function on the SAME code path with the SAME response shape. Stability
  * matters as much as shape: a random dummy would be distinguishable by asking
@@ -18,7 +18,7 @@
  *
  * What a dummy costs an attacker: they can still burn Argon2id at 64 MiB per
  * guess and get a login rejection. What it denies them: a cheap, silent,
- * unthrottleable list of which addresses hold accounts.
+ * unthrottleable list of which handles hold accounts.
  *
  * Pure module — no DB, no config, no clock.
  */
@@ -78,15 +78,17 @@ export function parseKdfDescriptor(value: JsonValue | undefined): KdfDescriptor 
 }
 
 /**
- * The deterministic dummy for an email with no account. Same email + same
+ * The deterministic dummy for a handle with no account. Same handle + same
  * `enumerationSecret` always yields the same descriptor; a different secret
  * yields an unrelated one, so two instances of this service cannot be
  * cross-referenced.
  *
- * Callers MUST pass an already-{@link normalizeEmail}d address.
+ * Callers MUST pass an already-{@link normalizeHandle}d value. The derivation
+ * is over an opaque string and cares nothing about its shape, which is why the
+ * move from addresses to handles changed nothing here.
  */
-export function deriveDummyKdfDescriptor(input: { email: string; enumerationSecret: string }): KdfDescriptor {
-  const digest = createHmac('sha256', input.enumerationSecret).update(`${DUMMY_SALT_LABEL}:${input.email}`).digest();
+export function deriveDummyKdfDescriptor(input: { handle: string; enumerationSecret: string }): KdfDescriptor {
+  const digest = createHmac('sha256', input.enumerationSecret).update(`${DUMMY_SALT_LABEL}:${input.handle}`).digest();
   return {
     salt: digest.subarray(0, KDF_SALT_BYTES).toString('base64'),
     params: { ...DEFAULT_ARGON2_PARAMS },

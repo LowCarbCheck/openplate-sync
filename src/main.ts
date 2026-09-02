@@ -31,7 +31,6 @@ import { createDrizzleResearchStore } from './db/research-store.js';
 import { deriveServerSecrets } from './lib/server-secrets.js';
 import { createThrottleStore } from './lib/throttle.js';
 import { generateFamilyId, generateToken } from './lib/tokens.js';
-import { selectTransport } from './mail/transport.js';
 import { createApp } from './server/create-app.js';
 import type { AuthContext } from './accounts/auth-handlers.js';
 import { SERVICE_VERSION } from './version.js';
@@ -55,17 +54,11 @@ async function main(): Promise<void> {
   });
   logger.info('Migrations applied');
 
-  const mailTransport = selectTransport(config.email, logger);
-  logger.info('Mail transport selected', { transport: mailTransport.name });
-
   const authContext: AuthContext = {
     store: createDrizzleAccountStore(database.db),
     pepper: secrets.verifierPepper,
     enumerationSecret: secrets.enumerationSecret,
     signupMode: config.signupMode,
-    requireEmailVerification: config.requireEmailVerification,
-    clientBaseUrl: config.clientBaseUrl,
-    sendMail: (message) => mailTransport.send(message),
     now: () => new Date(),
     mintToken: generateToken,
     mintFamilyId: generateFamilyId,
@@ -122,7 +115,6 @@ async function main(): Promise<void> {
       port: config.port,
       serviceVersion: SERVICE_VERSION,
       signupMode: config.signupMode,
-      requireEmailVerification: config.requireEmailVerification,
       // Whether the operator API exists on this instance, never its token.
       adminApi: admin !== null,
       sharing: shares !== null,

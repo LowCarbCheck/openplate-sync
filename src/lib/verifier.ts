@@ -30,24 +30,27 @@ import { asString, type JsonValue } from './json.js';
 export const AUTH_HASH_BYTES = 32;
 
 /**
- * Canonical account-identity form: trimmed and lowercased. Applied on EVERY
- * path that touches an email (signup, login, descriptor lookup, reset
- * request) — an account must not be reachable under one casing and invisible
+ * Canonical account-identity form: NFKC, then trimmed, then lowercased.
+ *
+ * Applied on EVERY path that touches a handle (signup, login, descriptor
+ * lookup) — an account must not be reachable under one spelling and invisible
  * under another, and the deterministic dummy descriptor must be stable for
- * `A@B.com` and `a@b.com` alike or the casing itself becomes an oracle.
+ * `Bright-Otter` and `bright-otter` alike or the spelling itself becomes an
+ * oracle.
+ *
+ * NFKC comes FIRST because compatibility composition is what folds the
+ * look-alike forms Unicode offers for the same characters (fullwidth Latin,
+ * ligatures, the non-breaking spaces a paste can carry). Trimming afterwards
+ * catches the ASCII spaces NFKC produces from those; lowercasing last is what
+ * makes the unique index a true case-insensitive guarantee.
+ *
+ * This is the whole opinion the server has about the SHAPE of a handle,
+ * beyond the input layer's "non-empty, no `@`, length-bounded"
+ * (`accounts/auth-input.ts`). Handles are minted by the client; the service
+ * neither generates nor suggests them.
  */
-export function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
-}
-
-/**
- * Deliberately permissive structural check — one `@`, something either side,
- * a dot in the domain, no whitespace. Email validity is decided by delivery,
- * not by a regex; this only rejects input that cannot possibly be an address
- * so it never reaches the mail transport.
- */
-export function isPlausibleEmail(email: string): boolean {
-  return /^[^\s@]+@[^\s@.]+(\.[^\s@.]+)+$/.test(email);
+export function normalizeHandle(handle: string): string {
+  return handle.normalize('NFKC').trim().toLowerCase();
 }
 
 /**

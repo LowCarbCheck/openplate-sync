@@ -7,11 +7,10 @@
  * externals, rather than a `node_modules` tree a self-hoster has to trust and
  * scan, and the artifact is reproducible from one command.
  *
- * WHY THESE FOUR ARE EXTERNAL:
+ * WHY THESE THREE ARE EXTERNAL:
  *  - `pg` resolves optional native/dialect helpers at runtime; bundling it is a
  *    well-known source of "cannot find module" failures that only appear in
  *    production.
- *  - `nodemailer` does the same for its transport plugins.
  *  - `express` relies on `instanceof` in a few internals, so a second bundled
  *    copy can misbehave in ways that are extremely unfun to debug.
  *  - `dotenv` is CommonJS and calls `require('fs')` at load time. Inlined into
@@ -108,7 +107,7 @@ async function main(): Promise<void> {
     platform: 'node',
     format: 'esm',
     target: 'node20',
-    external: ['express', 'pg', 'nodemailer', 'dotenv'],
+    external: ['express', 'pg', 'dotenv'],
     sourcemap: true,
     logLevel: 'info',
     define: { 'globalThis.__SERVICE_VERSION__': JSON.stringify(await packageVersion()) },

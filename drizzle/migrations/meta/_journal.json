@@ -50,6 +50,13 @@
       "when": 1788209046499,
       "tag": "0006_ambitious_glorian",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1788343430804,
+      "tag": "0007_faulty_tigra",
+      "breakpoints": true
     }
   ]
 }

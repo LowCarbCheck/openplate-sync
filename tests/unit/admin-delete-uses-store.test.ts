@@ -37,14 +37,14 @@ after(async () => {
 
 test('DELETE /v1/admin/accounts/:id calls the shared store method with that id', async () => {
   const created = await harness.fakeAccounts.createAccount({
-    email: 'to-be-erased@example.test',
+    handle: 'to-be-erased',
     displayName: null,
     verifier: 'verifier-value-never-in-a-response',
     kdfDescriptor: { salt: 'AAAA', params: { memorySizeKib: 65536, iterations: 3, parallelism: 1 } },
   });
   assert.ok(created.ok, 'fixture account must be created');
   const accountId = created.account.id;
-  harness.admin.seed({ id: accountId, email: 'to-be-erased@example.test', blobSizeBytes: 128 });
+  harness.admin.seed({ id: accountId, handle: 'to-be-erased', blobSizeBytes: 128 });
 
   const response = await harness.request({
     method: 'DELETE',

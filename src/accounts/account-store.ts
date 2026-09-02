@@ -20,12 +20,11 @@ import type { KdfDescriptor } from '../lib/kdf-descriptor.js';
 
 export interface AccountRecord {
   id: number;
-  /** Always the normalized form (`lib/verifier.ts`'s `normalizeEmail`) — normalization happens before the store is called. */
-  email: string;
+  /** Always the normalized form (`lib/verifier.ts`'s `normalizeHandle`) — normalization happens before the store is called. */
+  handle: string;
   displayName: string | null;
   verifier: string;
   kdfDescriptor: KdfDescriptor;
-  emailVerifiedAt: Date | null;
   createdAt: Date;
 }
 
@@ -48,14 +47,14 @@ export interface NewTokenInput {
 }
 
 export interface CreateAccountInput {
-  email: string;
+  handle: string;
   displayName: string | null;
   verifier: string;
   kdfDescriptor: KdfDescriptor;
 }
 
-/** `email-taken` is the ONLY expected failure; anything else is a real fault and throws. */
-export type CreateAccountResult = { ok: true; account: AccountRecord } | { ok: false; reason: 'email-taken' };
+/** `handle-taken` is the ONLY expected failure; anything else is a real fault and throws. */
+export type CreateAccountResult = { ok: true; account: AccountRecord } | { ok: false; reason: 'handle-taken' };
 
 /**
  * The outcome of an invited signup. `invite-invalid` is ONE member covering
@@ -64,7 +63,7 @@ export type CreateAccountResult = { ok: true; account: AccountRecord } | { ok: f
  * rather than three call sites remembering to say the same thing.
  */
 export type RedeemInviteResult =
-  { ok: true; account: AccountRecord } | { ok: false; reason: 'email-taken' | 'invite-invalid' };
+  { ok: true; account: AccountRecord } | { ok: false; reason: 'handle-taken' | 'invite-invalid' };
 
 export interface RedeemInviteAndCreateAccountInput {
   /** SHA-256 hex of the token the caller presented. The raw token never reaches the store. */
@@ -97,31 +96,31 @@ export interface RotateCredentialInput {
   issue: NewTokenInput[];
   /** Instant stamped on every revocation this rotation performs. */
   revokedAt: Date;
-  /** A single-use link token to consume atomically (the reset path); `null` for an authenticated change. */
-  consumeTokenId: number | null;
 }
 
 export interface AccountStore {
-  findAccountByEmail(email: string): Promise<AccountRecord | null>;
+  findAccountByHandle(handle: string): Promise<AccountRecord | null>;
   findAccountById(accountId: number): Promise<AccountRecord | null>;
   createAccount(input: CreateAccountInput): Promise<CreateAccountResult>;
   /** Cascades to `sync_blobs` and `sync_key_records` via the schema's FKs — the self-serve DSAR path. */
   deleteAccount(accountId: number): Promise<void>;
-  markEmailVerified(input: { accountId: number; verifiedAt: Date }): Promise<void>;
 
   insertTokens(tokens: NewTokenInput[]): Promise<void>;
   findToken(input: { kind: AccountTokenKind; tokenHash: string }): Promise<StoredToken | null>;
   revokeToken(input: { tokenId: number; revokedAt: Date }): Promise<void>;
   /** Revokes one device's lineage — used by logout and by refresh-reuse detection. */
   revokeFamily(input: { accountId: number; familyId: string; revokedAt: Date }): Promise<void>;
-  /** Revokes every `access`/`refresh` token for the account, leaving link tokens alone. */
+  /** Revokes every `access`/`refresh` token for the account. */
   revokeSessions(input: { accountId: number; revokedAt: Date }): Promise<void>;
-  revokeTokensOfKind(input: { accountId: number; kind: AccountTokenKind; revokedAt: Date }): Promise<void>;
 
   /**
    * ATOMIC credential rotation: new verifier + new KDF descriptor + upserted
    * key records + revocation of every outstanding session + the caller's new
    * session, in ONE transaction.
+   *
+   * This is the seam a recovery-code rotation joins (M181 spec 02): the shape
+   * is already "prove something, then move the verifier and the key records
+   * together", and the proof is what differs.
    *
    * It has to be one transaction. A partial application is a data-loss bug,
    * not a retryable hiccup: a new verifier stored without the re-wrapped DEK
@@ -146,8 +145,8 @@ export interface AccountStore {
    *    double-redeem race. Two concurrent redemptions of one invite: exactly
    *    one of them updates a row, because the second finds the predicate false.
    *  - The surrounding TRANSACTION is what gives the invite back when
-   *    `createAccount` then hits the unique violation on `email`. Without it,
-   *    probing a taken address would destroy a capability the person still
+   *    `createAccount` then hits the unique violation on `handle`. Without it,
+   *    probing a taken handle would destroy a capability the person still
    *    needs. A `409` must cost the invite nothing.
    *
    * Expiry is compared against `input.now`, never the database clock. A rule

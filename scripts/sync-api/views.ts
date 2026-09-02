@@ -19,9 +19,8 @@ import { CliError } from './client.js';
 
 export interface AccountView {
   id: number;
-  email: string;
+  handle: string;
   createdAt: string;
-  emailVerifiedAt: string | null;
   blobBytes: number | null;
   blobUpdatedAt: string | null;
   keyRecordKinds: string[];
@@ -36,7 +35,6 @@ export interface AccountPageView {
 
 export interface StatsView {
   accounts: number;
-  verifiedAccounts: number;
   accountsWithBlob: number;
   blobVersions: number;
   keyRecords: number;
@@ -59,18 +57,17 @@ function undocumentedResponse(what: string): CliError {
 function decodeAccount(value: JsonValue | undefined): AccountView {
   const account = asObject(value);
   const id = asNumber(account?.id);
-  const email = asString(account?.email);
+  const handle = asString(account?.handle);
   const createdAt = asString(account?.createdAt);
-  if (id === null || email === null || createdAt === null) throw undocumentedResponse('account');
+  if (id === null || handle === null || createdAt === null) throw undocumentedResponse('account');
 
   const blob = asObject(account?.blob);
   const kinds = asArray(account?.keyRecordKinds) ?? [];
 
   return {
     id,
-    email,
+    handle,
     createdAt,
-    emailVerifiedAt: asString(account?.emailVerifiedAt),
     blobBytes: asNumber(blob?.sizeBytes),
     blobUpdatedAt: asString(blob?.updatedAt),
     keyRecordKinds: kinds.map((kind) => asString(kind)).filter((kind): kind is string => kind !== null),
@@ -196,7 +193,6 @@ export function decodeStats(value: JsonValue): StatsView {
 
   return {
     accounts,
-    verifiedAccounts: asNumber(stats.verifiedAccounts) ?? 0,
     accountsWithBlob: asNumber(stats.accountsWithBlob) ?? 0,
     blobVersions: asNumber(stats.blobVersions) ?? 0,
     keyRecords: asNumber(stats.keyRecords) ?? 0,
@@ -234,11 +230,11 @@ function pad(value: string, width: number): string {
 export function formatAccountTable(page: AccountPageView): string {
   if (page.accounts.length === 0) return 'No accounts.';
 
-  const header = `${pad('ID', 6)}${pad('EMAIL', 36)}${pad('CREATED', 26)}${pad('BLOB', 12)}KEY RECORDS`;
+  const header = `${pad('ID', 6)}${pad('HANDLE', 36)}${pad('CREATED', 26)}${pad('BLOB', 12)}KEY RECORDS`;
   const rows = page.accounts.map((account) => {
     const blob = account.blobBytes === null ? '—' : formatBytes(account.blobBytes);
     const kinds = account.keyRecordKinds.length === 0 ? '—' : account.keyRecordKinds.join(',');
-    return `${pad(String(account.id), 6)}${pad(account.email, 36)}${pad(account.createdAt, 26)}${pad(blob, 12)}${kinds}`;
+    return `${pad(String(account.id), 6)}${pad(account.handle, 36)}${pad(account.createdAt, 26)}${pad(blob, 12)}${kinds}`;
   });
   const shown = page.offset + page.accounts.length;
   return [header, ...rows, '', `${page.accounts.length} of ${page.total} accounts (through ${shown}).`].join('\n');
@@ -247,9 +243,8 @@ export function formatAccountTable(page: AccountPageView): string {
 export function formatAccountDetail(account: AccountView): string {
   return [
     `id              ${account.id}`,
-    `email           ${account.email}`,
+    `handle          ${account.handle}`,
     `created         ${account.createdAt}`,
-    `email verified  ${account.emailVerifiedAt ?? 'never'}`,
     `blob            ${account.blobBytes === null ? 'none' : `${formatBytes(account.blobBytes)}, updated ${account.blobUpdatedAt ?? 'unknown'}`}`,
     `key records     ${account.keyRecordKinds.length === 0 ? 'none' : account.keyRecordKinds.join(', ')}`,
   ].join('\n');
@@ -258,7 +253,6 @@ export function formatAccountDetail(account: AccountView): string {
 export function formatStats(stats: StatsView): string {
   return [
     `accounts            ${stats.accounts}`,
-    `  email verified    ${stats.verifiedAccounts}`,
     `  with a blob       ${stats.accountsWithBlob}`,
     `blob versions       ${stats.blobVersions}`,
     `key records         ${stats.keyRecords}`,

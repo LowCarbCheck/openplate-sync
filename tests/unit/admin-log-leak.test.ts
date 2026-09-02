@@ -1,24 +1,28 @@
 /**
- * An admin action is logged with the account id and never with the address.
+ * An admin action is logged with the account id and never with the handle.
  *
- * The rule is `logger.ts`'s and the ADR restates it: an opaque account id is
- * the correlation handle, and an email address is not. A log line outlives the
- * request by months, gets shipped to whatever aggregates logs, and is pasted
- * into issues — so an address in it is a disclosure with a long tail, and one
- * that no operator asked for. The id answers every operational question the
- * address would ("which account did we erase, and can we prove it") without
- * naming a person.
+ * The rule is `logger.ts`'s and the ADR restates it: the opaque account id is
+ * the correlation key, and the user's own identifier is not. A log line
+ * outlives the request by months, gets shipped to whatever aggregates logs,
+ * and is pasted into issues — so a user-facing identifier in it is a
+ * disclosure with a long tail, and one no operator asked for. The id answers
+ * every operational question the handle would ("which account did we erase,
+ * and can we prove it") without naming the account to a reader.
+ *
+ * M181 replaced the address with a handle and did NOT relax this rule. A
+ * handle is opaque to a stranger but it is still what its owner types to log
+ * in, and it is still the thing that would let two log corpora be joined.
  *
  * The check is over the SERIALIZED line, not over a named field, because the
- * failure this guards against is somebody adding the address as context to a
- * message string rather than as a field.
+ * failure this guards against is somebody adding the identifier as context to
+ * a message string rather than as a field.
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { startAdminHarness, type AdminHarness } from './admin-harness.js';
 
 const ADMIN_TOKEN = 'admin-token-for-the-unit-suite-0123456789';
-const SEEDED_EMAIL = 'never-in-a-log-line@example.test';
+const SEEDED_HANDLE = 'never-in-a-log-line';
 
 let harness: AdminHarness;
 let accountId = 0;
@@ -26,21 +30,21 @@ let accountId = 0;
 before(async () => {
   harness = await startAdminHarness({ adminToken: ADMIN_TOKEN });
   const created = await harness.fakeAccounts.createAccount({
-    email: SEEDED_EMAIL,
+    handle: SEEDED_HANDLE,
     displayName: null,
     verifier: 'verifier-value-never-in-a-log-line',
     kdfDescriptor: { salt: 'AAAA', params: { memorySizeKib: 65536, iterations: 3, parallelism: 1 } },
   });
   assert.ok(created.ok, 'fixture account must be created');
   accountId = created.account.id;
-  harness.admin.seed({ id: accountId, email: SEEDED_EMAIL, blobSizeBytes: 512 });
+  harness.admin.seed({ id: accountId, handle: SEEDED_HANDLE, blobSizeBytes: 512 });
 });
 
 after(async () => {
   await harness.close();
 });
 
-test('an admin deletion logs the account id and not the address', async () => {
+test('an admin deletion logs the account id and not the handle', async () => {
   const response = await harness.request({
     method: 'DELETE',
     path: `/v1/admin/accounts/${accountId}`,
@@ -58,6 +62,6 @@ test('an admin deletion logs the account id and not the address', async () => {
   assert.equal(deletion.fields?.accountId, accountId);
 
   // The absence half.
-  assert.ok(!serialized.includes(SEEDED_EMAIL), 'no log line may contain the account email address');
-  assert.ok(!serialized.includes('never-in-a-log-line'), 'not even a fragment of the address');
+  assert.ok(!serialized.includes(SEEDED_HANDLE), 'no log line may contain the account handle');
+  assert.ok(!serialized.includes('verifier-value-never'), 'and certainly not a fragment of the verifier');
 });

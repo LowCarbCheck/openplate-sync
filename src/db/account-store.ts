@@ -37,14 +37,14 @@ import { accountTokens, accounts, signupInvites, syncKeyRecords } from './schema
 /**
  * Internal control signal for `redeemInviteAndCreateAccount`, never thrown out
  * of this module. A rollback can only be expressed as a throw, so the
- * duplicate-email outcome has to travel as one; this class is what lets the
+ * duplicate-handle outcome has to travel as one; this class is what lets the
  * catch tell it apart from a genuine database fault, which must still
  * propagate.
  */
-class EmailTakenSignal extends Error {
+class HandleTakenSignal extends Error {
   constructor() {
-    super('email taken');
-    this.name = 'EmailTakenSignal';
+    super('handle taken');
+    this.name = 'HandleTakenSignal';
   }
 }
 
@@ -54,11 +54,10 @@ type TokenRow = typeof accountTokens.$inferSelect;
 function mapAccountRow(row: AccountRow): AccountRecord {
   return {
     id: row.id,
-    email: row.email,
+    handle: row.handle,
     displayName: row.displayName,
     verifier: row.verifier,
     kdfDescriptor: row.kdfDescriptor,
-    emailVerifiedAt: row.emailVerifiedAt,
     createdAt: row.createdAt,
   };
 }
@@ -87,8 +86,8 @@ function tokenValues(tokens: NewTokenInput[]): (typeof accountTokens.$inferInser
 
 export function createDrizzleAccountStore(db: Database): AccountStore {
   return {
-    async findAccountByEmail(email: string): Promise<AccountRecord | null> {
-      const [row] = await db.select().from(accounts).where(eq(accounts.email, email)).limit(1);
+    async findAccountByHandle(handle: string): Promise<AccountRecord | null> {
+      const [row] = await db.select().from(accounts).where(eq(accounts.handle, handle)).limit(1);
       return row ? mapAccountRow(row) : null;
     },
 
@@ -102,7 +101,7 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
         const [row] = await db
           .insert(accounts)
           .values({
-            email: input.email,
+            handle: input.handle,
             displayName: input.displayName,
             verifier: input.verifier,
             kdfDescriptor: input.kdfDescriptor,
@@ -111,10 +110,10 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
         if (!row) throw new Error('Failed to insert account');
         return { ok: true, account: mapAccountRow(row) };
       } catch (error) {
-        // The unique index on `email` is what makes concurrent signups for
-        // the same address safe — never a read-then-insert check.
+        // The unique index on `handle` is what makes concurrent signups for
+        // the same handle safe — never a read-then-insert check.
         if (!isUniqueViolation(error)) throw error;
-        return { ok: false, reason: 'email-taken' };
+        return { ok: false, reason: 'handle-taken' };
       }
     },
 
@@ -123,7 +122,7 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
       // capability destroyed for nothing, and an account with an unconsumed
       // invite is a capability that can be spent twice.
       //
-      // The taken-email case is signalled by THROWING rather than returning,
+      // The taken-handle case is signalled by THROWING rather than returning,
       // and the reason is explicitness rather than necessity. Postgres has
       // already aborted the transaction by the time the unique violation
       // surfaces, so a plain `return` would issue a COMMIT that the server
@@ -134,7 +133,7 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
       //
       // What is genuinely load-bearing is the TRANSACTION itself: with the two
       // statements run outside one, the claim commits on its own and a
-      // duplicate-email signup burns the invite. `tests/integration/
+      // duplicate-handle signup burns the invite. `tests/integration/
       // signup-invites.test.ts` fails on exactly that change.
       try {
         return await db.transaction(async (tx): Promise<RedeemInviteResult> => {
@@ -166,7 +165,7 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
             [account] = await tx
               .insert(accounts)
               .values({
-                email: input.account.email,
+                handle: input.account.handle,
                 displayName: input.account.displayName,
                 verifier: input.account.verifier,
                 kdfDescriptor: input.account.kdfDescriptor,
@@ -174,12 +173,12 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
               .returning();
           } catch (error) {
             if (!isUniqueViolation(error)) throw error;
-            // THE INVITE MUST SURVIVE THIS. The address was taken, which is the
+            // THE INVITE MUST SURVIVE THIS. The handle was taken, which is the
             // caller's mistake and not a reason to burn a capability they still
             // need. Unwinding the transaction un-claims the invite by undoing
             // the UPDATE above — precisely why the transaction is here and the
             // conditional UPDATE alone would not be enough.
-            throw new EmailTakenSignal();
+            throw new HandleTakenSignal();
           }
           if (!account) throw new Error('Failed to insert account');
 
@@ -188,17 +187,13 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
           return { ok: true, account: mapAccountRow(account) };
         });
       } catch (error) {
-        if (error instanceof EmailTakenSignal) return { ok: false, reason: 'email-taken' };
+        if (error instanceof HandleTakenSignal) return { ok: false, reason: 'handle-taken' };
         throw error;
       }
     },
 
     async deleteAccount(accountId: number): Promise<void> {
       await db.delete(accounts).where(eq(accounts.id, accountId));
-    },
-
-    async markEmailVerified(input: { accountId: number; verifiedAt: Date }): Promise<void> {
-      await db.update(accounts).set({ emailVerifiedAt: input.verifiedAt }).where(eq(accounts.id, input.accountId));
     },
 
     async insertTokens(tokens: NewTokenInput[]): Promise<void> {
@@ -250,19 +245,6 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
         );
     },
 
-    async revokeTokensOfKind(input: { accountId: number; kind: AccountTokenKind; revokedAt: Date }): Promise<void> {
-      await db
-        .update(accountTokens)
-        .set({ revokedAt: input.revokedAt })
-        .where(
-          and(
-            eq(accountTokens.accountId, input.accountId),
-            eq(accountTokens.kind, input.kind),
-            isNull(accountTokens.revokedAt),
-          ),
-        );
-    },
-
     async rotateCredential(input: RotateCredentialInput): Promise<void> {
       await db.transaction(async (tx) => {
         await tx
@@ -305,13 +287,6 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
               isNull(accountTokens.revokedAt),
             ),
           );
-
-        if (input.consumeTokenId !== null) {
-          await tx
-            .update(accountTokens)
-            .set({ revokedAt: input.revokedAt })
-            .where(and(eq(accountTokens.id, input.consumeTokenId), isNull(accountTokens.revokedAt)));
-        }
 
         if (input.issue.length > 0) {
           await tx.insert(accountTokens).values(tokenValues(input.issue));

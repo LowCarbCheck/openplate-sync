@@ -42,7 +42,7 @@ export * as schema from './db/schema.js';
 
 // Configuration and cross-cutting utilities.
 export { parseConfig } from './config.js';
-export type { ServiceConfig, EmailSettings } from './config.js';
+export type { ServiceConfig } from './config.js';
 export { createLogger, createSilentLogger } from './logger.js';
 export type { Logger, LogLevel } from './logger.js';
 export { deriveServerSecrets } from './lib/server-secrets.js';
@@ -50,6 +50,4 @@ export { createThrottleStore } from './lib/throttle.js';
 export * from './lib/tokens.js';
 export * from './lib/verifier.js';
 export * from './lib/kdf-descriptor.js';
-export { selectTransport } from './mail/transport.js';
-export type { MailMessage, MailResult, MailTransport } from './mail/transport.js';
 export { SERVICE_VERSION } from './version.js';

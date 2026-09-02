@@ -5,7 +5,7 @@
 # `docker/`, so run it from the repository root like this:
 #
 #   cp .env.example .env
-#   # edit .env — SERVER_SECRET and CLIENT_BASE_URL are mandatory
+#   # edit .env, SERVER_SECRET is the only mandatory value
 #   docker compose --project-directory . -f docker/compose.yml up -d
 #
 # `--project-directory .` is not decoration. Without it, Compose treats
@@ -15,13 +15,12 @@
 # quickstart above assumes. (The project name is pinned below, so that part
 # does not depend on where you run from.)
 #
-# With no mail configured the service uses its console transport, so the
-# verification and reset links appear in the service log:
+# There is nothing to configure for mail, because this service sends none. An
+# account is a handle plus a passphrase, and a lost passphrase is recovered
+# with the recovery code the client showed the user at signup. Setting any of
+# the removed mail variables is a boot failure, not a no-op. See .env.example.
 #
 #   docker compose --project-directory . -f docker/compose.yml logs -f sync
-#
-# That is a supported way to run this, not a degraded one — a family instance
-# never needs an SMTP relay.
 #
 # NOTE FOR CONTRIBUTORS: this file is for SELF-HOSTERS. Local development and
 # the integration suite use the shared workspace Postgres (see
@@ -70,27 +69,19 @@ services:
       PORT: 3000
       DATABASE_URL: postgres://${POSTGRES_USER:-openplate}:${POSTGRES_PASSWORD:-openplate}@postgres:5432/${POSTGRES_DB:-openplate_sync}
       SERVER_SECRET: ${SERVER_SECRET:?set SERVER_SECRET in .env — see .env.example}
-      CLIENT_BASE_URL: ${CLIENT_BASE_URL:?set CLIENT_BASE_URL in .env — where your openplate client is served}
-      SIGNUPS_OPEN: ${SIGNUPS_OPEN:-true}
-      REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-false}
+      # Who may create an account: open | invite | closed. The older
+      # SIGNUPS_OPEN name is a boot failure, so it is not forwarded here.
+      SIGNUP_MODE: ${SIGNUP_MODE:-open}
       # Set to the number of reverse proxies in front of this service, or the
       # per-IP throttle collapses into one bucket anyone can lock for everyone.
       TRUST_PROXY: ${TRUST_PROXY:-0}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      EMAIL_FROM: ${EMAIL_FROM:-openplate <noreply@localhost>}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_SECURE: ${SMTP_SECURE:-false}
       # Off by default, and each is inert until forwarded here — Compose passes
       # only what this block names, so a variable set in `.env` alone never
       # reaches the container.
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       SYNC_SHARING: ${SYNC_SHARING:-false}
       SYNC_RESEARCH: ${SYNC_RESEARCH:-false}
-      PIGEON_API_KEY: ${PIGEON_API_KEY:-}
-      PIGEON_BASE_URL: ${PIGEON_BASE_URL:-}
       # Only for an EXTERNAL database. The bundled Postgres above speaks plain
       # TCP on the compose network.
       DATABASE_SSL: ${DATABASE_SSL:-false}

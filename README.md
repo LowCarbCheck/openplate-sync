@@ -2,7 +2,7 @@
 
 The account service for [openplate](https://github.com/LowCarbCheck/openplate). Its first feature is end-to-end-encrypted sync between your devices.
 
-It holds two things: an email address, and opaque ciphertext. It cannot read what it stores — not as a policy, but as a consequence of never receiving a key. Your passphrase never leaves your device; what reaches the server is a derived value that authenticates you and decrypts nothing.
+It holds two things: a handle, and opaque ciphertext. The handle is a short opaque string your client generates and you may edit; it is not an address, it may not contain an `@`, and this service cannot resolve it to a person. It cannot read what it stores, not as a policy, but as a consequence of never receiving a key. Your passphrase never leaves your device; what reaches the server is a derived value that authenticates you and decrypts nothing.
 
 **Start with [`PROTOCOL.md`](./PROTOCOL.md).** It is the normative specification of the wire protocol, written so a third party can implement either side of it without reading this code — an alternative client against this service, or an alternative server that an openplate client can be pointed at with `SYNC_SERVER_URL`.
 
@@ -21,7 +21,7 @@ cp .env.example .env
 
 # Generate the one secret you must not lose:
 openssl rand -hex 32     # → paste into SERVER_SECRET in .env
-# Set CLIENT_BASE_URL to wherever your openplate client is served.
+# That is the only value you must set.
 
 docker compose --project-directory . -f docker/compose.yml up -d
 curl http://localhost:3000/health
@@ -33,22 +33,18 @@ That is the whole install. Postgres comes up alongside the service, the schema m
 
 Then point your openplate app at it by setting `SYNC_SERVER_URL` to this service's public URL — the one a **browser** can reach, since the sync client runs in the page. If you want both halves in one file, openplate ships a combined [`docker/topologies/compose.sync.yml`](https://github.com/LowCarbCheck/openplate/blob/main/docker/topologies/compose.sync.yml) that brings up the app, this service and a shared Postgres together.
 
-### Mail is optional
+### There is no mail, and nothing to configure for it
 
-With no mail configured, verification and reset links are printed to the service log:
+This service sends no email and stores no address, so there is no relay to set up, no bounce to handle, and no deploy step you can get wrong. An account is a handle plus a passphrase.
 
-```bash
-docker compose --project-directory . -f docker/compose.yml logs -f sync
-```
+The cost is stated plainly rather than hidden: **there is no password reset.** A mailed reset link would let whoever controls a mailbox take over an account whose data they still could not read, which is a takeover that buys no recovery. A lost passphrase is recovered with the **recovery code** the client shows the user once at signup. Lose both and the account is gone, to its owner and to you as the operator alike. That is the same property that stops you reading your users' diaries.
 
-That is a supported way to run a personal or family instance, not a degraded one. Set `SMTP_HOST` and friends when you want real delivery. Every setting is documented in [`.env.example`](./.env.example).
+Setting any of the removed mail variables (`EMAIL_FROM`, `SMTP_*`, `PIGEON_*`, `CLIENT_BASE_URL`, `REQUIRE_EMAIL_VERIFICATION`) is a **boot failure**, not a no-op. See [`.env.example`](./.env.example) for why refusing to start is the safer answer.
 
-### Four settings that matter more than the rest
+### Three settings that matter more than the rest
 
 - **`SERVER_SECRET`** — back it up _with your database_. Two subkeys are derived from it: the pepper mixed into every stored auth verifier, and the key behind the anti-enumeration KDF responses. A restored database with a lost secret is a database nobody can log into, and every account would need a passphrase reset. The same is true of a deliberate rotation: changing this value invalidates every stored verifier at once, so it cannot be rotated after a suspected leak without resetting every account's passphrase.
 - **`TRUST_PROXY`** — set it to the number of reverse proxies in front of the service (`1` behind a single nginx or Traefik). Left at `false` behind a proxy, every request appears to come from the proxy's address and the per-IP throttle becomes one global bucket a single attacker can lock for all your users. Set to `true` with nothing in front, anyone can spoof `X-Forwarded-For` and skip the throttle entirely.
-
-- **`CLIENT_BASE_URL`** — the URL of the openplate **client**, not of this service. Verification and reset emails link to `/verify-email` and `/reset-passphrase`, which only the client serves; point this at the sync server by mistake and every link in every email answers `404`.
 
 Your reverse proxy must also allow request bodies of about **2.75 MB**. Blobs are capped at 2 MB, base64 inflates them by a third, and nginx's default `client_max_body_size` is 1 MB — left at the default it rejects legitimate maximum-size syncs before this service ever sees or logs them. In nginx that is `client_max_body_size 3m;`.
 
@@ -74,8 +70,8 @@ pnpm sync-api invites create --note "who it is for" --client-url https://your-ap
 ```
 
 The token is printed **once** and is not stored — only its digest is. If you lose it, revoke
-the invite and mint another. One invite creates one account, and a failed attempt (a taken
-email address, say) does not spend it.
+the invite and mint another. One invite creates one account, and a failed attempt (a handle
+somebody already took, say) does not spend it.
 
 > The older **`SIGNUPS_OPEN`** variable was removed. The service now refuses to start if it is
 > set, rather than ignoring it: it defaulted to _open_, so an instance that had it set to
@@ -101,7 +97,7 @@ The database lives in the `postgres-data` volume declared by `docker/compose.yml
 
 ### What your users should understand
 
-Losing the passphrase without the recovery code means losing the data. Permanently, and to you as the operator too. The email reset flow restores _login_ and cannot restore _data_ — the reset email says so in those words before anyone clicks. This is the direct cost of the server not being able to read anything, and it is not a bug you can fix from the server side.
+Losing the passphrase without the recovery code means losing the data. Permanently, and to you as the operator too. There is no third path, and inventing one would mean the server could open the data. This is the direct cost of the server not being able to read anything, and it is not a bug you can fix from the server side.
 
 ### The admin API is off unless you turn it on
 
@@ -133,7 +129,7 @@ What it can never do, by design rather than by default:
 - **Reset anyone's passphrase.** There cannot be a meaningful admin reset: the
   passphrase wraps the data key on the client, so a server-side credential
   change would produce an account that logs in and decrypts nothing.
-- **Send email.**
+- **Contact a user.** There is no address to write to.
 
 The reasoning in full is in
 [`docs/adr/0001-an-admin-api-for-a-zero-knowledge-service.md`](./docs/adr/0001-an-admin-api-for-a-zero-knowledge-service.md).
@@ -207,13 +203,12 @@ The integration suite targets a local Postgres at `localhost:5433` (user `postgr
 | `src/db/`             | Drizzle schema and the two store implementations.                             |
 | `src/admin/`          | The admin metadata read contract — deliberately not part of `AccountStore`.   |
 | `src/lib/`            | Pure primitives: verifier, tokens, KDF descriptors, throttle.                 |
-| `src/mail/`           | Console / SMTP / pigeon transports and the two messages this service sends.   |
 | `scripts/sync-api/`   | The `pnpm sync-api` admin CLI. HTTP only — it imports no database code.       |
 | `drizzle/migrations/` | Generated migrations. Never hand-written — see `src/db/schema.ts`.            |
 
 ### Invariants
 
-- **No `@sprqvntrs/*` or private-registry dependencies.** This repo must be buildable by anyone. The pigeon mail transport is a hand-written HTTP client for exactly that reason.
+- **No `@sprqvntrs/*` or private-registry dependencies.** This repo must be buildable by anyone.
 - **Handler cores stay pure and dependency-injected.** The shell owns Express, the database and the environment; the cores take a store, a clock and a token minter. That is why the auth suite tests rotation, reuse detection and revocation without a database.
 - **`src/protocol.ts` is a hand-maintained duplicate** of `openplate/app/lib/sync/engine/protocol.ts`. There is no shared package and no shared CI, so both repos carry a unit test asserting the constants against _transcribed literals_. Changing the protocol means editing four places — two sources and two tests — starting with PROTOCOL.md.
 - **Migrations are generated, never written.** And journal timestamps are never hand-edited: the migrator applies only migrations newer than the last applied one, so an out-of-order value causes a later migration to be silently skipped at boot.

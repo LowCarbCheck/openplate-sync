@@ -91,21 +91,21 @@ beforeEach(async () => {
   await database.reset();
 });
 
-async function signUp(email: string, seed: number): Promise<Party> {
+async function signUp(handle: string, seed: number): Promise<Party> {
   const response = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
+    body: { handle, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
   });
-  assert.equal(response.status, 201, `signup for ${email}`);
+  assert.equal(response.status, 201, `signup for ${handle}`);
   assert.ok(response.body.tokens);
   return { accountId: response.body.account.id, accessToken: response.body.tokens.accessToken };
 }
 
 /** A contributor enrolled in one study, having pushed version 1. */
 async function enrolledPair(): Promise<{ contributor: Party; study: Party; sealed: string }> {
-  const contributor = await signUp('contributor@example.test', 51);
-  const study = await signUp('study@example.test', 52);
+  const contributor = await signUp('contributor', 51);
+  const study = await signUp('study', 52);
   const sealed = sampleContributionBody(23, 200);
 
   const push = await service.request<ContributionSummary>({
@@ -226,7 +226,7 @@ test('the study side carries no account id, in any response, for any row', async
 
   // Withdraw a SECOND contributor too, so the withdrawals response has a row
   // to be wrong about as well.
-  const other = await signUp('other-contributor@example.test', 53);
+  const other = await signUp('other-contributor', 53);
   const otherPseudonym = 'X4B7QW2ZP9M1N5R8T3V0KJ6CDE';
   const push = await service.request({
     method: 'PUT',
@@ -344,8 +344,8 @@ test('withdrawal is atomic: the row and the tombstone land together, or neither 
 });
 
 test('withdrawal is atomic under a LATE failure: the delete rolls back with the tombstone', async () => {
-  const contributor = await signUp('late-fail@example.test', 54);
-  const study = await signUp('late-fail-study@example.test', 55);
+  const contributor = await signUp('late-fail', 54);
+  const study = await signUp('late-fail-study', 55);
 
   // Seeded DIRECTLY, bypassing the route's validation, with a pseudonym the
   // TOMBSTONE table refuses (`CHECK length(pseudonym) > 0`). That makes the
@@ -392,7 +392,7 @@ test('cascade: deleting either account erases the contribution, from either end'
   assert.deepEqual(await database.db.select().from(researchContributions), [], 'contributor delete must cascade');
 
   // Now the study end, with a fresh pair.
-  const second = await signUp('second-contributor@example.test', 56);
+  const second = await signUp('second-contributor', 56);
   const push = await service.request({
     method: 'PUT',
     path: `/v1/sync/contributions/${study.accountId}`,
@@ -421,8 +421,8 @@ test('cascade: deleting either account erases the contribution, from either end'
 });
 
 test('the request boundary refuses what no row should ever hold', async () => {
-  const contributor = await signUp('picky@example.test', 57);
-  const study = await signUp('picky-study@example.test', 58);
+  const contributor = await signUp('picky', 57);
+  const study = await signUp('picky-study', 58);
   const valid = {
     pseudonym: PSEUDONYM,
     schemaTier: SCHEMA_TIER,

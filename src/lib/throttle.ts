@@ -13,7 +13,7 @@
  * from IP A locks `A::victim@example.com` only — the real user on IP B hits
  * an untouched bucket. That is what keeps a throttle from becoming a free
  * account-lockout DoS. Signup has no pre-existing identifier to key on, so it
- * throttles by IP alone (keying it by the submitted email would let an
+ * throttles by IP alone (keying it by the submitted handle would let an
  * attacker evade it by rotating addresses).
  *
  * The DECISION functions are pure and unit-tested; the `Map`-backed wrappers

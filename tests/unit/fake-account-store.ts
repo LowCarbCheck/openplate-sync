@@ -2,7 +2,7 @@
  * In-memory `AccountStore` for the auth handler tests — the account-system
  * counterpart to `fake-storage-adapter.ts`.
  *
- * It implements the same semantics the Drizzle store must: unique emails,
+ * It implements the same semantics the Drizzle store must: unique handles,
  * digest-keyed token lookup, revocation that is stamped once and never
  * cleared, and a `rotateCredential` that applies its whole effect. The last
  * one is the reason this fake is worth having — the handler tests can assert
@@ -12,7 +12,7 @@
  * It deliberately does NOT simulate a transaction rollback. Atomicity is a
  * property of Postgres, and the integration suite is where it is exercised.
  * `redeemInviteAndCreateAccount` therefore reproduces the RULES the real
- * transaction enforces (one redemption per invite; a taken email leaves the
+ * transaction enforces (one redemption per invite; a taken handle leaves the
  * invite spendable) by ordering its writes, not by rolling anything back. The
  * concurrency guarantee behind those rules is only testable against Postgres.
  */
@@ -78,9 +78,9 @@ export function createFakeAccountStore(): FakeAccountStore {
   }
 
   return {
-    async findAccountByEmail(email: string): Promise<AccountRecord | null> {
+    async findAccountByHandle(handle: string): Promise<AccountRecord | null> {
       for (const account of accountsById.values()) {
-        if (account.email === email) return { ...account };
+        if (account.handle === handle) return { ...account };
       }
       return null;
     },
@@ -92,15 +92,14 @@ export function createFakeAccountStore(): FakeAccountStore {
 
     async createAccount(input: CreateAccountInput): Promise<CreateAccountResult> {
       for (const account of accountsById.values()) {
-        if (account.email === input.email) return { ok: false, reason: 'email-taken' };
+        if (account.handle === input.handle) return { ok: false, reason: 'handle-taken' };
       }
       const account: AccountRecord = {
         id: nextAccountId++,
-        email: input.email,
+        handle: input.handle,
         displayName: input.displayName,
         verifier: input.verifier,
         kdfDescriptor: input.kdfDescriptor,
-        emailVerifiedAt: null,
         createdAt: new Date(),
       };
       accountsById.set(account.id, account);
@@ -119,9 +118,9 @@ export function createFakeAccountStore(): FakeAccountStore {
       const created = await this.createAccount(input.account);
       // The invite is marked spent ONLY on success. This fake cannot roll a
       // transaction back, but it can honour the rule the transaction exists to
-      // enforce — a duplicate email must leave the invite redeemable — by
+      // enforce — a duplicate handle must leave the invite redeemable — by
       // simply not claiming it until the account exists.
-      if (!created.ok) return { ok: false, reason: 'email-taken' };
+      if (!created.ok) return { ok: false, reason: 'handle-taken' };
 
       invite.redeemedAt = input.now;
       return { ok: true, account: created.account };
@@ -143,11 +142,6 @@ export function createFakeAccountStore(): FakeAccountStore {
       for (let index = tokens.length - 1; index >= 0; index -= 1) {
         if (tokens[index]?.accountId === accountId) tokens.splice(index, 1);
       }
-    },
-
-    async markEmailVerified(input: { accountId: number; verifiedAt: Date }): Promise<void> {
-      const account = accountsById.get(input.accountId);
-      if (account) account.emailVerifiedAt = input.verifiedAt;
     },
 
     async insertTokens(newTokens: NewTokenInput[]): Promise<void> {
@@ -187,10 +181,6 @@ export function createFakeAccountStore(): FakeAccountStore {
       );
     },
 
-    async revokeTokensOfKind(input: { accountId: number; kind: AccountTokenKind; revokedAt: Date }): Promise<void> {
-      revokeMatching((token) => token.accountId === input.accountId && token.kind === input.kind, input.revokedAt);
-    },
-
     async rotateCredential(input: RotateCredentialInput): Promise<void> {
       const account = accountsById.get(input.accountId);
       if (account) {
@@ -202,9 +192,6 @@ export function createFakeAccountStore(): FakeAccountStore {
         (token) => token.accountId === input.accountId && SESSION_TOKEN_KINDS.includes(token.kind),
         input.revokedAt,
       );
-      if (input.consumeTokenId !== null) {
-        revokeMatching((token) => token.id === input.consumeTokenId, input.revokedAt);
-      }
       for (const token of input.issue) {
         tokens.push({
           id: nextTokenId++,

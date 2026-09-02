@@ -2,14 +2,13 @@
  * Boots the REAL Express app (`createApp`) against a real Postgres on an
  * ephemeral loopback port, and hands back a small typed HTTP client.
  *
- * Only three dependencies are substituted, and each for a reason that is
- * about determinism rather than avoidance:
- *   - the mailer, so tests can read the link out of a captured message
- *     instead of an inbox;
- *   - the clock, so token expiry is assertable without sleeping;
- *   - nothing else. The store, the storage adapter, the router, the bearer
- *     middleware, the CORS layer and the error handler are all production
- *     code, and the schema is the committed migrations.
+ * Exactly ONE dependency is substituted, for a reason that is about
+ * determinism rather than avoidance: the clock, so token expiry is assertable
+ * without sleeping. The store, the storage adapter, the router, the bearer
+ * middleware, the CORS layer and the error handler are all production code,
+ * and the schema is the committed migrations.
+ *
+ * The mailer used to be the second substitution. M181 deleted it.
  */
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -27,7 +26,6 @@ import { generateFamilyId, generateToken } from '../../src/lib/tokens.js';
 import { deriveServerSecrets } from '../../src/lib/server-secrets.js';
 import type { AuthContext } from '../../src/accounts/auth-handlers.js';
 import type { SignupMode } from '../../src/protocol.js';
-import type { MailMessage, MailResult } from '../../src/mail/transport.js';
 import type { Database } from '../../src/db/client.js';
 import { SHARE_WRAPPED_DEK_BYTES } from '../../src/server/share-routes.js';
 import { RESEARCH_BODY_MIN_BYTES } from '../../src/server/research-routes.js';
@@ -49,7 +47,6 @@ export interface HttpRequestInput {
 
 export interface ServiceHarness {
   baseUrl: string;
-  sentMail: MailMessage[];
   authContext: AuthContext;
   advance(ms: number): void;
   request<T>(input: HttpRequestInput): Promise<HttpResponse<T>>;
@@ -73,7 +70,6 @@ export const PERMISSIVE_THROTTLE: ThrottleConfig = {
 export interface StartServiceOptions {
   db: Database;
   signupMode?: SignupMode;
-  requireEmailVerification?: boolean;
   throttleConfig?: ThrottleConfig;
   /**
    * Absent (the default) boots the service the way every deployment boots
@@ -97,7 +93,6 @@ export interface StartServiceOptions {
 }
 
 export async function startService(options: StartServiceOptions): Promise<ServiceHarness> {
-  const sentMail: MailMessage[] = [];
   let clock = Date.now();
   const secrets = deriveServerSecrets('integration-test-root-secret-long-enough');
 
@@ -106,12 +101,6 @@ export async function startService(options: StartServiceOptions): Promise<Servic
     pepper: secrets.verifierPepper,
     enumerationSecret: secrets.enumerationSecret,
     signupMode: options.signupMode ?? 'open',
-    requireEmailVerification: options.requireEmailVerification ?? false,
-    clientBaseUrl: 'https://app.example.test',
-    async sendMail(message: MailMessage): Promise<MailResult> {
-      sentMail.push(message);
-      return { success: true, messageId: `harness-${sentMail.length}` };
-    },
     now: () => new Date(clock),
     mintToken: generateToken,
     mintFamilyId: generateFamilyId,
@@ -148,7 +137,6 @@ export async function startService(options: StartServiceOptions): Promise<Servic
 
   return {
     baseUrl,
-    sentMail,
     authContext,
     advance(ms: number) {
       clock += ms;

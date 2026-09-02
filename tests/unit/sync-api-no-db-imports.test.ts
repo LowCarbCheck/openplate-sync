@@ -28,7 +28,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const entrypoint = resolve(repoRoot, 'scripts/sync-api/main.ts');
 
 /** Package specifiers that mean "this module reached the database layer". */
-const FORBIDDEN_PACKAGES = ['pg', 'drizzle-orm', 'drizzle-kit', 'dotenv', 'express', 'nodemailer'] as const;
+const FORBIDDEN_PACKAGES = ['pg', 'drizzle-orm', 'drizzle-kit', 'dotenv', 'express'] as const;
 
 /** Repo files the CLI must not reach, by the path they resolve to. */
 const FORBIDDEN_FILES = ['src/db/', 'src/config.ts', 'src/accounts/', 'src/main.ts'] as const;

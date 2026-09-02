@@ -12,7 +12,6 @@ function baseEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     DATABASE_URL: 'postgres://user:pass@localhost:5432/db',
     SERVER_SECRET: SECRET,
-    CLIENT_BASE_URL: 'https://app.example.test/',
     ...overrides,
   };
 }
@@ -21,7 +20,6 @@ test('a minimal valid environment parses with sane defaults', () => {
   const config = parseConfig(baseEnv());
   assert.equal(config.port, 3000);
   assert.equal(config.signupMode, 'open');
-  assert.equal(config.requireEmailVerification, false);
   assert.equal(config.trustProxy, false);
   assert.equal(config.logLevel, 'info');
   // Both dark features are OFF unless an operator opts in. This is the
@@ -29,12 +27,10 @@ test('a minimal valid environment parses with sane defaults', () => {
   // routes before anyone opts in safe (ADR-0002 / ADR-0003).
   assert.equal(config.sharingEnabled, false);
   assert.equal(config.researchEnabled, false);
-  // Trailing slash stripped so link building never doubles the separator.
-  assert.equal(config.clientBaseUrl, 'https://app.example.test');
 });
 
-test('a missing DATABASE_URL, SERVER_SECRET or CLIENT_BASE_URL is fatal', () => {
-  for (const key of ['DATABASE_URL', 'SERVER_SECRET', 'CLIENT_BASE_URL']) {
+test('a missing DATABASE_URL or SERVER_SECRET is fatal', () => {
+  for (const key of ['DATABASE_URL', 'SERVER_SECRET']) {
     const env = baseEnv();
     delete env[key];
     assert.throws(() => parseConfig(env), new RegExp(key));
@@ -77,22 +73,37 @@ test('an invalid PORT or LOG_LEVEL is fatal', () => {
   assert.throws(() => parseConfig(baseEnv({ LOG_LEVEL: 'chatty' })), /LOG_LEVEL/);
 });
 
-test('mail settings default to the console path and read pigeon/SMTP when present', () => {
-  const bare = parseConfig(baseEnv());
-  assert.equal(bare.email.smtp.host, '');
-  assert.equal(bare.email.pigeon.apiKey, '');
+test('every variable M181 removed is fatal rather than ignored', () => {
+  // The same asymmetry SIGNUPS_OPEN is rejected under, applied to the mailer.
+  // A variable that is quietly ignored lets an operator believe mail is
+  // configured on a service that has no mailer, and believe their users can
+  // reset a passphrase they cannot — a false belief discovered by whoever
+  // needs it most, on the day they need it. Refusing to boot costs one deploy.
+  const removed = [
+    'REQUIRE_EMAIL_VERIFICATION',
+    'CLIENT_BASE_URL',
+    'EMAIL_FROM',
+    'SMTP_HOST',
+    'SMTP_PORT',
+    'SMTP_USER',
+    'SMTP_PASSWORD',
+    'SMTP_SECURE',
+    'PIGEON_API_KEY',
+    'PIGEON_BASE_URL',
+  ];
+  for (const key of removed) {
+    // The message must NAME the variable, or an operator reading one line of
+    // container output cannot tell which of ten it was.
+    assert.throws(() => parseConfig(baseEnv({ [key]: 'anything' })), new RegExp(key), `${key} must be fatal`);
+  }
+});
 
-  const configured = parseConfig(
-    baseEnv({
-      SMTP_HOST: 'mail.example.test',
-      SMTP_PORT: '465',
-      SMTP_SECURE: 'true',
-      PIGEON_BASE_URL: 'https://pigeon.test/',
-    }),
-  );
-  assert.equal(configured.email.smtp.port, 465);
-  assert.equal(configured.email.smtp.secure, true);
-  assert.equal(configured.email.pigeon.baseUrl, 'https://pigeon.test');
+test('a removed variable is fatal even when set to its old default', () => {
+  // The trap this closes: an operator who left REQUIRE_EMAIL_VERIFICATION at
+  // `false` reads it as "off, therefore harmless". It is not harmless, it is
+  // stale, and an empty-looking value must not slip past the guard.
+  assert.throws(() => parseConfig(baseEnv({ REQUIRE_EMAIL_VERIFICATION: 'false' })), /REQUIRE_EMAIL_VERIFICATION/);
+  assert.throws(() => parseConfig(baseEnv({ SMTP_HOST: '' })), /SMTP_HOST/);
 });
 
 test('SYNC_RESEARCH and SYNC_SHARING are independent flags', () => {

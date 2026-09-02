@@ -32,8 +32,7 @@ export interface AdminSeedSecrets {
 
 export interface AdminSeedInput {
   id: number;
-  email: string;
-  emailVerified?: boolean;
+  handle: string;
   blobSizeBytes?: number;
   keyRecordKinds?: SyncKeyRecordKind[];
 }
@@ -53,9 +52,8 @@ export function createFakeAdminStore(): FakeAdminStore {
       const kinds = input.keyRecordKinds ?? [];
       summaries.set(input.id, {
         id: input.id,
-        email: input.email,
+        handle: input.handle,
         createdAt: new Date('2026-08-01T09:00:00.000Z'),
-        emailVerifiedAt: input.emailVerified === true ? new Date('2026-08-02T09:00:00.000Z') : null,
         blob:
           input.blobSizeBytes === undefined
             ? null
@@ -93,7 +91,6 @@ export function createFakeAdminStore(): FakeAdminStore {
       const withBlob = all.filter((account) => account.blob !== null);
       return {
         accounts: all.length,
-        verifiedAccounts: all.filter((account) => account.emailVerifiedAt !== null).length,
         accountsWithBlob: withBlob.length,
         blobVersions: withBlob.length,
         keyRecords: all.reduce((total, account) => total + account.keyRecordKinds.length, 0),

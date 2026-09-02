@@ -34,22 +34,21 @@ import {
 } from './service-harness.js';
 
 const ADMIN_TOKEN = 'integration-admin-token-0123456789abcdef';
-const EMAIL = 'admin-subject@example.test';
+const HANDLE = 'admin-subject';
 const AUTH_HASH = sampleAuthHash(31);
 const CIPHERTEXT = sampleCiphertext(5, 1024);
 const WRAPPED_DEK = sampleWrappedDek(13);
 
 interface SessionBody {
-  account: { id: number; email: string };
+  account: { id: number; handle: string };
   tokens: { accessToken: string; refreshToken: string } | null;
 }
 
 interface AccountBody {
   account: {
     id: number;
-    email: string;
+    handle: string;
     createdAt: string;
-    emailVerifiedAt: string | null;
     blob: { sizeBytes: number; updatedAt: string } | null;
     keyRecordKinds: string[];
   };
@@ -95,7 +94,7 @@ async function seedFurnishedAccount(): Promise<{ accountId: number; accessToken:
   const signup = await service.request<SessionBody>({
     method: 'POST',
     path: '/v1/auth/signup',
-    body: { email: EMAIL, authHash: AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(), displayName: 'Admin Subject' },
+    body: { handle: HANDLE, authHash: AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(), displayName: 'Admin Subject' },
   });
   assert.equal(signup.status, 201);
   // Read without an `assert.ok(... !== undefined)` narrowing call: an
@@ -139,8 +138,7 @@ test('the metadata endpoints describe the real rows', async () => {
     adminToken: ADMIN_TOKEN,
   });
   assert.equal(single.status, 200);
-  assert.equal(single.body.account.email, EMAIL);
-  assert.equal(single.body.account.emailVerifiedAt, null);
+  assert.equal(single.body.account.handle, HANDLE);
   // 1024 base64 characters decode to 768 bytes — the DECODED length is what
   // `size_bytes` holds and what an operator is told.
   assert.equal(single.body.account.blob?.sizeBytes, Buffer.from(CIPHERTEXT, 'base64').byteLength);

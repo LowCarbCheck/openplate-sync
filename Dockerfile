@@ -6,7 +6,7 @@
 # dependency list, and it is what makes this image reproducible by anyone.
 #
 # The runtime layer carries the esbuild bundle plus exactly three real
-# dependencies (`express`, `pg`, `nodemailer` — see `scripts/build.ts` for why
+# dependencies (`express`, `pg`, `dotenv` — see `scripts/build.ts` for why
 # those are external), and the committed migrations, which the service applies
 # itself at boot. A self-hoster pulling a newer tag never runs a second
 # command.
