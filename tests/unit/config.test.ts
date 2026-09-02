@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MIN_SERVER_SECRET_LENGTH, parseConfig } from '../../src/config.js';
+import { MAX_SYNC_NOTICE_LENGTH, MIN_SERVER_SECRET_LENGTH, parseConfig } from '../../src/config.js';
 
 const SECRET = 'x'.repeat(MIN_SERVER_SECRET_LENGTH);
 
@@ -121,4 +121,45 @@ test('SYNC_RESEARCH and SYNC_SHARING are independent flags', () => {
 
   // A typo must not silently mean "off" on a flag whose absence is a 404.
   assert.throws(() => parseConfig(baseEnv({ SYNC_RESEARCH: 'yes' })), /SYNC_RESEARCH/);
+});
+
+test('an instance with nothing to say publishes no notice at all', () => {
+  // ABSENCE IS THE DEFAULT AND IT IS A SHAPE, not just a value: `null` here is
+  // what keeps the field off the /health body entirely, so a client older than
+  // M181 parses the response exactly as it always did.
+  assert.equal(parseConfig(baseEnv()).notice, null);
+  assert.equal(parseConfig(baseEnv({ SYNC_NOTICE: '   ' })).notice, null);
+});
+
+test('SYNC_NOTICE is carried whole, with its optional link', () => {
+  assert.deepEqual(parseConfig(baseEnv({ SYNC_NOTICE: '  We move on 1 March.  ' })).notice, {
+    text: 'We move on 1 March.',
+  });
+  assert.deepEqual(
+    parseConfig(baseEnv({ SYNC_NOTICE: 'We move on 1 March.', SYNC_NOTICE_URL: 'https://example.org/moving' })).notice,
+    { text: 'We move on 1 March.', url: 'https://example.org/moving' },
+  );
+});
+
+test('an over-long SYNC_NOTICE is a boot failure, never a truncation', () => {
+  // /health is this container's own HEALTHCHECK path and is polled forever, so
+  // the cap is real. Failing to boot is the only honest answer: quietly cutting
+  // a shutdown notice in half ships a sentence the operator never wrote.
+  const tooLong = 'n'.repeat(MAX_SYNC_NOTICE_LENGTH + 1);
+  assert.throws(() => parseConfig(baseEnv({ SYNC_NOTICE: tooLong })), /SYNC_NOTICE/);
+  // The boundary itself is accepted, so the cap is a limit and not an off-by-one.
+  const atCap = 'n'.repeat(MAX_SYNC_NOTICE_LENGTH);
+  assert.deepEqual(parseConfig(baseEnv({ SYNC_NOTICE: atCap })).notice, { text: atCap });
+});
+
+test('SYNC_NOTICE_URL must be an absolute http(s) URL, and must have something to link from', () => {
+  const withNotice = (url: string): NodeJS.ProcessEnv => baseEnv({ SYNC_NOTICE: 'Read this.', SYNC_NOTICE_URL: url });
+  // The client refuses these schemes too; refusing them at boot means the
+  // operator hears about it instead of wondering why no link appears.
+  assert.throws(() => parseConfig(withNotice('javascript:alert(1)')), /SYNC_NOTICE_URL/);
+  assert.throws(() => parseConfig(withNotice('data:text/html,hi')), /SYNC_NOTICE_URL/);
+  assert.throws(() => parseConfig(withNotice('/moving')), /SYNC_NOTICE_URL/);
+  // A link with no message is far more likely a typo in the variable name than
+  // an intention, and it would publish nothing either way.
+  assert.throws(() => parseConfig(baseEnv({ SYNC_NOTICE_URL: 'https://example.org/moving' })), /SYNC_NOTICE_URL/);
 });

@@ -358,6 +358,23 @@ Unauthenticated, deliberately: a client must be able to discover that it is inco
 
 `signupMode` is `open`, `invite` or `closed` (§5.8.1), and it is **optional**: a service older than the field omits it, and a client must treat its absence as "attempt the signup and handle the `403`" rather than as a refusal to talk. It is published because it is not a secret — `POST /v1/auth/signup` already discloses it to anyone who calls it — and it saves a client from provoking an error to decide which form to draw.
 
+`notice` is the operator's message to every client, and it is **optional** in exactly the same sense: an instance with nothing to say omits the field, and a client that has never heard of it ignores it.
+
+```json
+{
+  "protocolVersion": 1,
+  "envelopeVersion": 1,
+  "serviceVersion": "0.1.0",
+  "notice": { "text": "This instance moves to a new address on 1 March.", "url": "https://example.org/moving" }
+}
+```
+
+`text` is required when the field is present; `url` is optional and, when present, is an absolute `https:`/`http:` URL. The service caps `text` at 280 characters and refuses to boot on a longer one, because `/health` is also the container's HEALTHCHECK path and is polled continuously.
+
+This is a **pull** channel and nothing more. The service holds no addresses (M181), never initiates, and cannot know who read a notice: a person who opens the app sees it, and a person who does not, does not. It is not a notification mechanism and must not be relied on as one — an operator who needs to be able to reach their users keeps that contact list themselves, outside this service.
+
+A client MUST treat `text` and `url` as hostile input. They come from whatever server the user pointed at. Render `text` as text and never as markup, and follow `url` only after checking its scheme explicitly.
+
 ---
 
 ### 5.7 `POST /v1/auth/kdf` — pre-login KDF descriptor

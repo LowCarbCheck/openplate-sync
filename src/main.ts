@@ -105,6 +105,7 @@ async function main(): Promise<void> {
     throttle: createThrottleStore(),
     logger,
     trustProxy: config.trustProxy,
+    notice: config.notice,
     admin,
     shares,
     research,

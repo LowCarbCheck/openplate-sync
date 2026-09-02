@@ -165,6 +165,35 @@ export interface ProtocolHandshake {
    * when this said `'open'`.
    */
   signupMode?: SignupMode;
+  /**
+   * A short message the operator wants every client to show — a planned
+   * migration, a shutdown date, a "read this before you sync again".
+   *
+   * WHY IT LIVES ON THE HANDSHAKE. This service holds no addresses (M181), so
+   * it has no channel to write to anybody. The notice is PULL, never push: the
+   * client already reads `/health` on every connect, so a person who opens the
+   * app sees the message and a person who does not, does not. That limitation
+   * is real and is written down rather than papered over — it is not a
+   * notification system and must never be relied on as one.
+   *
+   * OPTIONAL, for the same reason `signupMode` is: an instance with nothing to
+   * say omits it, and an older client that has never heard of it ignores it.
+   * Its text is bounded by the service's config (`MAX_SYNC_NOTICE_LENGTH`)
+   * because `/health` is the container's own HEALTHCHECK path and is polled
+   * continuously.
+   *
+   * IT IS HOSTILE INPUT ON THE CLIENT SIDE. It arrives from whatever server
+   * the user pointed at, which is not necessarily the operator they think it
+   * is: render it as TEXT, never as markup, and never build a link from
+   * {@link OperatorNotice.url} without checking its scheme first.
+   */
+  notice?: OperatorNotice;
+}
+
+/** The optional operator message of {@link ProtocolHandshake.notice}. `url` is absent when the notice links nowhere. */
+export interface OperatorNotice {
+  text: string;
+  url?: string;
 }
 
 /** Result of {@link checkProtocolCompatibility} — `reason` is a user-presentable sentence. */

@@ -46,7 +46,7 @@
 import express from 'express';
 import type { Express } from 'express';
 import { ENVELOPE_VERSION, PROTOCOL_VERSION, SYNC_API_PREFIX } from '../protocol.js';
-import type { ProtocolHandshake } from '../protocol.js';
+import type { OperatorNotice, ProtocolHandshake } from '../protocol.js';
 import type { SyncResearchStore, SyncRotationStore, SyncShareStore, SyncStorageAdapter } from '../contract-types.js';
 import type { AuthContext } from '../accounts/auth-handlers.js';
 import { registerAuthRoutes } from '../accounts/register-auth-routes.js';
@@ -97,6 +97,12 @@ export interface CreateAppOptions {
   /** Express `trust proxy`. Wrong here means `req.ip` is the proxy's and the whole throttle is one shared bucket. */
   trustProxy: boolean | number;
   /**
+   * The operator's message, published on the health handshake, or
+   * `null`/absent for an instance with nothing to say — the default. Static
+   * config (`SYNC_NOTICE`), never a stored record: see `config.ts`.
+   */
+  notice?: OperatorNotice | null;
+  /**
    * The operator's API, or `null`/absent for "this instance does not have
    * one" — which is the default and what every unconfigured deployment gets.
    * See the module header for why absence is a 404 rather than a 401.
@@ -145,6 +151,11 @@ export function createApp(options: CreateAppOptions): Express {
       // already tells anyone who asks. See `SignupMode`.
       signupMode: options.authContext.signupMode,
     };
+    // The operator's notice rides on this same /health body, and only when
+    // there is one: an instance with nothing to say sends no field at all, so
+    // a client older than M181 parses the response exactly as before. It is
+    // PULL — this service holds no addresses and never initiates.
+    if (options.notice != null) handshake.notice = options.notice;
     res.status(200).json(handshake);
   });
 

@@ -41,6 +41,38 @@ The cost is stated plainly rather than hidden: **there is no password reset.** A
 
 Setting any of the removed mail variables (`EMAIL_FROM`, `SMTP_*`, `PIGEON_*`, `CLIENT_BASE_URL`, `REQUIRE_EMAIL_VERIFICATION`) is a **boot failure**, not a no-op. See [`.env.example`](./.env.example) for why refusing to start is the safer answer.
 
+### You have no way to contact your users, so keep your own list
+
+Holding no addresses means this service cannot write to anybody: no breach
+notification, no "this instance is moving", no "your account will be deleted on
+Friday". That is the deliberate consequence of the design, not an omission to be
+fixed later, and it is worth reading twice before you run an instance for
+somebody other than yourself.
+
+**If you need to be able to reach your users, keep that list yourself, outside
+this service, and do not expect the service to help.** You already know who they
+are: you handed them their join links personally. A household has a chat, a
+clinic has a patient record, an employer has a directory. Any of those is a
+better contact list than a column in a zero-knowledge database, and none of them
+puts an address next to a diary the operator cannot read.
+
+The one thing the service does offer is a **notice on the handshake**. Set
+`SYNC_NOTICE` (and optionally `SYNC_NOTICE_URL`) and every client that connects
+shows the message as a dismissible banner:
+
+```bash
+SYNC_NOTICE="This instance moves to sync.example.org on 1 March. Sign in there with the same handle."
+SYNC_NOTICE_URL="https://example.org/moving"
+```
+
+Know exactly what that is and is not. It is **pull, not push**: the client reads
+it from `GET /health` when it connects, so it reaches only the people who open
+the app, it does not reach anybody who has stopped using it, and the server never
+learns who read it. Changing it is a redeploy, the same as `SIGNUP_MODE`. The
+text is capped at 280 characters because `/health` is also the container's
+healthcheck path and is polled continuously. For anything that must actually
+arrive, use your own contact list.
+
 ### Three settings that matter more than the rest
 
 - **`SERVER_SECRET`** — back it up _with your database_. Two subkeys are derived from it: the pepper mixed into every stored auth verifier, and the key behind the anti-enumeration KDF responses. A restored database with a lost secret is a database nobody can log into, and every account would need a passphrase reset. The same is true of a deliberate rotation: changing this value invalidates every stored verifier at once, so it cannot be rotated after a suspected leak without resetting every account's passphrase.

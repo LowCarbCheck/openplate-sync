@@ -12,7 +12,7 @@
  * kept in step with it.
  */
 import { isLogLevel, type LogLevel } from './logger.js';
-import { isSignupMode, SIGNUP_MODES, type SignupMode } from './protocol.js';
+import { isSignupMode, SIGNUP_MODES, type OperatorNotice, type SignupMode } from './protocol.js';
 
 /**
  * Minimum accepted `SERVER_SECRET` length. 32 characters is the shortest
@@ -33,6 +33,24 @@ export const MIN_SERVER_SECRET_LENGTH = 32;
  * the module header.
  */
 export const MIN_ADMIN_TOKEN_LENGTH = 24;
+
+/**
+ * Longest accepted `SYNC_NOTICE`, in characters.
+ *
+ * THE CAP IS NOT TIDINESS. The notice is published on `GET /health`, which is
+ * this container's own HEALTHCHECK path (`bay-sprqvntrs` sets
+ * `healthcheck_path: /health`) and is therefore polled continuously, forever.
+ * An unbounded string there is a payload the operator inflicts on their own
+ * instance. 280 characters is enough for "we are moving on 1 March, details at
+ * the link" and short enough that nobody is tempted to publish a changelog.
+ *
+ * Over-long is a BOOT FAILURE, not a truncation: silently cutting a shutdown
+ * notice in half would ship a sentence the operator never wrote.
+ */
+export const MAX_SYNC_NOTICE_LENGTH = 280;
+
+/** Schemes a `SYNC_NOTICE_URL` may use. Anything else (`javascript:`, `data:`) is a boot failure, never a rendered link. */
+const NOTICE_URL_SCHEMES = ['https:', 'http:'];
 
 export interface ServiceConfig {
   port: number;
@@ -91,6 +109,22 @@ export interface ServiceConfig {
    * from one where the feature was never written.
    */
   researchEnabled: boolean;
+  /**
+   * The operator's message to every client, or `null` — the default, and what
+   * an instance with nothing to say has.
+   *
+   * This is the whole of M181's notice channel, and it is deliberately static
+   * config rather than a table with an admin endpoint. Both deliver the same
+   * string to the same banner; only one of them needs a migration, a store, a
+   * route, its own authorisation and its own tests. An operator who wants to
+   * change it redeploys, exactly as they already do for `SIGNUP_MODE`.
+   *
+   * It is not a notification system: nobody who does not open the app will
+   * ever see it, and the service cannot know who did. See `README.md` — an
+   * operator who needs to be able to REACH their users keeps that list
+   * themselves, outside this service.
+   */
+  notice: OperatorNotice | null;
   logLevel: LogLevel;
 }
 
@@ -136,6 +170,48 @@ function parseSignupMode(env: NodeJS.ProcessEnv): SignupMode {
     throw new Error(`Invalid SIGNUP_MODE: expected ${SIGNUP_MODES.join('/')}, got "${raw}"`);
   }
   return raw;
+}
+
+/**
+ * `SYNC_NOTICE` (and the optional `SYNC_NOTICE_URL` beside it) — the message
+ * every client shows on connect. Absent, which is the default, means the
+ * handshake carries no notice field at all and an older client is unaffected.
+ *
+ * Three things are refused at boot rather than shipped:
+ *  - a notice longer than {@link MAX_SYNC_NOTICE_LENGTH} — see that constant;
+ *  - a URL whose scheme is not `https:`/`http:`, because the client will not
+ *    render it either and a `javascript:` value in an operator's env is worth
+ *    saying out loud;
+ *  - a URL with no notice, which is a link with nothing to say and is far more
+ *    likely a typo in the variable name than an intention.
+ */
+function parseNotice(env: NodeJS.ProcessEnv): OperatorNotice | null {
+  const text = env.SYNC_NOTICE?.trim() ?? '';
+  const url = env.SYNC_NOTICE_URL?.trim() ?? '';
+
+  if (text === '') {
+    if (url === '') return null;
+    throw new Error('SYNC_NOTICE_URL is set without SYNC_NOTICE: a link with no message is never published');
+  }
+  if (text.length > MAX_SYNC_NOTICE_LENGTH) {
+    throw new Error(
+      `SYNC_NOTICE must be at most ${MAX_SYNC_NOTICE_LENGTH} characters (got ${text.length}) — it is published on /health, which the container healthcheck polls continuously`,
+    );
+  }
+  if (url === '') return { text };
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`Invalid SYNC_NOTICE_URL: expected an absolute https:// URL, got "${url}"`);
+  }
+  if (!NOTICE_URL_SCHEMES.includes(parsed.protocol)) {
+    throw new Error(
+      `Invalid SYNC_NOTICE_URL scheme "${parsed.protocol}": only ${NOTICE_URL_SCHEMES.join('/')} are published`,
+    );
+  }
+  return { text, url };
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -257,6 +333,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
     adminToken: parseAdminToken(env),
     sharingEnabled: parseBoolean(env, 'SYNC_SHARING', false),
     researchEnabled: parseBoolean(env, 'SYNC_RESEARCH', false),
+    notice: parseNotice(env),
     logLevel: parseLogLevel(env),
   };
 }
