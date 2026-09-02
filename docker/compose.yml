@@ -82,6 +82,11 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       SYNC_SHARING: ${SYNC_SHARING:-false}
       SYNC_RESEARCH: ${SYNC_RESEARCH:-false}
+      # The operator notice: one short sentence /health publishes and the
+      # client shows. Empty means no notice. SYNC_NOTICE_URL without
+      # SYNC_NOTICE is a boot failure. See .env.example for the length cap.
+      SYNC_NOTICE: ${SYNC_NOTICE:-}
+      SYNC_NOTICE_URL: ${SYNC_NOTICE_URL:-}
       # Only for an EXTERNAL database. The bundled Postgres above speaks plain
       # TCP on the compose network.
       DATABASE_SSL: ${DATABASE_SSL:-false}

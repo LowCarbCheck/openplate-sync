@@ -155,10 +155,10 @@ Under Compose, put the value in `.env` — `docker/compose.yml` already forwards
 `ADMIN_TOKEN` into the container. Compose passes only the variables that file's
 `environment:` block names, so a variable you add to `.env` and nowhere else
 never reaches the service. `SIGNUP_MODE`, `TRUST_PROXY`, `LOG_LEVEL`,
-`SYNC_SHARING`, `SYNC_RESEARCH` and `DATABASE_SSL` are forwarded there too.
-`SYNC_NOTICE` and `SYNC_NOTICE_URL` are **not**: setting them in `.env` alone
-has no effect on a Compose install, so add them to that `environment:` block
-before you rely on a notice reaching anybody.
+`SYNC_SHARING`, `SYNC_RESEARCH`, `DATABASE_SSL`, `SYNC_NOTICE` and
+`SYNC_NOTICE_URL` are forwarded there too. If you run your own Compose file
+rather than the one in `docker/`, name each variable you rely on in its
+`environment:` block.
 
 What it can never do, by design rather than by default:
 
