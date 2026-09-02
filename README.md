@@ -37,7 +37,11 @@ Then point your openplate app at it by setting `SYNC_SERVER_URL` to this service
 
 This service sends no email and stores no address, so there is no relay to set up, no bounce to handle, and no deploy step you can get wrong. An account is a handle plus a passphrase.
 
-The cost is stated plainly rather than hidden: **there is no password reset.** A mailed reset link would let whoever controls a mailbox take over an account whose data they still could not read, which is a takeover that buys no recovery. A lost passphrase is recovered with the **recovery code** the client shows the user once at signup. Lose both and the account is gone, to its owner and to you as the operator alike. That is the same property that stops you reading your users' diaries.
+The cost is stated plainly rather than hidden: **there is no mailed password reset, and you cannot perform one either.** A mailed reset link would let whoever controls a mailbox take over an account whose data they still could not read, which is a takeover that buys no recovery.
+
+What replaces it is the **recovery code** the client shows the user once at signup, beside their handle, as one saved account card. Holding that code, a user can log in (`POST /v1/auth/recover`) and set a new passphrase (`POST /v1/auth/recover-rotate`); both endpoints are throttled per IP and handle on one shared bucket. Unlike a mailed link, the code is held by the user and never by the server, so it both proves who they are and unwraps their data.
+
+**Lose the passphrase and the recovery code, and the account is gone**: to its owner, and to you as the operator alike. There is no third path, and there cannot be one, because the server holds no key material to restore. That is the same property that stops you reading your users' diaries.
 
 Setting any of the removed mail variables (`EMAIL_FROM`, `SMTP_*`, `PIGEON_*`, `CLIENT_BASE_URL`, `REQUIRE_EMAIL_VERIFICATION`) is a **boot failure**, not a no-op. See [`.env.example`](./.env.example) for why refusing to start is the safer answer.
 
@@ -75,7 +79,7 @@ arrive, use your own contact list.
 
 ### Three settings that matter more than the rest
 
-- **`SERVER_SECRET`** — back it up _with your database_. Two subkeys are derived from it: the pepper mixed into every stored auth verifier, and the key behind the anti-enumeration KDF responses. A restored database with a lost secret is a database nobody can log into, and every account would need a passphrase reset. The same is true of a deliberate rotation: changing this value invalidates every stored verifier at once, so it cannot be rotated after a suspected leak without resetting every account's passphrase.
+- **`SERVER_SECRET`** — back it up _with your database_. Two subkeys are derived from it: the pepper mixed into every stored auth verifier, and the key behind the anti-enumeration KDF responses. A restored database with a lost secret is a database nobody can log into, and **not even a recovery code gets anybody back in**: the pepper keys both the passphrase verifier and the recovery verifier, so losing it invalidates both at once. The same is true of a deliberate rotation. There is no reset that repairs this from the server side, so treat the secret as part of the backup, not as a setting.
 - **`TRUST_PROXY`** — set it to the number of reverse proxies in front of the service (`1` behind a single nginx or Traefik). Left at `false` behind a proxy, every request appears to come from the proxy's address and the per-IP throttle becomes one global bucket a single attacker can lock for all your users. Set to `true` with nothing in front, anyone can spoof `X-Forwarded-For` and skip the throttle entirely.
 
 Your reverse proxy must also allow request bodies of about **2.75 MB**. Blobs are capped at 2 MB, base64 inflates them by a third, and nginx's default `client_max_body_size` is 1 MB — left at the default it rejects legitimate maximum-size syncs before this service ever sees or logs them. In nginx that is `client_max_body_size 3m;`.
@@ -129,6 +133,8 @@ The database lives in the `postgres-data` volume declared by `docker/compose.yml
 
 ### What your users should understand
 
+Two secrets, and the account card that carries them. At signup the client shows the **handle** and the **recovery code** together, once. A handle is not memorable the way an address is, so that card is what a user must actually keep.
+
 Losing the passphrase without the recovery code means losing the data. Permanently, and to you as the operator too. There is no third path, and inventing one would mean the server could open the data. This is the direct cost of the server not being able to read anything, and it is not a bug you can fix from the server side.
 
 ### The admin API is off unless you turn it on
@@ -148,9 +154,11 @@ credential exists and is merely locked.
 Under Compose, put the value in `.env` — `docker/compose.yml` already forwards
 `ADMIN_TOKEN` into the container. Compose passes only the variables that file's
 `environment:` block names, so a variable you add to `.env` and nowhere else
-never reaches the service. The same holds for `SYNC_SHARING`, `SYNC_RESEARCH`,
-`PIGEON_API_KEY`, `PIGEON_BASE_URL` and `DATABASE_SSL`, all of which are
-forwarded there too.
+never reaches the service. `SIGNUP_MODE`, `TRUST_PROXY`, `LOG_LEVEL`,
+`SYNC_SHARING`, `SYNC_RESEARCH` and `DATABASE_SSL` are forwarded there too.
+`SYNC_NOTICE` and `SYNC_NOTICE_URL` are **not**: setting them in `.env` alone
+has no effect on a Compose install, so add them to that `environment:` block
+before you rely on a notice reaching anybody.
 
 What it can never do, by design rather than by default:
 

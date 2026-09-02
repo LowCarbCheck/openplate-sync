@@ -29,6 +29,7 @@ The client holds all the keys. It serializes its whole local store, gzips it, en
 | **Key record**    | One wrapped DEK, plus (passphrase kind only) the KDF parameters needed to re-derive its KEK. |
 | **`blobVersion`** | Monotonic per-account counter. The compare-and-swap token.                                   |
 | **Account**       | The unit of isolation. One account has at most one current blob and at most two key records. |
+| **Handle**        | An opaque per-server account identifier. Never an address; may not contain an `@`.           |
 
 ## 3. Cryptography (client-side; the server implements none of it)
 
@@ -41,7 +42,9 @@ A conforming server needs none of this section — it is here so an alternative 
 passphrase ─Argon2id(salt, m, t, p)─► hash ─┤
                           └─HKDF-SHA-256(salt, info=AUTH)───────────► authHash (sent to the server)
 
-recovery code ────────────────────────────────HKDF-SHA-256(salt="", info=RECOVERY_KEK)──► KEK_r
+                                     ┌─HKDF-SHA-256(salt="", info=RECOVERY_KEK)──► KEK_r            (never sent)
+recovery code ───────────────────────┤
+                                     └─HKDF-SHA-256(salt="", info=RECOVERY_AUTH)─► recoveryAuthHash (sent)
 ```
 
 - **Argon2id** parameters (recorded per account in the passphrase key record's `kdfDescriptor` and in the account's own KDF descriptor, so they can be raised later without breaking existing accounts): `memorySizeKib: 65536` (64 MiB), `iterations: 3`, `parallelism: 1`, `hashLength: 32`. Salt: 16 random bytes.
@@ -49,8 +52,11 @@ recovery code ──────────────────────
   - `openplate-sync:passphrase-kek:v1`
   - `openplate-sync:recovery-kek:v1`
   - `openplate-sync:auth:v1`
+  - `openplate-sync:recovery-auth:v1`
 - **The `auth` branch is what the client sends as its password.** It is a sibling of `KEK_p`, not a parent and not a child: both are HKDF outputs over the same Argon2id hash under different `info` labels, so possession of one gives no information about the other. This is the whole reason the server can authenticate a user it cannot decrypt for. `authHash` is 32 bytes, base64 on the wire.
-- The server never stores `authHash` either. It stores `HMAC-SHA-256(serverPepper, authHash)`, with the pepper held outside the database — see §5.8.
+- **The `recovery-auth` branch is what the client sends to prove possession of the recovery code** (§5.14). It is a sibling of `KEK_r` in exactly the sense `authHash` is a sibling of `KEK_p`, and it is 32 bytes, base64 on the wire.
+- **The `recovery-auth` label is never the `recovery-kek` label.** That domain separation is load-bearing, not tidiness. The KEK branch derives the key that opens the diary; were the same output also sent to the server, this service would store an HMAC of the material that unwraps a DEK, and "the operator cannot read your data" would rest on SHA-256 being one-way rather than on the operator never having held the value. Both labels are frozen, neither is derived from the other, and a future change to either is a new `:v2` label rather than a redefinition (ADR-0004).
+- The server never stores `authHash` or `recoveryAuthHash` either. It stores `HMAC-SHA-256(serverPepper, ...)` of each, with the pepper held outside the database. See §5.8.
 - The recovery path deliberately skips Argon2id and uses an **empty HKDF salt**. That is correct, not an oversight: RFC 5869 §3.1 permits it when the input key material is already high-entropy, which a 160-bit random code is by construction. Only low-entropy human passphrases need a memory-hard stretch and a real salt.
 - **Recovery code**: 20 random bytes (160 bits), rendered in a Crockford-style base32 alphabet (`0123456789ABCDEFGHJKMNPQRSTVWXYZ` — no `O`, `I`, `L` to survive transcription) in groups of 5.
 - KEKs are 256-bit AES-GCM keys, imported non-extractable.
@@ -233,7 +239,7 @@ Two token kinds, both opaque random strings, both stored **only as SHA-256 diges
 | `access`  | 15 min   | Sent on every request. Short, because a leaked one is useful for as long as it lives. |
 | `refresh` | 30 days  | Exchanged for a new pair. Rotating — every use spends it.                             |
 
-**Why an opaque pair and not a JWT.** Revocation is load-bearing in this protocol: a passphrase change and both reset paths must invalidate every outstanding session _immediately_, and a user changing their passphrase under suspicion expects exactly that. A stateless token can only be made to expire, never to stop working, without adding the same server-side denylist that a database-backed opaque token already is.
+**Why an opaque pair and not a JWT.** Revocation is load-bearing in this protocol: a passphrase change and a recovery-code rotation must invalidate every outstanding session _immediately_, and a user changing their passphrase under suspicion expects exactly that. A stateless token can only be made to expire, never to stop working, without adding the same server-side denylist that a database-backed opaque token already is.
 
 **Why a pair at all.** The client must never persist the passphrase, so it cannot silently re-derive an auth-hash to log in again. A long-lived rotating refresh token is the only thing that makes silent re-authentication possible in a zero-knowledge design.
 
@@ -246,12 +252,12 @@ Two token kinds, both opaque random strings, both stored **only as SHA-256 diges
 **Revocation triggers.** Every one of these revokes **all** outstanding `access` and `refresh` tokens for the account:
 
 - `POST /v1/auth/change-passphrase`
-- `POST /v1/auth/reset`
+- `POST /v1/auth/recover-rotate`
 - account deletion (by row cascade)
 
 `POST /v1/auth/logout` revokes one family — that device — and leaves the account's other sessions alone.
 
-Link tokens (email verification, reset) live in the same store with their own kinds and lifetimes (24 h and 1 h respectively). They are single-use, and requesting a new reset link revokes any outstanding one.
+**Session tokens are now the only kind.** Until 0.5.0 this store also held two single-use LINK kinds, minted to be put in a message: one confirmed an address, the other redeemed a mailed recovery link. Both went with the mailer (§5.12, §5.13). A service that holds no address cannot send a link, and `POST /v1/auth/recover` needs none: the credential it checks is the recovery code the user already holds.
 
 ## 5. Endpoints
 
@@ -381,9 +387,9 @@ A client MUST treat `text` and `url` as hostile input. They come from whatever s
 
 Unauthenticated, IP-throttled. Returns the Argon2id salt and parameters a device needs to derive `authHash` before it can log in.
 
-POST rather than GET, for what is a read: a GET puts the email in the request line, and from there into access logs, proxy logs, `Referer` headers and browser history. An endpoint whose whole purpose is not disclosing who has an account should not scatter the address it was asked about.
+POST rather than GET, for what is a read: a GET puts the handle in the request line, and from there into access logs, proxy logs, `Referer` headers and browser history. An endpoint whose whole purpose is not disclosing who has an account should not scatter the identifier it was asked about.
 
-Request: `{"email": "person@example.com"}` · Response `200`:
+Request: `{"handle": "qr7k4m2p"}` · Response `200`:
 
 ```json
 {
@@ -394,14 +400,15 @@ Request: `{"email": "person@example.com"}` · Response `200`:
 }
 ```
 
-**An unknown email gets a descriptor too.** It is derived deterministically as `HMAC(serverSecret, email)` — stable across requests, identical in shape, produced by the same code path. A `400` is returned only for input that could not be an email address at all.
+**An unknown handle gets a descriptor too.** It is derived deterministically as `HMAC(serverSecret, handle)` over the canonical handle (§5.8), so it is stable across requests, identical in shape, and produced by the same code path. A `400` is returned only for input that could not be a handle at all. The move from addresses to handles changed nothing here: the derivation runs over an opaque string, and a handle is one.
 
-This matters more than it looks. A zero-knowledge login _requires_ an unauthenticated, email-keyed endpoint that answers before authentication; done naively it is a free, silent, unthrottleable list of which addresses hold accounts. Stability is as load-bearing as the shape: a random dummy would be distinguishable by asking twice.
+This matters more than it looks. A zero-knowledge login _requires_ an unauthenticated, handle-keyed endpoint that answers before authentication; done naively it is a free, silent, unthrottleable list of which handles hold accounts. Stability is as load-bearing as the shape: a random dummy would be distinguishable by asking twice.
 
-A conforming server MUST NOT return `404`, an empty body, or a different shape for an unknown address. It must also:
+A conforming server MUST NOT return `404`, an empty body, or a different shape for an unknown handle. It must also:
 
-- **Do the same work on both branches.** Derive the dummy unconditionally, including for accounts that exist and will never use it, so a hit and a miss cost the same lookup and the same HMAC. Deriving it lazily leaves a timing delta — the response says nothing, but how long it took to produce does.
-- **Rate-limit by source address**, returning `429` with `Retry-After`. This is the other half of the same defence: the residual timing signal is statistical, and only emerges from many samples per address. Denying the samples is what closes it. Keying the limit by the submitted email would be worse than nothing — probing many addresses _is_ the attack, so a per-email bucket hands out a fresh allowance for every address the attacker wants to test.
+- **Do the same work on both branches.** Derive the dummy unconditionally, including for accounts that exist and will never use it, so a hit and a miss cost the same lookup and the same HMAC. Deriving it lazily leaves a timing delta: the response says nothing, but how long it took to produce does.
+- **Derive it over the canonical handle**, so two spellings of one unknown handle cannot be told apart by their descriptors.
+- **Rate-limit by source address**, returning `429` with `Retry-After`. This is the other half of the same defence: the residual timing signal is statistical, and only emerges from many samples per handle. Denying the samples is what closes it. Keying the limit by the submitted handle would be worse than nothing, because probing many handles _is_ the attack, so a per-handle bucket hands out a fresh allowance for every handle the attacker wants to test.
 
 ### 5.8 `POST /v1/auth/signup`
 
@@ -409,26 +416,33 @@ Unauthenticated, IP-throttled.
 
 ```json
 {
-  "email": "...",
+  "handle": "qr7k4m2p",
   "authHash": "<base64, 32 bytes>",
   "kdfDescriptor": { "...": "..." },
-  "displayName": "optional or null"
+  "displayName": "optional or null",
+  "recoveryAuthHash": "<base64, 32 bytes>, optional or null"
 }
 ```
 
-| Status | Meaning                                                                                                                |
-| ------ | ---------------------------------------------------------------------------------------------------------------------- |
-| `201`  | `{"account": {...}, "tokens": {...} \| null}`. `tokens` is `null` when the server requires email verification.         |
-| `400`  | Malformed email, `authHash` not 32 decoded bytes, or a descriptor without a 16-byte salt and positive Argon2id params. An address is malformed unless its domain carries at least one dot, so a bare host like `admin@localhost` is rejected. |
+`handle` is the account's identifier: an opaque per-server string, canonicalised NFKC then trimmed then lowercased, non-empty, at most 64 characters, unique on the instance, and **never containing an `@`**. The client mints it and the user may edit it. The service has no other opinion about its shape and cannot resolve it to a person. The `@` rejection is what stops this field drifting back into an address register one signup at a time, and it is never relaxed (ADR-0004).
+
+`recoveryAuthHash` is the second authenticator (§5.14), the `recovery-auth` HKDF branch of §3.1. It is **optional**, and absent and `null` both mean the same thing: this account has no second authenticator, so a lost passphrase ends it. A client that omits the field must say so to the user in those terms, at signup, while the recovery code is still on screen.
+
+| Status | Meaning                                                                                                                                                                                                                                                          |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `201`  | `{"account": {"id": 1, "handle": "...", "displayName": null}, "tokens": {...}}`. A session is always issued; there is nothing left to confirm.                                                                                                                   |
+| `400`  | A handle that is empty, over 64 characters or contains `@`; an `authHash` or `recoveryAuthHash` that is not 32 decoded bytes; or a descriptor without a 16-byte salt and positive Argon2id params.                                                               |
 | `403`  | Either this instance is not accepting new accounts (`SIGNUP_MODE=closed`), or it requires an invite and none was given, or the one given was not valid (`SIGNUP_MODE=invite`). The two carry different `error` text; show the message rather than infer a cause. |
-| `409`  | An account already exists for this email.                                                                              |
-| `429`  | Throttled. `Retry-After` in seconds.                                                                                   |
+| `409`  | An account already exists for this handle.                                                                                                                                                                                                                       |
+| `429`  | Throttled. `Retry-After` in seconds.                                                                                                                                                                                                                             |
 
-The server stores `HMAC-SHA-256(serverPepper, authHash)`, **not** a second slow KDF over it. The client has already paid the memory-hard cost; hashing again server-side would add no brute-force resistance (an attacker holding the auth-hash has already skipped Argon2id) while creating a login-flood DoS in which every attempt pins 64 MiB. Peppering still defeats what peppering is for: with the pepper outside the database, a dumped table cannot be replayed against a live instance or checked offline against guesses.
+The server stores `HMAC-SHA-256(serverPepper, authHash)`, and the same construction over `recoveryAuthHash` when one is supplied, **not** a second slow KDF over either. The client has already paid the memory-hard cost; hashing again server-side would add no brute-force resistance (an attacker holding the auth-hash has already skipped Argon2id) while creating a login-flood DoS in which every attempt pins 64 MiB. Peppering still defeats what peppering is for: with the pepper outside the database, a dumped table cannot be replayed against a live instance or checked offline against guesses.
 
-**The `409` is a genuine account-enumeration oracle — the only one in this protocol — and it is accepted rather than removed.** The usual fix (always `202`, move the truth into an email) requires guaranteed mail delivery, and this service's default configuration has none: with `REQUIRE_EMAIL_VERIFICATION` off and the console mail transport, a duplicate signup answered with `202` would tell the user their account was created when it was not, with no email arriving to correct it. The oracle-free variant is therefore unavailable in the configuration most self-hosters run, not merely inconvenient.
+**The `409` is a genuine account-enumeration oracle, the only one in this protocol, and it is accepted rather than removed.** The usual fix (always `202`, and move the truth into a message) needs a channel to send that message on. This service has none: it stores no address and has no mailer (§5.12, §5.13). A duplicate signup answered with `202` would tell the user their account was created when it was not, and nothing would ever arrive to correct it. The oracle-free variant is not merely inconvenient here; it does not exist.
 
-It is bounded by the per-IP signup throttle, removed entirely by `SIGNUP_MODE=closed`, narrowed but NOT removed by `SIGNUP_MODE=invite`, and deliberately not repeated anywhere else: `kdf`, `login` and `request-reset` all stay indistinguishable. Full reasoning: [`SECURITY.md`](./SECURITY.md).
+**What it discloses is now strictly less.** It confirms that an opaque per-server handle is taken. It used to confirm that a named person's email address held an account, which is a value an attacker can also phish, correlate across services and sell. A handle is minted by the client, means nothing off this instance, and gives nobody a way to reach or identify its holder.
+
+It is bounded by the per-IP signup throttle, removed entirely by `SIGNUP_MODE=closed`, narrowed but NOT removed by `SIGNUP_MODE=invite`, and deliberately not repeated anywhere else: `kdf`, `login`, `recover` and `recover-rotate` all stay indistinguishable. Full reasoning: [`SECURITY.md`](./SECURITY.md).
 
 #### 5.8.1 Invites
 
@@ -438,19 +452,19 @@ On an instance running `SIGNUP_MODE=invite`, the signup body carries one extra f
 { "inviteToken": "<the token the operator gave you>" }
 ```
 
-An invite is a single-use, expiring capability. It is **not** addressed to an email address, so anyone holding it may use it, once. Unknown, malformed, missing, expired and already-redeemed tokens all produce the SAME `403` and the same message: telling them apart would let a caller probe which tokens exist, and would disclose that a token had once been real.
+An invite is a single-use, expiring capability. It is **not** bound to a handle or to any identity, so anyone holding it may use it, once. Unknown, malformed, missing, expired and already-redeemed tokens all produce the SAME `403` and the same message: telling them apart would let a caller probe which tokens exist, and would disclose that a token had once been real.
 
-A signup that fails for any other reason does **not** consume the invite. In particular a `409` (address already registered) leaves it spendable, so a typo does not cost somebody their invitation. The service enforces this with a conditional update inside a transaction, so concurrent redemptions of one invite still produce exactly one account.
+A signup that fails for any other reason does **not** consume the invite. In particular a `409` (handle already registered) leaves it spendable, so a typo does not cost somebody their invitation. The service enforces this with a conditional update inside a transaction, so concurrent redemptions of one invite still produce exactly one account.
 
 Instances advertise their mode on the `/health` handshake as `signupMode` (§5.6). Treat it as a hint for rendering the right form; the `403` remains the contract, because an operator can change the mode between the handshake and the submit.
 
 ### 5.9 `POST /v1/auth/login`
 
-Unauthenticated, throttled per IP **and** email.
+Unauthenticated, throttled per IP **and** handle. A `401` counts against that bucket and a success clears it, which slows a single-source brute force without letting anyone lock a victim out of their own account from another address.
 
-Request `{"email": "...", "authHash": "..."}` → `200` `{"account": {...}, "tokens": {...}}`.
+Request `{"handle": "...", "authHash": "..."}` → `200` `{"account": {...}, "tokens": {...}}`.
 
-`400` when `email` is not a plausible address or `authHash` is not 32 base64-decoded bytes — the request never reaches the credential check, so this status carries no information about whether the account exists. `401` for an unknown account and for a wrong auth-hash, with **identical** body text. `403` if verification is required and the address is unconfirmed. `429` when throttled.
+`400` when `handle` is not a plausible handle or `authHash` is not 32 base64-decoded bytes: the request never reaches the credential check, so this status carries no information about whether the account exists. `401` for an unknown account and for a wrong auth-hash, with **identical** body text and after **identical work**, because the verifier comparison runs on both branches against a full-width stand-in. `429` when throttled.
 
 ### 5.10 `POST /v1/auth/refresh`
 
@@ -460,21 +474,40 @@ Unauthenticated (the refresh token is the credential). Request `{"refreshToken":
 
 Bearer. `204`. Revokes the caller's token family — this device only.
 
-### 5.12 `POST /v1/auth/verify-email`
+### 5.12 `POST /v1/auth/verify-email` — removed in 0.5.0
 
-Unauthenticated. Request `{"token": "..."}` → `200` `{"verified": true}`. Single-use; an invalid, expired or already-redeemed token is `400`.
+Gone with the mailer. This service stores no address, so there is nothing to confirm.
 
-### 5.13 `POST /v1/auth/request-reset`
+The number is retired rather than reused, and §5.13 with it. `§5.n` references appear in source comments across both repos, and silently renumbering would turn every one of them into a lie.
 
-Unauthenticated, IP-throttled. Request `{"email": "..."}` → **always** `202`, whether or not the address has an account. The only channel that reveals anything is the email itself, and only to whoever controls the inbox.
+### 5.13 `POST /v1/auth/request-reset` — removed in 0.5.0
 
-### 5.14 `POST /v1/auth/reset` and `POST /v1/auth/change-passphrase`
+Gone with the mailer, and this is the removal worth explaining.
 
-The two credential-rotation endpoints. They take the same submission shape because they do the same thing; only the proof differs.
+It mailed a link whose holder could replace the account's verifier, KDF descriptor and key records. On a zero-knowledge service that is an account-**takeover** path that returns no recovery: the DEK is wrapped under a passphrase-KEK and a recovery-KEK the server never sees, so whoever redeemed the link got a login to a diary they still could not read, and could destroy the real owner's access on the way. Whoever controlled a mailbox controlled the accounts registered to it, and got nothing readable for it.
+
+Its replacement is the recovery code the user already holds (§5.14). Unlike a link, that code both authenticates **and** unwraps, because the user holds it and the server never has. Reasoning in full: [`docs/adr/0004-identity-without-email.md`](./docs/adr/0004-identity-without-email.md).
+
+The one enumeration weakness this document used to record went with the endpoint. `request-reset` was the path where timing was _not_ equalised, because a known address cost a token write and a mail send that an unknown address did not. No such path exists now.
+
+### 5.14 `POST /v1/auth/recover`, `POST /v1/auth/recover-rotate` and `POST /v1/auth/change-passphrase`
+
+The recovery-code authenticator, and the two credential rotations. `recover-rotate` and `change-passphrase` take the same submission shape because they do the same thing; only the proof differs.
+
+**`POST /v1/auth/recover`** — unauthenticated, throttled per IP **and** handle. Request `{"handle": "...", "recoveryAuthHash": "<base64, 32 bytes>"}` → `200` `{"account": {...}, "tokens": {...}}`.
+
+What comes back is an ordinary session, deliberately not a lesser one: the holder of the recovery code is the account owner by construction, and a restricted "recovery mode" token would add a second authorization surface carrying no property the code does not already carry.
 
 ```jsonc
-// POST /v1/auth/reset — unauthenticated, proof is the emailed token
-{ "token": "...", "authHash": "<new>", "kdfDescriptor": {...}, "keyRecords": [ ... ] }
+// POST /v1/auth/recover-rotate — unauthenticated, proof is the recovery code
+{
+  "handle": "...",
+  "recoveryAuthHash": "<the current recovery proof>",
+  "newAuthHash": "<new>",
+  "kdfDescriptor": {...},
+  "keyRecords": [ ... ],
+  "newRecoveryAuthHash": "<a new recovery proof>" | null  // optional: rotate the code too
+}
 
 // POST /v1/auth/change-passphrase — bearer, proof is the current passphrase
 { "currentAuthHash": "...", "newAuthHash": "...", "kdfDescriptor": {...}, "keyRecords": [ ... ] }
@@ -482,21 +515,32 @@ The two credential-rotation endpoints. They take the same submission shape becau
 
 `keyRecords` entries are `{"kind": "passphrase" | "recovery", "kdfDescriptor": {...} | null, "wrappedDek": "<base64>"}`, at most one per kind, obeying the same rules as §5.4 (a `recovery` record's descriptor must be `null`; a `passphrase` record's must not be).
 
-Both return `200` `{"tokens": {...}}` — a fresh pair for the caller.
+`change-passphrase` returns `200` `{"tokens": {...}}`. `recover-rotate` returns `200` `{"account": {...}, "tokens": {...}}`, because the caller arrived without a session and needs to know which account it just re-entered. Both hand back a fresh pair.
 
-**The whole submission is applied atomically.** New verifier, new account KDF descriptor, upserted key records, revocation of every outstanding session, and the caller's new pair either all commit or none do. This is not an implementation detail: a new verifier stored without the re-wrapped DEK produces an account that logs in fine and can never decrypt its own blob again, with nothing to tell the user until they try.
+**The whole submission is applied atomically.** New verifier, new account KDF descriptor, an optionally new recovery verifier, upserted key records, revocation of every outstanding session, and the caller's new pair either all commit or none do. This is not an implementation detail. Every half-state is a distinct disaster the user cannot see until they try to read their own diary: a verifier without its re-wrapped record logs in and decrypts nothing, a record without its verifier cannot log in at all, and a rotated recovery verifier without its record leaves a code that authenticates and then unwraps nothing.
 
 **`keyRecords` must be present**, even as `[]`. An absent key is a `400`, for the same reason `expectedUpdatedAt` is required in §5.4: silence must never be read as consent on a path that can strand data.
 
 Kinds _not_ submitted are left untouched. A passphrase change re-wraps the DEK under a new `KEK_p`; the `recovery` record still wraps the same, unchanged DEK and remains valid.
 
-**What reset can and cannot do.** It restores **login**. It cannot restore **data** — the server never held a key. A client that submits `keyRecords: []` gets a working account whose blob is permanently undecryptable. A conforming client must say so, in those terms, before the user commits to the flow.
+Four rules apply to `recover-rotate` alone:
+
+- **A `passphrase` key record is required**, and `[]` is a `400`. Unlike a passphrase change, this path necessarily changed `KEK_p`, so accepting a submission without the re-wrap would mint an account that logs in perfectly and decrypts nothing.
+- **Rotating the recovery code is all-or-nothing.** `newRecoveryAuthHash` and a `recovery` key record must arrive together or not at all; either alone is a `400`. Half of that pair leaves a code that authenticates and unwraps nothing, or one that unwraps and cannot log in.
+- **The write is a compare-and-swap on the recovery verifier the proof matched**, re-asserted inside the transaction. It is not the authentication, which already happened; it is what stops two concurrent recoveries from overwriting a credential the user has already been told is theirs.
+- **One failure, four causes.** An unknown handle, an account that never set a recovery code, a wrong code, and a rotation that lost that compare-and-swap race all answer `401` with identical text, after identical work. A race must not be distinguishable from a bad guess, and a missing second authenticator must not be distinguishable from a missing account.
+
+Both recovery endpoints share **one** throttle bucket per (IP, handle), and neither clears it on success. They authenticate the same secret, so a separate allowance for each would halve the cost of guessing it, and a legitimate recovery happens once, so no honest client needs its allowance back.
+
+**What a rotation can and cannot do.** It restores **login**. It cannot restore **data**, because the server never held a key. A `change-passphrase` submitting `keyRecords: []` leaves a working account whose blob is permanently undecryptable, which is exactly why `recover-rotate` refuses that submission outright. A conforming client must say so, in those terms, before the user commits to the flow.
+
+**If the passphrase and the recovery code are both lost, the account cannot be recovered.** Not by an endpoint, not by the operator, not by a support path: the server holds no key material with which to do it, which is the same fact that stops it reading the diary. What remains is an account nobody can open, and the only useful operation on it is deletion. A conforming client says this before it shows a recovery code, not after.
 
 ### 5.15 `GET /v1/auth/account` and `POST /v1/auth/delete`
 
 Both bearer.
 
-`GET /v1/auth/account` → `200` `{"account": {"id": 1, "email": "...", "displayName": null, "emailVerified": false}}`.
+`GET /v1/auth/account` → `200` `{"account": {"id": 1, "handle": "...", "displayName": null}}`.
 
 `POST /v1/auth/delete` takes `{"authHash": "..."}` and returns `204`. **Re-authentication is required even though the caller already holds a valid token**: a session left behind on a shared device must not be enough to destroy someone's data irreversibly.
 
@@ -531,7 +575,7 @@ pair, and that is what survives a DEK rotation.
 
 - **The grantee surface has no write verbs against the grantor**, and serves only
   the caller's own share row, the grantor's current blob, and `grantorAccountId`.
-  Never the grantor's key records, KDF descriptor, verifier, email or display
+  Never the grantor's key records, KDF descriptor, verifier, handle or display
   name. A grantee who could pull the grantor's `recovery` wrapped DEK would be
   one brute-forced recovery code away from rotation authority over that account.
 - **Only the current blob.** The retained version ring is an owner-recovery
@@ -696,7 +740,9 @@ The reference implementation is `checkProtocolCompatibility()` in both `protocol
 
 The two version numbers are independent on purpose: re-framing the crypto and re-shaping the HTTP API are different kinds of change with different blast radii.
 
-**Pre-1.0 latitude.** Until the first public release, `PROTOCOL_VERSION` stays `1` through breaking changes. Two have already been taken under it: the move from cookie to bearer authentication, and the move of the sync routes from `/api/sync` to `/v1/sync`. There are zero production blobs and no third-party implementations, so there is nothing to break. This paragraph is deleted at public release, and from then on the rules above are followed literally.
+**Pre-1.0 latitude.** Until the first public release, `PROTOCOL_VERSION` stays `1` through breaking changes. Three have now been taken under it: the move from cookie to bearer authentication, the move of the sync routes from `/api/sync` to `/v1/sync`, and 0.5.0's removal of email. There are zero production blobs and no third-party implementations, so there is nothing to break. This paragraph is deleted at public release, and from then on the rules above are followed literally.
+
+**0.5.0 is a breaking change to the auth contract**, and by the rules above it would bump `PROTOCOL_VERSION` on a released protocol. The auth field is `handle`, not `email`; `verify-email` and `request-reset` are gone (§5.12, §5.13); `recover` and `recover-rotate` are new (§5.14). It is taken under the latitude above, which means the §6 handshake does **not** catch it: a client older than 0.5.0 posting `email` gets a `400` it cannot repair, and the version numbers still match. That is acceptable exactly once, on a service with one test account that is deleted rather than migrated, and it is recorded here so nobody reads §6 as covering it. Reasoning: [`docs/adr/0004-identity-without-email.md`](./docs/adr/0004-identity-without-email.md).
 
 ## 8. Size limits and the capacity plan
 
@@ -727,7 +773,7 @@ Being honest about the metadata, because "end-to-end encrypted" is often heard a
 - **Version numbers**: `blobVersion`, `envelopeVersion`, and the number of retained versions.
 - **KDF parameters and salt** for the passphrase record. These are not secrets; they exist to be served to a new device before login.
 - **Whether an account has completed setup** (has key records) and whether it has ever synced (has a blob).
-- **The account itself**: an email address, an optional display name, an authentication verifier (a keyed hash of a keyed hash of the passphrase — see §5.8), the account's KDF parameters, and whether the address has been confirmed.
+- **The account itself**: a **handle**, an optional display name, an authentication verifier (a keyed hash of a keyed hash of the passphrase, see §5.8), a second verifier of the same construction over the recovery proof when the account has set one, and the account's KDF parameters. A handle is an opaque per-server identifier that the user chose or their client generated: it may not contain an `@`, it means nothing on any other instance, and this service cannot resolve it to a person. Since 0.5.0 it is the only field naming an account holder, and it names them to nobody. **No mailbox, no address, and no field that identifies a holder in the world outside this instance is stored.**
 - **Session metadata**: how many active sessions exist, when each was created, and when tokens were last rotated or revoked. Token values themselves are stored only as digests.
 - **The study graph**, on a deployment with `SYNC_RESEARCH` set (§5.18): which
   account contributes to which study, when, how often, and how large each
@@ -757,10 +803,11 @@ A conforming **sync** server needs, in full:
 
 Additionally, a server that also implements the **account** endpoints of §5.7–§5.15 must:
 
-6. Serve a stable, real-shaped KDF descriptor for unknown emails (§5.7), doing identical work on both branches, and rate-limit the endpoint by source address. A `404`, a lazily-derived dummy, or an unthrottled endpoint each re-opens — by response, by timing, or by volume — the enumeration oracle the rest of the design closes.
-7. Store the verifier as a keyed hash of the submitted `authHash` under a secret held outside the database — never the `authHash` itself, and never in plaintext.
+6. Serve a stable, real-shaped KDF descriptor for unknown handles (§5.7), doing identical work on both branches, and rate-limit the endpoint by source address. A `404`, a lazily-derived dummy, or an unthrottled endpoint each re-opens the enumeration oracle the rest of the design closes, by response, by timing, or by volume.
+7. Store both verifiers as keyed hashes of the submitted `authHash` and `recoveryAuthHash` under a secret held outside the database. Never the submitted value itself, and never in plaintext.
 8. Apply §5.14's rotation submissions atomically, and revoke every outstanding session on each of the triggers in §4.2.
-9. Cascade account deletion to blobs and key records.
+9. Reject any handle containing `@` (§5.8), and throttle `recover` and `recover-rotate` on one shared bucket per (IP, handle). A server that accepts addresses as handles is not implementing this protocol; it is re-introducing the field 0.5.0 removed.
+10. Cascade account deletion to blobs and key records.
 
 A conforming server needs **none** of: the crypto in §3, JSON parsing of any payload, or knowledge of what a food log is.
 
@@ -771,7 +818,9 @@ Beyond §3 and the 409 loop of §5.1:
 - Perform the §6 handshake before the first sync and refuse on mismatch.
 - Never persist the passphrase, either KEK, or the DEK to any durable storage. Derive on unlock, hold in memory, discard.
 - Run Argon2id off the main thread. At 64 MiB it visibly freezes low-end phones.
-- Show the recovery code exactly once, at setup, behind an explicit "I have saved this" acknowledgment. It is the only data-preserving recovery path that exists; an email-based reset can restore _login_, never data.
+- Show the handle and the recovery code together, once, at setup, as one saved account card behind an explicit "I have saved this" acknowledgment. A handle is not memorable the way an address was, and the code is the only recovery path that exists at all: there is no mailed reset, and nothing the operator can do (§5.14).
+- Derive the recovery proof under `openplate-sync:recovery-auth:v1` and **never** send `KEK_r`. The two are siblings over the same code, and sending the KEK branch would hand the server an HMAC of the value that opens the diary (§3.1).
+- Say, before the user commits, that losing the passphrase _and_ the recovery code ends the account. Say it in those words. Any softer phrasing promises a recovery that cannot exist.
 - Treat `404` from `GET /blob` as "new account", not as an error.
 - Send `authHash` — the `auth` HKDF branch of §3.1 — and never the passphrase, the Argon2id output, or `KEK_p`. Deriving the wrong branch is silent: it authenticates fine and produces a key that decrypts nothing.
 - Fetch the KDF descriptor (§5.7) before deriving anything on a new device. Do not assume the defaults; an account created under raised parameters will not derive correctly from them.
