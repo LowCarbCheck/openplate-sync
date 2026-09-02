@@ -40,6 +40,7 @@ test('DELETE /v1/admin/accounts/:id calls the shared store method with that id',
     handle: 'to-be-erased',
     displayName: null,
     verifier: 'verifier-value-never-in-a-response',
+    recoveryVerifier: null,
     kdfDescriptor: { salt: 'AAAA', params: { memorySizeKib: 65536, iterations: 3, parallelism: 1 } },
   });
   assert.ok(created.ok, 'fixture account must be created');

@@ -57,6 +57,13 @@
       "when": 1788343430804,
       "tag": "0007_faulty_tigra",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788344403049,
+      "tag": "0008_overjoyed_eddie_brock",
+      "breakpoints": true
     }
   ]
 }

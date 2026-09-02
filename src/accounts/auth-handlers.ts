@@ -36,6 +36,7 @@ import {
   parseHandle,
   parseKdfDescriptorField,
   parseKeyRecordSubmissions,
+  parseOptionalRecoveryAuthHash,
   parseTokenField,
 } from './auth-input.js';
 import type { JsonObject, JsonValue } from '../lib/json.js';
@@ -98,6 +99,14 @@ const ABSENT_ACCOUNT_VERIFIER = '0'.repeat(64);
 
 /** A single generic message for every login failure — never "no such account" vs "wrong passphrase". */
 const LOGIN_REJECTED = 'invalid handle or passphrase';
+
+/**
+ * The ONE failure the recovery endpoints ever report. An unknown handle, an
+ * account that never set a recovery code, a wrong code, and a rotation that
+ * lost a race all come back as this exact string with this exact status —
+ * see `handleRecover` for why the list has to be that long.
+ */
+const RECOVERY_REJECTED = 'invalid handle or recovery code';
 
 function summarize(account: AccountRecord): AccountSummary {
   return {
@@ -258,11 +267,21 @@ export async function handleSignup(
   if (!kdfDescriptor.ok) return invalid(kdfDescriptor.reason);
   const displayName = parseDisplayName(fields.displayName);
   if (!displayName.ok) return invalid(displayName.reason);
+  // The second authenticator, set at signup or never. The client shows the
+  // handle and the recovery code together as one saved account card, so this
+  // is the moment the user is holding both; a device that skips it creates an
+  // account whose lost passphrase is terminal.
+  const recoveryAuthHash = parseOptionalRecoveryAuthHash(fields.recoveryAuthHash);
+  if (!recoveryAuthHash.ok) return invalid(recoveryAuthHash.reason);
 
   const accountInput = {
     handle: handle.value,
     displayName: displayName.value,
     verifier: computeVerifier({ authHash: authHash.value, pepper: ctx.pepper }),
+    recoveryVerifier:
+      recoveryAuthHash.value === null
+        ? null
+        : computeVerifier({ authHash: recoveryAuthHash.value, pepper: ctx.pepper }),
     kdfDescriptor: kdfDescriptor.value,
   };
 
@@ -513,6 +532,158 @@ export async function handleChangePassphrase(
 
   ctx.logger.info('Passphrase changed', { accountId: account.id });
   return { status: 'ok', body: { tokens: session.tokens } };
+}
+
+// ---------------------------------------------------------------------------
+// Recovery-code authentication (M181 spec 02)
+// ---------------------------------------------------------------------------
+
+/**
+ * Checks a recovery proof against an account, in constant time whatever the
+ * account's state.
+ *
+ * THREE DIFFERENT "NO" ANSWERS COLLAPSE INTO ONE `null`, and all three cost
+ * the same work: the handle is unknown, the account exists but never set a
+ * recovery code, or the code is wrong. Each is compared against a
+ * full-width stand-in, so the branch that returns is chosen after the HMAC
+ * rather than instead of it — the same shape `handleLogin` and
+ * `handleGetKdfDescriptor` use, and for the same reason (M128 security
+ * review: a response that says nothing can still be an oracle in its timing).
+ *
+ * The returned `recoveryVerifier` is what the store then compare-and-swaps
+ * on, so the value this function matched is the value the transaction
+ * requires to still be there.
+ */
+async function authenticateRecoveryCode(
+  input: { handle: string; recoveryAuthHash: string },
+  ctx: AuthContext,
+): Promise<{ account: AccountRecord; recoveryVerifier: string } | null> {
+  const account = await ctx.store.findAccountByHandle(input.handle);
+  const candidate = computeVerifier({ authHash: input.recoveryAuthHash, pepper: ctx.pepper });
+  const matches = verifierMatches({ candidate, stored: account?.recoveryVerifier ?? ABSENT_ACCOUNT_VERIFIER });
+
+  if (account === null || account.recoveryVerifier === null || !matches) return null;
+  return { account, recoveryVerifier: account.recoveryVerifier };
+}
+
+/**
+ * `POST /v1/auth/recover` — log in with the recovery code instead of the
+ * passphrase.
+ *
+ * The recovery code is the SECOND authenticator, and it is the only one left
+ * once a passphrase is lost. It replaced a mailed reset link, which on a
+ * zero-knowledge service was an account-TAKEOVER path that returned no
+ * recovery: the link holder got a login to a diary they still could not read,
+ * and could lock the real owner out on the way. The code, unlike the link, is
+ * held by the user and never by the server — so it both authenticates AND
+ * unwraps, which is the whole difference.
+ *
+ * What comes back is an ordinary session. It is deliberately NOT a
+ * lesser one: the holder of the recovery code is the account owner by
+ * construction, and a restricted "recovery mode" token would only add a
+ * second authorization surface with no property the code does not already
+ * carry.
+ *
+ * Throttled per IP and handle in `register-auth-routes.ts`. That throttle is
+ * not decoration: this endpoint accepts a guess at a value the user has
+ * written on paper.
+ */
+export async function handleRecover(
+  body: JsonValue | undefined,
+  ctx: AuthContext,
+): Promise<AuthOutcome<SessionResponse>> {
+  const fields = asFields(body);
+  const handle = parseHandle(fields.handle);
+  if (!handle.ok) return invalid(handle.reason);
+  const recoveryAuthHash = parseAuthHashField(fields.recoveryAuthHash, 'recoveryAuthHash');
+  if (!recoveryAuthHash.ok) return invalid(recoveryAuthHash.reason);
+
+  const proof = await authenticateRecoveryCode({ handle: handle.value, recoveryAuthHash: recoveryAuthHash.value }, ctx);
+  if (proof === null) return { status: 'unauthorized', reason: RECOVERY_REJECTED };
+
+  const session = mintSession(ctx, { accountId: proof.account.id, familyId: ctx.mintFamilyId() });
+  await ctx.store.insertTokens(session.rows);
+  ctx.logger.info('Account recovered with a recovery code', { accountId: proof.account.id });
+  return { status: 'ok', body: { account: summarize(proof.account), tokens: session.tokens } };
+}
+
+/**
+ * `POST /v1/auth/recover-rotate` — prove the recovery code, then set a new
+ * passphrase.
+ *
+ * THE PROOF TRAVELS IN THIS REQUEST rather than in a session token minted by
+ * `handleRecover`, so the code is checked in the same call that writes. A
+ * two-step flow would let a session outlive the moment the user held the
+ * card, and would make the store's compare-and-swap guard a check against
+ * something read minutes ago.
+ *
+ * A `passphrase` KEY RECORD IS REQUIRED, unlike `handleChangePassphrase`
+ * where an empty array is a legitimate "I am changing nothing". Here the
+ * passphrase-KEK necessarily changed, so the DEK MUST be re-wrapped under the
+ * new one. Accepting the rotation without it would mint an account that logs
+ * in perfectly and decrypts nothing, with no way for the user to notice until
+ * they open their diary — the brick `server/rotate-dek-handler.ts` refuses to
+ * build, refused here too.
+ *
+ * ROTATING THE RECOVERY CODE IS ALL-OR-NOTHING for the same reason: a new
+ * recovery verifier without a re-wrapped `recovery` record leaves a code that
+ * authenticates and then unwraps nothing, and a re-wrapped `recovery` record
+ * without the new verifier leaves a code that unwraps and can no longer log
+ * in. Both halves, or neither.
+ */
+export async function handleRecoverRotate(
+  body: JsonValue | undefined,
+  ctx: AuthContext,
+): Promise<AuthOutcome<SessionResponse>> {
+  const fields = asFields(body);
+  const handle = parseHandle(fields.handle);
+  if (!handle.ok) return invalid(handle.reason);
+  const recoveryAuthHash = parseAuthHashField(fields.recoveryAuthHash, 'recoveryAuthHash');
+  if (!recoveryAuthHash.ok) return invalid(recoveryAuthHash.reason);
+  const rotation = parseRotationFields(fields, 'newAuthHash');
+  if (!rotation.ok) return invalid(rotation.reason);
+  const newRecoveryAuthHash = parseOptionalRecoveryAuthHash(fields.newRecoveryAuthHash, 'newRecoveryAuthHash');
+  if (!newRecoveryAuthHash.ok) return invalid(newRecoveryAuthHash.reason);
+
+  const submittedKinds = new Set(rotation.value.keyRecords.map((record) => record.kind));
+  if (!submittedKinds.has('passphrase')) {
+    return invalid('a passphrase key record is required: the new passphrase-KEK must re-wrap the DEK');
+  }
+  if ((newRecoveryAuthHash.value !== null) !== submittedKinds.has('recovery')) {
+    return invalid('rotating the recovery code requires both newRecoveryAuthHash and a recovery key record');
+  }
+
+  const proof = await authenticateRecoveryCode({ handle: handle.value, recoveryAuthHash: recoveryAuthHash.value }, ctx);
+  if (proof === null) return { status: 'unauthorized', reason: RECOVERY_REJECTED };
+
+  const now = ctx.now();
+  const session = mintSession(ctx, { accountId: proof.account.id, familyId: ctx.mintFamilyId() });
+  // ONE call, because every piece below has to move together. The transaction
+  // is the store's — see `AccountStore.recoverAndRotatePassphrase` for what
+  // each half-state costs. No transaction appears in this file.
+  const rotated = await ctx.store.recoverAndRotatePassphrase({
+    accountId: proof.account.id,
+    expectedRecoveryVerifier: proof.recoveryVerifier,
+    verifier: computeVerifier({ authHash: rotation.value.authHash, pepper: ctx.pepper }),
+    kdfDescriptor: rotation.value.kdfDescriptor,
+    newRecoveryVerifier:
+      newRecoveryAuthHash.value === null
+        ? null
+        : computeVerifier({ authHash: newRecoveryAuthHash.value, pepper: ctx.pepper }),
+    keyRecords: rotation.value.keyRecords,
+    issue: session.rows,
+    revokedAt: now,
+  });
+
+  if (!rotated.ok) {
+    // A lost race reports the SAME failure a wrong code does. It is a rare
+    // outcome, and letting it be distinguishable would hand an attacker a
+    // signal that a concurrent recovery just succeeded.
+    return { status: 'unauthorized', reason: RECOVERY_REJECTED };
+  }
+
+  ctx.logger.info('Passphrase reset with a recovery code', { accountId: proof.account.id });
+  return { status: 'ok', body: { account: summarize(proof.account), tokens: session.tokens } };
 }
 
 // ---------------------------------------------------------------------------

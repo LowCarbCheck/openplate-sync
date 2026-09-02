@@ -22,7 +22,10 @@ import type {
   AccountStore,
   CreateAccountInput,
   CreateAccountResult,
+  KeyRecordSubmission,
   NewTokenInput,
+  RecoverAndRotatePassphraseInput,
+  RecoverAndRotatePassphraseResult,
   RedeemInviteAndCreateAccountInput,
   RedeemInviteResult,
   RotateCredentialInput,
@@ -48,6 +51,29 @@ class HandleTakenSignal extends Error {
   }
 }
 
+/**
+ * Refusal signal for `recoverAndRotatePassphrase`, never thrown out of this
+ * module. A `return` from a transaction callback COMMITS what has already
+ * been written — the exact half-application this method exists to prevent —
+ * so a refusal has to travel as a throw. Same discipline as
+ * `db/rotation-store.ts`'s `RotationRefused` and `HandleTakenSignal` above.
+ */
+class RecoveryRotationRefused extends Error {
+  readonly result: RecoverAndRotatePassphraseResult;
+
+  constructor(result: RecoverAndRotatePassphraseResult) {
+    super('recovery rotation refused');
+    this.name = 'RecoveryRotationRefused';
+    this.result = result;
+  }
+}
+
+/**
+ * A transaction handle, as drizzle hands one to a `db.transaction` callback.
+ * Named so the two shared write helpers below can only be given one.
+ */
+type Transaction = Parameters<Parameters<Database['transaction']>[0]>[0];
+
 type AccountRow = typeof accounts.$inferSelect;
 type TokenRow = typeof accountTokens.$inferSelect;
 
@@ -57,6 +83,7 @@ function mapAccountRow(row: AccountRow): AccountRecord {
     handle: row.handle,
     displayName: row.displayName,
     verifier: row.verifier,
+    recoveryVerifier: row.recoveryVerifier,
     kdfDescriptor: row.kdfDescriptor,
     createdAt: row.createdAt,
   };
@@ -84,6 +111,57 @@ function tokenValues(tokens: NewTokenInput[]): (typeof accountTokens.$inferInser
   }));
 }
 
+/**
+ * Upserts the submitted re-wrapped DEKs, one row per `kind`.
+ *
+ * Shared by both rotations so the two can never drift: `tx` is always a
+ * TRANSACTION handle, never the pool, because a key-record write that lands
+ * outside its rotation's transaction is exactly the half-state both callers
+ * exist to prevent.
+ *
+ * Kinds NOT submitted are left untouched on purpose. A passphrase change
+ * re-wraps only `passphrase`; the `recovery` record still wraps the SAME
+ * (unchanged) DEK and stays valid, so touching it would destroy a working
+ * recovery path for nothing.
+ */
+async function upsertKeyRecords(
+  tx: Transaction,
+  input: { accountId: number; keyRecords: KeyRecordSubmission[]; updatedAt: Date },
+): Promise<void> {
+  for (const record of input.keyRecords) {
+    await tx
+      .insert(syncKeyRecords)
+      .values({
+        accountId: input.accountId,
+        kind: record.kind,
+        kdfDescriptor: record.kdfDescriptor,
+        wrappedDek: Buffer.from(record.wrappedDek),
+      })
+      .onConflictDoUpdate({
+        target: [syncKeyRecords.accountId, syncKeyRecords.kind],
+        set: {
+          kdfDescriptor: record.kdfDescriptor,
+          wrappedDek: Buffer.from(record.wrappedDek),
+          updatedAt: input.updatedAt,
+        },
+      });
+  }
+}
+
+/** Revokes every live session for one account. Transaction-scoped, for the same reason {@link upsertKeyRecords} is. */
+async function revokeSessionsIn(tx: Transaction, input: { accountId: number; revokedAt: Date }): Promise<void> {
+  await tx
+    .update(accountTokens)
+    .set({ revokedAt: input.revokedAt })
+    .where(
+      and(
+        eq(accountTokens.accountId, input.accountId),
+        inArray(accountTokens.kind, [...SESSION_TOKEN_KINDS]),
+        isNull(accountTokens.revokedAt),
+      ),
+    );
+}
+
 export function createDrizzleAccountStore(db: Database): AccountStore {
   return {
     async findAccountByHandle(handle: string): Promise<AccountRecord | null> {
@@ -104,6 +182,7 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
             handle: input.handle,
             displayName: input.displayName,
             verifier: input.verifier,
+            recoveryVerifier: input.recoveryVerifier,
             kdfDescriptor: input.kdfDescriptor,
           })
           .returning();
@@ -168,6 +247,7 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
                 handle: input.account.handle,
                 displayName: input.account.displayName,
                 verifier: input.account.verifier,
+                recoveryVerifier: input.account.recoveryVerifier,
                 kdfDescriptor: input.account.kdfDescriptor,
               })
               .returning();
@@ -252,46 +332,76 @@ export function createDrizzleAccountStore(db: Database): AccountStore {
           .set({ verifier: input.verifier, kdfDescriptor: input.kdfDescriptor })
           .where(eq(accounts.id, input.accountId));
 
-        // Upsert only the submitted kinds. A passphrase change re-wraps the
-        // DEK under a new passphrase-KEK; the recovery record still wraps the
-        // SAME (unchanged) DEK and stays valid, so touching it would destroy a
-        // working recovery path for nothing.
-        for (const record of input.keyRecords) {
-          await tx
-            .insert(syncKeyRecords)
-            .values({
-              accountId: input.accountId,
-              kind: record.kind,
-              kdfDescriptor: record.kdfDescriptor,
-              wrappedDek: Buffer.from(record.wrappedDek),
-            })
-            .onConflictDoUpdate({
-              target: [syncKeyRecords.accountId, syncKeyRecords.kind],
-              set: {
-                kdfDescriptor: record.kdfDescriptor,
-                wrappedDek: Buffer.from(record.wrappedDek),
-                updatedAt: input.revokedAt,
-              },
-            });
-        }
+        await upsertKeyRecords(tx, {
+          accountId: input.accountId,
+          keyRecords: input.keyRecords,
+          updatedAt: input.revokedAt,
+        });
 
         // Every other device is logged out. A user changing their passphrase
         // under suspicion expects exactly this.
-        await tx
-          .update(accountTokens)
-          .set({ revokedAt: input.revokedAt })
-          .where(
-            and(
-              eq(accountTokens.accountId, input.accountId),
-              inArray(accountTokens.kind, [...SESSION_TOKEN_KINDS]),
-              isNull(accountTokens.revokedAt),
-            ),
-          );
+        await revokeSessionsIn(tx, { accountId: input.accountId, revokedAt: input.revokedAt });
 
         if (input.issue.length > 0) {
           await tx.insert(accountTokens).values(tokenValues(input.issue));
         }
       });
+    },
+
+    async recoverAndRotatePassphrase(
+      input: RecoverAndRotatePassphraseInput,
+    ): Promise<RecoverAndRotatePassphraseResult> {
+      // ONE transaction, and the four writes below are the whole reason this
+      // method exists rather than a handler calling the store four times. See
+      // `AccountStore.recoverAndRotatePassphrase` for what each half-state
+      // costs the user; none of them is recoverable and none is visible until
+      // they try to read their own diary.
+      try {
+        return await db.transaction(async (tx): Promise<RecoverAndRotatePassphraseResult> => {
+          // (1) and (2): the passphrase verifier and, when the user is also
+          // replacing their code, the recovery verifier — in one UPDATE, guarded
+          // by the recovery verifier the handler matched. Zero rows means
+          // another rotation committed in between, so this one is operating on a
+          // credential that no longer exists and must not proceed.
+          const [updated] = await tx
+            .update(accounts)
+            .set({
+              verifier: input.verifier,
+              kdfDescriptor: input.kdfDescriptor,
+              // `undefined` omits the column from the SET list, which is how a
+              // rotation that keeps the existing code leaves it alone. `null`
+              // would CLEAR it and silently destroy the second authenticator.
+              recoveryVerifier: input.newRecoveryVerifier ?? undefined,
+            })
+            .where(and(eq(accounts.id, input.accountId), eq(accounts.recoveryVerifier, input.expectedRecoveryVerifier)))
+            .returning({ id: accounts.id });
+
+          if (!updated) throw new RecoveryRotationRefused({ ok: false, reason: 'recovery-superseded' });
+
+          // (3) and (4): the re-wrapped `passphrase` record, and the `recovery`
+          // record when the code itself moved. Same statement as an ordinary
+          // change-passphrase, inside this transaction.
+          await upsertKeyRecords(tx, {
+            accountId: input.accountId,
+            keyRecords: input.keyRecords,
+            updatedAt: input.revokedAt,
+          });
+
+          // A recovery is a stronger event than a passphrase change: whoever
+          // held the old passphrase is, by construction, not the person doing
+          // this. Every outstanding session goes.
+          await revokeSessionsIn(tx, { accountId: input.accountId, revokedAt: input.revokedAt });
+
+          if (input.issue.length > 0) {
+            await tx.insert(accountTokens).values(tokenValues(input.issue));
+          }
+
+          return { ok: true };
+        });
+      } catch (error) {
+        if (error instanceof RecoveryRotationRefused) return error.result;
+        throw error;
+      }
     },
 
     async purgeExpiredTokens(input: { before: Date }): Promise<number> {

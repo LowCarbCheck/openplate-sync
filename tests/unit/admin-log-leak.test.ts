@@ -33,6 +33,7 @@ before(async () => {
     handle: SEEDED_HANDLE,
     displayName: null,
     verifier: 'verifier-value-never-in-a-log-line',
+    recoveryVerifier: null,
     kdfDescriptor: { salt: 'AAAA', params: { memorySizeKib: 65536, iterations: 3, parallelism: 1 } },
   });
   assert.ok(created.ok, 'fixture account must be created');

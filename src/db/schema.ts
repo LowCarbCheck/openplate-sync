@@ -85,6 +85,28 @@ export const accounts = pgTable(
      */
     verifier: text('verifier').notNull(),
     /**
+     * The SECOND authenticator (M181 spec 02): `HMAC-SHA-256(serverPepper,
+     * clientRecoveryAuthHash)`, hex, computed by the very same
+     * `lib/verifier.ts` `computeVerifier` as the column above. Never the raw
+     * hash, and never anything that opens a blob.
+     *
+     * THE CLIENT DERIVES ITS INPUT UNDER A LABEL THAT IS NOT THE RECOVERY-KEK
+     * LABEL, and that separation is the whole security argument for this
+     * column. `openplate-sync:recovery-auth:v1` is a sibling of
+     * `openplate-sync:recovery-kek:v1`: both are HKDF branches over the raw
+     * recovery code, and the KEK branch is what WRAPS the account's DEK. Were
+     * the same output used for both, this service would be storing an HMAC of
+     * the material that opens the diary, and "the operator cannot read your
+     * data" would rest on SHA-256 being one-way rather than on the operator
+     * never having held the value at all. Domain separation is what keeps the
+     * claim structural.
+     *
+     * NULLABLE, because an account may be created without one. A `NULL` here
+     * means the account has no second authenticator: a lost passphrase is then
+     * terminal, which is stated plainly rather than papered over.
+     */
+    recoveryVerifier: text('recovery_verifier'),
+    /**
      * Argon2id salt + cost parameters, served UNAUTHENTICATED to a new device
      * before login (PROTOCOL.md §5.7). Non-secret by construction — a salt
      * that has to be handed out cannot be a secret, and cost parameters are

@@ -8,6 +8,8 @@
  *  - refresh rotates, and REUSING a rotated refresh token kills the family
  *  - both credential-rotation paths revoke every outstanding session
  *  - deletion requires re-authentication and takes the sync data with it
+ *  - the recovery code authenticates, and an unknown handle, an account with
+ *    no recovery code and a wrong code are one indistinguishable failure
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,6 +19,8 @@ import {
   handleGetKdfDescriptor,
   handleLogin,
   handleLogout,
+  handleRecover,
+  handleRecoverRotate,
   handleRefresh,
   handleSignup,
   resolveAccessToken,
@@ -36,6 +40,8 @@ import {
 const HANDLE = 'bright-otter-42';
 const AUTH_HASH = sampleAuthHash(11);
 const OTHER_AUTH_HASH = sampleAuthHash(22);
+const RECOVERY_AUTH_HASH = sampleAuthHash(33);
+const NEW_RECOVERY_AUTH_HASH = sampleAuthHash(44);
 
 function signupBody(overrides: JsonObject = {}) {
   return {
@@ -43,6 +49,19 @@ function signupBody(overrides: JsonObject = {}) {
     authHash: AUTH_HASH,
     kdfDescriptor: sampleKdfDescriptor(),
     displayName: 'A Person',
+    recoveryAuthHash: RECOVERY_AUTH_HASH,
+    ...overrides,
+  };
+}
+
+/** The body `POST /v1/auth/recover-rotate` takes, minus whatever a test is testing the absence of. */
+function recoverRotateBody(overrides: JsonObject = {}) {
+  return {
+    handle: HANDLE,
+    recoveryAuthHash: RECOVERY_AUTH_HASH,
+    newAuthHash: OTHER_AUTH_HASH,
+    kdfDescriptor: sampleKdfDescriptor(2),
+    keyRecords: [{ kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: sampleWrappedDek(21) }],
     ...overrides,
   };
 }
@@ -487,4 +506,154 @@ test('deletion removes the account and its sync data', async () => {
   assert.equal(fixture.store.hasAccount(session.accountId), false);
   assert.equal(fixture.store.keyRecordsFor(session.accountId).size, 0);
   assert.equal(await resolveAccessToken(tokens.accessToken, fixture.ctx), null);
+});
+
+// ── Recovery-code authentication (M181 spec 02) ────────────────────────────
+
+test('the recovery code logs an account in without the passphrase', async () => {
+  const fixture = createAuthFixture();
+  await signUp(fixture);
+
+  const outcome = await handleRecover({ handle: HANDLE, recoveryAuthHash: RECOVERY_AUTH_HASH }, fixture.ctx);
+  assert.equal(outcome.status, 'ok');
+  if (outcome.status !== 'ok') throw new Error('unreachable');
+  assert.equal(outcome.body.account.handle, HANDLE);
+
+  const session = await resolveAccessToken(outcome.body.tokens.accessToken, fixture.ctx);
+  assert.ok(session, 'a recovery must hand back a usable session');
+});
+
+test('the recovery code is not the passphrase, and neither stands in for the other', async () => {
+  const fixture = createAuthFixture();
+  await signUp(fixture);
+
+  // The passphrase auth-hash presented as a recovery proof, and vice versa.
+  assert.equal(
+    (await handleRecover({ handle: HANDLE, recoveryAuthHash: AUTH_HASH }, fixture.ctx)).status,
+    'unauthorized',
+  );
+  assert.equal(
+    (await handleLogin({ handle: HANDLE, authHash: RECOVERY_AUTH_HASH }, fixture.ctx)).status,
+    'unauthorized',
+  );
+});
+
+test('an unknown handle, an account with no recovery code and a wrong code are ONE failure', async () => {
+  const fixture = createAuthFixture();
+  await signUp(fixture);
+  // A second account created WITHOUT a recovery code — the third of the three
+  // cases that must not be distinguishable.
+  const withoutCode = await handleSignup(signupBody({ handle: 'no-code-here', recoveryAuthHash: null }), fixture.ctx);
+  assert.equal(withoutCode.status, 'created');
+
+  const outcomes = await Promise.all([
+    handleRecover({ handle: 'nobody-at-all', recoveryAuthHash: RECOVERY_AUTH_HASH }, fixture.ctx),
+    handleRecover({ handle: 'no-code-here', recoveryAuthHash: RECOVERY_AUTH_HASH }, fixture.ctx),
+    handleRecover({ handle: HANDLE, recoveryAuthHash: OTHER_AUTH_HASH }, fixture.ctx),
+  ]);
+
+  const answers = new Set(outcomes.map((outcome) => JSON.stringify(outcome)));
+  assert.equal(answers.size, 1, `every recovery failure must read identically, got ${[...answers].join(' | ')}`);
+});
+
+test('recover-rotate sets a new passphrase, re-wraps the DEK and logs every device out', async () => {
+  const fixture = createAuthFixture();
+  const original = requireTokens(await signUp(fixture));
+
+  const outcome = await handleRecoverRotate(recoverRotateBody(), fixture.ctx);
+  assert.equal(outcome.status, 'ok');
+  if (outcome.status !== 'ok') throw new Error('unreachable');
+
+  // The point of the whole flow: the new passphrase works and the old is dead.
+  assert.equal((await handleLogin({ handle: HANDLE, authHash: OTHER_AUTH_HASH }, fixture.ctx)).status, 'ok');
+  assert.equal((await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx)).status, 'unauthorized');
+
+  // The re-wrapped DEK landed, so the new passphrase can actually decrypt.
+  const records = fixture.store.keyRecordsFor(outcome.body.account.id);
+  assert.equal(
+    Buffer.from(records.get('passphrase')?.wrappedDek ?? new Uint8Array()).toString('base64'),
+    sampleWrappedDek(21),
+  );
+
+  // Every session that existed before the reset is gone.
+  assert.equal(await resolveAccessToken(original.accessToken, fixture.ctx), null);
+  assert.ok(await resolveAccessToken(outcome.body.tokens.accessToken, fixture.ctx));
+});
+
+test('recover-rotate refuses without a passphrase key record, rather than minting an account that decrypts nothing', async () => {
+  const fixture = createAuthFixture();
+  await signUp(fixture);
+
+  const outcome = await handleRecoverRotate(recoverRotateBody({ keyRecords: [] }), fixture.ctx);
+  assert.equal(outcome.status, 'invalid');
+  // And nothing moved: the old passphrase still works.
+  assert.equal((await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx)).status, 'ok');
+});
+
+test('rotating the recovery code needs BOTH its verifier and its key record, in either direction', async () => {
+  const fixture = createAuthFixture();
+  await signUp(fixture);
+
+  const verifierOnly = await handleRecoverRotate(
+    recoverRotateBody({ newRecoveryAuthHash: NEW_RECOVERY_AUTH_HASH }),
+    fixture.ctx,
+  );
+  assert.equal(verifierOnly.status, 'invalid');
+
+  const recordOnly = await handleRecoverRotate(
+    recoverRotateBody({
+      keyRecords: [
+        { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: sampleWrappedDek(21) },
+        { kind: 'recovery', kdfDescriptor: null, wrappedDek: sampleWrappedDek(31) },
+      ],
+    }),
+    fixture.ctx,
+  );
+  assert.equal(recordOnly.status, 'invalid');
+});
+
+test('rotating the recovery code moves its verifier and its key record together', async () => {
+  const fixture = createAuthFixture();
+  const session = await signUp(fixture);
+
+  const outcome = await handleRecoverRotate(
+    recoverRotateBody({
+      newRecoveryAuthHash: NEW_RECOVERY_AUTH_HASH,
+      keyRecords: [
+        { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: sampleWrappedDek(21) },
+        { kind: 'recovery', kdfDescriptor: null, wrappedDek: sampleWrappedDek(31) },
+      ],
+    }),
+    fixture.ctx,
+  );
+  assert.equal(outcome.status, 'ok');
+
+  // The new code authenticates, the old one does not.
+  assert.equal(
+    (await handleRecover({ handle: HANDLE, recoveryAuthHash: NEW_RECOVERY_AUTH_HASH }, fixture.ctx)).status,
+    'ok',
+  );
+  assert.equal(
+    (await handleRecover({ handle: HANDLE, recoveryAuthHash: RECOVERY_AUTH_HASH }, fixture.ctx)).status,
+    'unauthorized',
+  );
+  // And the record the new code unwraps moved with it.
+  const records = fixture.store.keyRecordsFor(session.account.id);
+  assert.equal(
+    Buffer.from(records.get('recovery')?.wrappedDek ?? new Uint8Array()).toString('base64'),
+    sampleWrappedDek(31),
+  );
+});
+
+test('a wrong recovery code changes nothing, and reads the same as an unknown handle', async () => {
+  const fixture = createAuthFixture();
+  await signUp(fixture);
+
+  const wrongCode = await handleRecoverRotate(recoverRotateBody({ recoveryAuthHash: OTHER_AUTH_HASH }), fixture.ctx);
+  const unknownHandle = await handleRecoverRotate(recoverRotateBody({ handle: 'nobody-at-all' }), fixture.ctx);
+  assert.deepEqual(wrongCode, unknownHandle);
+  assert.equal(wrongCode.status, 'unauthorized');
+
+  // The old passphrase still works and no key record was written.
+  assert.equal((await handleLogin({ handle: HANDLE, authHash: AUTH_HASH }, fixture.ctx)).status, 'ok');
 });

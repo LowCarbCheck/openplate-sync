@@ -69,6 +69,29 @@ export function parseAuthHashField(value: JsonValue | undefined, field = 'authHa
   return { ok: true, value: encoded };
 }
 
+/**
+ * The recovery-code auth proof, or the absence of one.
+ *
+ * OPTIONAL AT SIGNUP AND WHEN ROTATING, REQUIRED WHEN RECOVERING. An account
+ * may exist with no second authenticator, and `null` is how a client says so
+ * — the alternative, inferring it from a missing key, would make a typo in
+ * the field name silently create an account that can never be recovered.
+ *
+ * Structurally identical to {@link parseAuthHashField}: the value is a 32-byte
+ * HKDF output, base64, kept as the ORIGINAL string because it is the HMAC
+ * input. What differs is only the client-side label it was derived under
+ * (`openplate-sync:recovery-auth:v1`), which this service never sees and
+ * cannot check — the separation is a client property, asserted by the frozen
+ * label test in the openplate repo.
+ */
+export function parseOptionalRecoveryAuthHash(
+  value: JsonValue | undefined,
+  field = 'recoveryAuthHash',
+): ParseResult<string | null> {
+  if (value === undefined || value === null) return { ok: true, value: null };
+  return parseAuthHashField(value, field);
+}
+
 export function parseKdfDescriptorField(value: JsonValue | undefined): ParseResult<KdfDescriptor> {
   const descriptor = parseKdfDescriptor(value);
   if (descriptor === null) return fail('kdfDescriptor must contain a 16-byte base64 salt and positive Argon2id params');

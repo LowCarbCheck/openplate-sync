@@ -9,6 +9,11 @@
  * that a rotation revoked every session AND upserted the key records AND
  * consumed the link token, without a database.
  *
+ * `recoverAndRotatePassphrase` is here for the same reason, and with the same
+ * limit: it reproduces the compare-and-swap RULE, not the atomicity. Proving
+ * that a failure part-way through leaves nothing behind needs a real
+ * transaction, and that test lives in `tests/integration/`.
+ *
  * It deliberately does NOT simulate a transaction rollback. Atomicity is a
  * property of Postgres, and the integration suite is where it is exercised.
  * `redeemInviteAndCreateAccount` therefore reproduces the RULES the real
@@ -23,6 +28,8 @@ import type {
   CreateAccountResult,
   KeyRecordSubmission,
   NewTokenInput,
+  RecoverAndRotatePassphraseInput,
+  RecoverAndRotatePassphraseResult,
   RedeemInviteAndCreateAccountInput,
   RedeemInviteResult,
   RotateCredentialInput,
@@ -99,6 +106,7 @@ export function createFakeAccountStore(): FakeAccountStore {
         handle: input.handle,
         displayName: input.displayName,
         verifier: input.verifier,
+        recoveryVerifier: input.recoveryVerifier,
         kdfDescriptor: input.kdfDescriptor,
         createdAt: new Date(),
       };
@@ -203,6 +211,40 @@ export function createFakeAccountStore(): FakeAccountStore {
           tokenHash: token.tokenHash,
         });
       }
+    },
+
+    async recoverAndRotatePassphrase(
+      input: RecoverAndRotatePassphraseInput,
+    ): Promise<RecoverAndRotatePassphraseResult> {
+      const account = accountsById.get(input.accountId);
+      // The compare-and-swap the real store performs inside its transaction,
+      // reproduced as a RULE rather than as a rollback (see the header): a
+      // rotation whose expected recovery verifier no longer matches applies
+      // nothing at all.
+      if (!account || account.recoveryVerifier !== input.expectedRecoveryVerifier) {
+        return { ok: false, reason: 'recovery-superseded' };
+      }
+
+      account.verifier = input.verifier;
+      account.kdfDescriptor = input.kdfDescriptor;
+      if (input.newRecoveryVerifier !== null) account.recoveryVerifier = input.newRecoveryVerifier;
+      upsertKeyRecords(input.accountId, input.keyRecords);
+      revokeMatching(
+        (token) => token.accountId === input.accountId && SESSION_TOKEN_KINDS.includes(token.kind),
+        input.revokedAt,
+      );
+      for (const token of input.issue) {
+        tokens.push({
+          id: nextTokenId++,
+          accountId: token.accountId,
+          kind: token.kind,
+          familyId: token.familyId,
+          expiresAt: token.expiresAt,
+          revokedAt: null,
+          tokenHash: token.tokenHash,
+        });
+      }
+      return { ok: true };
     },
 
     async purgeExpiredTokens(input: { before: Date }): Promise<number> {

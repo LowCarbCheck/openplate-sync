@@ -12,6 +12,12 @@
  *  - **login** — keyed by IP **and** handle, cleared on success. Slows a
  *    single-source brute force without letting anyone lock a victim out of
  *    their own account from a different IP.
+ *  - **recover** and **recover-rotate** — keyed by IP **and** handle, exactly
+ *    like login and for the same reason, but they matter more: both accept a
+ *    guess at the ONE authenticator left to a user who has lost their
+ *    passphrase, and a success on either hands over the account. Neither is
+ *    cleared on success — a legitimate recovery happens once, so there is no
+ *    honest client that needs its allowance back.
  *  - **signup** and **kdf** — keyed by IP ALONE, and every attempt counts,
  *    successful or not. These are volume controls (account-farming, bulk
  *    handle probing), not credential guards, and keying them by the submitted
@@ -40,6 +46,8 @@ import {
   handleGetKdfDescriptor,
   handleLogin,
   handleLogout,
+  handleRecover,
+  handleRecoverRotate,
   handleRefresh,
   handleSignup,
 } from './auth-handlers.js';
@@ -164,6 +172,54 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
       } else if (outcome.status === 'ok') {
         throttle.clear(key);
       }
+      sendOutcome(res, outcome);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Both recovery routes share ONE throttle bucket per (IP, handle), on
+  // purpose: they authenticate the same secret, so letting an attacker spend a
+  // fresh allowance on each would halve the cost of guessing it.
+  const recoveryThrottleKey = (req: Request): string =>
+    throttleKey({
+      namespace: 'recover',
+      ip: clientIp(req),
+      identifier: asString(asFields(req.body).handle) ?? undefined,
+    });
+
+  router.post(`${AUTH_API_PREFIX}/recover`, async (req, res, next) => {
+    try {
+      const key = recoveryThrottleKey(req);
+      const decision = throttle.check(key);
+      if (decision.locked) {
+        sendThrottled(res, decision.retryAfterMs);
+        return;
+      }
+
+      const outcome = await handleRecover(req.body, ctx);
+      // Counts every attempt, successful or not, and is never cleared. A
+      // recovery is a once-in-an-account's-life event; a caller making a
+      // second one within the window is far more likely to be guessing than
+      // to be the owner.
+      throttle.recordFailure(key);
+      sendOutcome(res, outcome);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post(`${AUTH_API_PREFIX}/recover-rotate`, async (req, res, next) => {
+    try {
+      const key = recoveryThrottleKey(req);
+      const decision = throttle.check(key);
+      if (decision.locked) {
+        sendThrottled(res, decision.retryAfterMs);
+        return;
+      }
+
+      const outcome = await handleRecoverRotate(req.body, ctx);
+      throttle.recordFailure(key);
       sendOutcome(res, outcome);
     } catch (error) {
       next(error);

@@ -24,6 +24,12 @@ export interface AccountRecord {
   handle: string;
   displayName: string | null;
   verifier: string;
+  /**
+   * The recovery-code verifier — `HMAC(pepper, recoveryAuthHash)`, or `null`
+   * for an account that has no second authenticator. See the schema column
+   * for why its HKDF label is not the recovery-KEK label.
+   */
+  recoveryVerifier: string | null;
   kdfDescriptor: KdfDescriptor;
   createdAt: Date;
 }
@@ -50,6 +56,8 @@ export interface CreateAccountInput {
   handle: string;
   displayName: string | null;
   verifier: string;
+  /** Optional at creation: an account may exist with no second authenticator (see {@link AccountRecord.recoveryVerifier}). */
+  recoveryVerifier: string | null;
   kdfDescriptor: KdfDescriptor;
 }
 
@@ -98,6 +106,49 @@ export interface RotateCredentialInput {
   revokedAt: Date;
 }
 
+/**
+ * A recovery-code rotation: the whole move a user makes when they have lost
+ * their passphrase and still hold their recovery code.
+ *
+ * `expectedRecoveryVerifier` makes the write a COMPARE-AND-SWAP rather than a
+ * blind update. The handler has already checked the proof, so this is not the
+ * authentication — it is the guard against two rotations racing. Without it,
+ * a second recovery that started before the first committed would overwrite a
+ * verifier the user has already been told is theirs, and would do it under a
+ * recovery code that is no longer current.
+ */
+export interface RecoverAndRotatePassphraseInput {
+  accountId: number;
+  /** The recovery verifier the handler matched against, re-asserted inside the transaction. */
+  expectedRecoveryVerifier: string;
+  /** The new passphrase verifier — `HMAC(pepper, newAuthHash)`. */
+  verifier: string;
+  kdfDescriptor: KdfDescriptor;
+  /**
+   * The new recovery verifier when the user is also replacing their recovery
+   * code, `null` to leave the existing one in place. A non-`null` value must
+   * arrive with a `recovery` key record; the handler refuses the pair
+   * half-supplied, because a rotated code whose record still wraps under the
+   * old one authenticates and then unwraps nothing.
+   */
+  newRecoveryVerifier: string | null;
+  /** Re-wrapped DEKs, upserted by `kind`, exactly as {@link RotateCredentialInput.keyRecords}. */
+  keyRecords: KeyRecordSubmission[];
+  /** Session tokens minted for the caller, inserted inside the same transaction. */
+  issue: NewTokenInput[];
+  /** Instant stamped on every revocation this rotation performs. */
+  revokedAt: Date;
+}
+
+/**
+ * `recovery-superseded` is the ONLY expected failure: the account's recovery
+ * verifier changed between the handler's check and the transaction, so this
+ * rotation is operating on a credential that no longer exists. The caller
+ * reports it as the same generic failure a wrong code gets — a race must not
+ * be distinguishable from a bad guess.
+ */
+export type RecoverAndRotatePassphraseResult = { ok: true } | { ok: false; reason: 'recovery-superseded' };
+
 export interface AccountStore {
   findAccountByHandle(handle: string): Promise<AccountRecord | null>;
   findAccountById(accountId: number): Promise<AccountRecord | null>;
@@ -128,6 +179,30 @@ export interface AccountStore {
    * again, and the user has no way to tell until they try.
    */
   rotateCredential(input: RotateCredentialInput): Promise<void>;
+
+  /**
+   * ATOMIC recovery-code rotation: the new passphrase verifier, the new KDF
+   * descriptor, an optionally-new recovery verifier, the re-wrapped key
+   * records, the revocation of every outstanding session and the caller's new
+   * session — in ONE transaction.
+   *
+   * EVERY HALF-STATE HERE IS A DISTINCT DISASTER, which is why this is one
+   * method rather than a handler calling four:
+   *
+   *  - verifier moved, `passphrase` key record not: the user logs in with the
+   *    new passphrase and decrypts nothing. That is the exact brick
+   *    `server/rotate-dek-handler.ts` already refuses to create.
+   *  - key record moved, verifier not: the user cannot log in at all, and the
+   *    old passphrase they no longer have is the only key to a DEK that has
+   *    just been re-wrapped away from it.
+   *  - recovery verifier moved, `recovery` key record not: the code that
+   *    authenticates no longer unwraps.
+   *
+   * None of these is a retryable hiccup and none of them is visible until the
+   * user tries. Postgres is where the guarantee lives; the integration suite
+   * injects a failure part-way through and asserts the account is untouched.
+   */
+  recoverAndRotatePassphrase(input: RecoverAndRotatePassphraseInput): Promise<RecoverAndRotatePassphraseResult>;
 
   /**
    * ATOMIC invited signup: consume one invite and create the account it paid
