@@ -68,10 +68,46 @@ export function hashToken(raw: string): string {
   return createHash('sha256').update(raw).digest('hex');
 }
 
-/** Mints a 256-bit random token and its digest. */
+/** Mints a 256-bit random token and its digest. Session tokens carry no prefix. */
 export function generateToken(): GeneratedToken {
   const raw = randomBytes(32).toString('base64url');
   return { raw, hash: hashToken(raw) };
+}
+
+/**
+ * The shape a SIGNUP INVITE carries, and nothing else does. Kept beside
+ * `generateToken` because the contrast is the point: session tokens stay bare.
+ */
+export const SIGNUP_INVITE_TOKEN_PREFIX = 'si_';
+
+/**
+ * Mints a signup invite: the same 256 bits, wearing its service's prefix.
+ *
+ * A signup invite is the one token of this service that is handed to a HUMAN,
+ * pasted into a chat, and put in a join link beside a token belonging to a
+ * DIFFERENT service (the gateway's `gi_`). The prefix makes the two
+ * distinguishable before either is posted anywhere: the client refuses to send
+ * the wrong one, and this server refuses to look one up.
+ *
+ * Session tokens deliberately keep their bare shape. They are never seen by a
+ * person, never travel beside another service's token, and prefixing them would
+ * only mark a credential in a log as worth stealing.
+ */
+export function generateSignupInviteToken(): GeneratedToken {
+  const raw = `${SIGNUP_INVITE_TOKEN_PREFIX}${randomBytes(32).toString('base64url')}`;
+  return { raw, hash: hashToken(raw) };
+}
+
+/**
+ * Whether a presented string could be a signup invite at all.
+ *
+ * A SHAPE GATE, not a check: it is run BEFORE any lookup and its rejection is
+ * the same generic `invite-invalid` a wrong, spent or expired token gets, so it
+ * adds no oracle. What it buys is that a gateway token posted here is refused
+ * without ever being hashed against this service's invite rows.
+ */
+export function isSignupInviteToken(raw: string): boolean {
+  return raw.startsWith(SIGNUP_INVITE_TOKEN_PREFIX);
 }
 
 /**

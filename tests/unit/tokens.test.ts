@@ -11,8 +11,11 @@ import {
   TOKEN_TTL_MS,
   classifyToken,
   computeExpiry,
+  SIGNUP_INVITE_TOKEN_PREFIX,
   generateFamilyId,
+  generateSignupInviteToken,
   generateToken,
+  isSignupInviteToken,
   hashToken,
   isTokenUsable,
   parseBearerHeader,
@@ -27,6 +30,27 @@ test('generateToken returns a raw token and its matching digest', () => {
   // why an unstretched SHA-256 is the right hash here.
   assert.notEqual(generateToken().raw, token.raw);
   assert.notEqual(generateFamilyId(), generateFamilyId());
+});
+
+test("a signup invite wears this service's prefix and a session token does not", () => {
+  const invite = generateSignupInviteToken();
+  assert.ok(invite.raw.startsWith(SIGNUP_INVITE_TOKEN_PREFIX));
+  assert.equal(invite.hash, hashToken(invite.raw));
+  // The prefix is part of the pre-image, so the digest of the prefixed string
+  // is what a lookup must match. Hashing the bare remainder would never find
+  // the row.
+  assert.notEqual(invite.hash, hashToken(invite.raw.slice(SIGNUP_INVITE_TOKEN_PREFIX.length)));
+  // A session token stays bare: it is never seen by a person and never travels
+  // beside another service's token.
+  assert.equal(generateToken().raw.startsWith(SIGNUP_INVITE_TOKEN_PREFIX), false);
+});
+
+test("the shape gate accepts this service's invites and refuses the gateway's", () => {
+  assert.equal(isSignupInviteToken(generateSignupInviteToken().raw), true);
+  // `gi_` is an openplate-gateway invite. It must never be looked up here.
+  assert.equal(isSignupInviteToken('gi_a-gateway-invite'), false);
+  assert.equal(isSignupInviteToken(generateToken().raw), false);
+  assert.equal(isSignupInviteToken(''), false);
 });
 
 test('an access token expires long before a refresh token', () => {

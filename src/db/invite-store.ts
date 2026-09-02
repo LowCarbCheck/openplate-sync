@@ -18,7 +18,7 @@
  */
 import { and, count, desc, eq, isNull } from 'drizzle-orm';
 import type { InviteStore, InviteSummary, MintInviteInput, MintedInvite } from '../admin/invite-store.js';
-import { generateToken } from '../lib/tokens.js';
+import { generateSignupInviteToken } from '../lib/tokens.js';
 import type { Database } from './client.js';
 import { signupInvites } from './schema.js';
 
@@ -35,9 +35,10 @@ const SUMMARY_COLUMNS = {
 export function createDrizzleInviteStore(db: Database): InviteStore {
   return {
     async mint(input: MintInviteInput): Promise<MintedInvite> {
-      // Same primitive the session and link tokens use: 256 bits of
-      // `randomBytes`, stored only as a SHA-256 digest.
-      const token = generateToken();
+      // Same primitive the session tokens use: 256 bits of `randomBytes`,
+      // stored only as a SHA-256 digest — plus the `si_` prefix that binds the
+      // token to THIS service (see `lib/tokens.ts`).
+      const token = generateSignupInviteToken();
       const [row] = await db
         .insert(signupInvites)
         .values({ tokenHash: token.hash, note: input.note, expiresAt: input.expiresAt })

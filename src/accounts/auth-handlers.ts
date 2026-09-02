@@ -27,7 +27,14 @@ import type {
 import type { KdfDescriptor } from '../lib/kdf-descriptor.js';
 import { deriveDummyKdfDescriptor } from '../lib/kdf-descriptor.js';
 import { computeVerifier, verifierMatches } from '../lib/verifier.js';
-import { classifyToken, computeExpiry, hashToken, TOKEN_TTL_MS, type GeneratedToken } from '../lib/tokens.js';
+import {
+  classifyToken,
+  computeExpiry,
+  isSignupInviteToken,
+  hashToken,
+  TOKEN_TTL_MS,
+  type GeneratedToken,
+} from '../lib/tokens.js';
 import type { Logger } from '../logger.js';
 import {
   asFields,
@@ -238,6 +245,12 @@ async function createAccountForMode(
   // `400`. A caller must not be able to learn what a well-formed invite looks
   // like by watching the status code change.
   if (!inviteToken.ok) return { ok: false, reason: 'invite-invalid' };
+  // THE SHAPE GATE, and it runs before the lookup: a token minted by the
+  // gateway (`gi_`) is refused here without ever being hashed against this
+  // service's invite rows. Its answer is the SAME `invite-invalid` a wrong,
+  // spent or expired token gets, so a caller cannot tell the two apart and the
+  // gate adds no oracle to a service that carefully has none.
+  if (!isSignupInviteToken(inviteToken.value)) return { ok: false, reason: 'invite-invalid' };
 
   return await ctx.store.redeemInviteAndCreateAccount({
     inviteTokenHash: hashToken(inviteToken.value),

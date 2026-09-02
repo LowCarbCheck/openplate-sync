@@ -454,6 +454,8 @@ On an instance running `SIGNUP_MODE=invite`, the signup body carries one extra f
 
 An invite is a single-use, expiring capability. It is **not** bound to a handle or to any identity, so anyone holding it may use it, once. Unknown, malformed, missing, expired and already-redeemed tokens all produce the SAME `403` and the same message: telling them apart would let a caller probe which tokens exist, and would disclose that a token had once been real.
 
+**An invite token begins with `si_`, and the service refuses anything that does not.** The prefix binds the token to this service. A person is handed an invite in a chat message, and in a join link it may sit beside an `openplate-gateway` invite, which begins with `gi_`; without the prefix the two are interchangeable strings and one can be posted to the wrong service. The check is a **shape gate before the lookup**: a token of the wrong shape is never hashed against the invite table, and it is refused with the same `403` and the same message as every other bad invite, so the gate adds no oracle. Session tokens carry no prefix and are unchanged.
+
 A signup that fails for any other reason does **not** consume the invite. In particular a `409` (handle already registered) leaves it spendable, so a typo does not cost somebody their invitation. The service enforces this with a conditional update inside a transaction, so concurrent redemptions of one invite still produce exactly one account.
 
 Instances advertise their mode on the `/health` handshake as `signupMode` (§5.6). Treat it as a hint for rendering the right form; the `403` remains the contract, because an operator can change the mode between the handshake and the submit.

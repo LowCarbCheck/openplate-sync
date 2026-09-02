@@ -192,7 +192,7 @@ test('signup is refused when the instance is closed', async () => {
 // Invite-only signup (M166)
 // ---------------------------------------------------------------------------
 
-const INVITE_TOKEN = 'invite-token-for-tests';
+const INVITE_TOKEN = 'si_invite-token-for-tests';
 
 /** A fixture in invite mode with one live invite already minted. */
 function inviteFixture(options: { expiresInMs?: number } = {}) {
@@ -224,10 +224,10 @@ test('a signup that hits a taken handle leaves the invite redeemable', async () 
   const fixture = inviteFixture();
   // Burn the handle first, using a SECOND invite, so the handle exists.
   fixture.store.seedInvite({
-    tokenHash: hashToken('first-invite'),
+    tokenHash: hashToken('si_first-invite'),
     expiresAt: new Date(fixture.now().getTime() + 60_000),
   });
-  const first = await handleSignup(signupBody({ inviteToken: 'first-invite' }), fixture.ctx);
+  const first = await handleSignup(signupBody({ inviteToken: 'si_first-invite' }), fixture.ctx);
   assert.equal(first.status, 'created');
 
   const duplicate = await handleSignup(signupBody({ inviteToken: INVITE_TOKEN }), fixture.ctx);
@@ -246,11 +246,13 @@ test('an expired invite is refused, and is refused as invalid rather than as exp
   assert.match(outcome.reason, /valid invite is required/i);
 });
 
-test('unknown, missing and expired invites are indistinguishable', async () => {
+test('unknown, missing, wrong-service and expired invites are indistinguishable', async () => {
   // A caller who can tell these apart can probe which tokens exist, and can
-  // learn that a token WAS real before it was spent.
+  // learn that a token WAS real before it was spent. `gi_…` is a GATEWAY
+  // invite: it is stopped by the shape gate before any lookup, and the whole
+  // point of this case is that the caller cannot tell that happened.
   const reasons = new Set<string>();
-  for (const inviteToken of [undefined, '', 'never-minted', 12345]) {
+  for (const inviteToken of [undefined, '', 'never-minted', 'gi_a-gateway-invite-posted-here', 12345]) {
     const fixture = inviteFixture({ expiresInMs: 1000 });
     fixture.advance(2000);
     const body = inviteToken === undefined ? signupBody() : signupBody({ inviteToken });
