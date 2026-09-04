@@ -66,3 +66,38 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+
+  # ── Tell the website ───────────────────────────────────────────────────────
+  # openplate.de quotes this repository's README table and `docs/*.md`, and it
+  # quotes them at the latest published release rather than at `main`, because
+  # the site documents what a reader can install. This dispatch is what makes
+  # that immediate instead of up to a day late; the site also syncs daily, so a
+  # missed dispatch heals itself.
+  #
+  # NO `needs:`. It runs beside the image build, not after it. The v0.10.0 and
+  # v0.10.1 tag runs of openplate both HUNG in "Build and push" (M192
+  # follow-up), and a dispatch waiting on that job would have been eaten by the
+  # hang. Nothing about re-quoting the docs depends on an image existing.
+  #
+  # IT CARRIES THE TAG FOR THE RECORD AND NOTHING ELSE READS IT. Which release
+  # the site documents is decided in one place, `highestTag` in the site's
+  # sync-docs.ts, which takes the highest vX.Y.Z tag. A tag passed as an
+  # instruction would be a second answer to that question.
+  #
+  # The credential is a fine-grained PAT and those expire inside a year; when it
+  # does, this 401s. Nothing depends on this job, so a marketing site not
+  # hearing about a release can never fail one.
+  dispatch-website:
+    runs-on: ubuntu-latest
+    # Tags only, and no prerelease: the site only ever quotes a released line.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+    steps:
+      - name: Ask openplate.de to re-quote the docs
+        env:
+          GH_TOKEN: ${{ secrets.OPENPLATE_WEBSITE_DISPATCH_TOKEN }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY_OWNER}/openplate-website/dispatches" \
+            -f event_type=openplate-released \
+            -f "client_payload[repo]=${GITHUB_REPOSITORY#*/}" \
+            -f "client_payload[tag]=$GITHUB_REF_NAME"

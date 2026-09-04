@@ -4,7 +4,7 @@
 # There is no cloud CI: pushes from the workstation are what trigger Argo's
 # build/deploy, so the tests belong in front of the push rather than after it.
 #
-# Runs: lint -> typecheck -> unit tests -> integration tests (needs Postgres) -> build.
+# Runs: docs manifest -> lint -> typecheck -> unit tests -> integration tests (needs Postgres) -> build.
 #
 # Escape hatches (use deliberately, they push untested code):
 #   SKIP_TESTS=1 git push        skip the whole gate
@@ -29,6 +29,15 @@ if [ "$has_content" = "0" ]; then
   echo "▶ pre-push: deletion-only push, no tests to run"
   exit 0
 fi
+
+# ── FIRST TIER: the documentation manifest ──────────────────────────────────
+# No network, no node, no install: POSIX shell over the README's `##
+# Documentation` table and the `docs/` directory. It is first because it is the
+# cheapest, and because openplate.de reads that table as its manifest — a broken
+# row here fails a workflow in another repository, hours later, with nobody
+# watching. M193 spec 05.
+echo "▶ pre-push: the README Documentation table against docs/"
+./scripts/check-docs-manifest.sh
 
 # TS commands need the ts-dev toolbox (the host lacks native build tools), but
 # must run bare when the hook itself is already executing inside a container.
