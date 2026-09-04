@@ -14,6 +14,21 @@ The account service for [openplate](https://github.com/LowCarbCheck/openplate). 
 
 ---
 
+## Documentation
+
+`docs/` holds only architecture decision records for now
+([`docs/adr/`](./docs/adr/)); this README's Self-hosting, The AI proxy, Backup and restore,
+and The admin API sections read like standalone guides and are candidates for splitting into
+`docs/` files later.
+
+### Reference
+
+| Guide | What it covers |
+| --- | --- |
+| [**Protocol**](./PROTOCOL.md) | The wire and key protocol, version 2 |
+
+---
+
 ## Self-hosting
 
 ```bash
