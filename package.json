@@ -1,6 +1,6 @@
 {
   "name": "openplate-sync",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "description": "Standalone account + E2EE blob-sync service for openplate — Bitwarden-model accounts over CAS blob push/pull and wrapped-DEK key records, on a versioned wire protocol (see PROTOCOL.md). Stores opaque ciphertext only; it cannot decrypt what it holds.",

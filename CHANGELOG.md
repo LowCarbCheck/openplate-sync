@@ -5,6 +5,12 @@ All notable changes to `openplate-sync` are recorded here. The format follows
 [semantic versioning](https://semver.org/spec/v2.0.0.html). Pre-1.0, a breaking
 change moves the minor.
 
+## [0.6.1] - 2026-09-05
+
+- The README now lists the published documentation (`PROTOCOL.md`) in a
+  Documentation table, so the project site at openplate.de can quote it.
+- A release now tells the site to re-quote the docs.
+
 ## [0.6.0] - 2026-09-04
 
 One server. This service is now the whole backend an openplate deployment
