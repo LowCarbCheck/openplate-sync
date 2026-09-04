@@ -15,10 +15,11 @@
 # quickstart above assumes. (The project name is pinned below, so that part
 # does not depend on where you run from.)
 #
-# There is nothing to configure for mail, because this service sends none. An
-# account is a handle plus a passphrase, and a lost passphrase is recovered
-# with the recovery code the client showed the user at signup. Setting any of
-# the removed mail variables is a boot failure, not a no-op. See .env.example.
+# An account is an EMAIL ADDRESS plus a passphrase, and it is created by
+# redeeming an invite you addressed to somebody — signup is invite-only,
+# always. Mail is optional: with none configured, an invitation comes back as a
+# link for you to paste rather than as a letter. The old SMTP and PIGEON_*
+# names are boot failures, not no-ops. See .env.example.
 #
 #   docker compose --project-directory . -f docker/compose.yml logs -f sync
 #
@@ -69,9 +70,18 @@ services:
       PORT: 3000
       DATABASE_URL: postgres://${POSTGRES_USER:-openplate}:${POSTGRES_PASSWORD:-openplate}@postgres:5432/${POSTGRES_DB:-openplate_sync}
       SERVER_SECRET: ${SERVER_SECRET:?set SERVER_SECRET in .env — see .env.example}
-      # Who may create an account: open | invite | closed. The older
-      # SIGNUPS_OPEN name is a boot failure, so it is not forwarded here.
-      SIGNUP_MODE: ${SIGNUP_MODE:-open}
+      # Signup is INVITE-ONLY, always: there is no mode to set. SIGNUP_MODE and
+      # the older SIGNUPS_OPEN are both boot failures, so neither is forwarded
+      # here. Mint an invite with `pnpm sync-api invites create --email …`.
+      #
+      # What the instance calls itself, and which language its two letters are
+      # written in (en | de).
+      INSTANCE_NAME: ${INSTANCE_NAME:-openplate}
+      INSTANCE_LANGUAGE: ${INSTANCE_LANGUAGE:-en}
+      # Both or neither: they build the link in an invitation and in a
+      # password-reset mail. With neither, the admin API returns the raw token.
+      SERVER_PUBLIC_URL: ${SERVER_PUBLIC_URL:-}
+      CLIENT_BASE_URL: ${CLIENT_BASE_URL:-}
       # Set to the number of reverse proxies in front of this service, or the
       # per-IP throttle collapses into one bucket anyone can lock for everyone.
       TRUST_PROXY: ${TRUST_PROXY:-0}
@@ -87,6 +97,21 @@ services:
       # SYNC_NOTICE is a boot failure. See .env.example for the length cap.
       SYNC_NOTICE: ${SYNC_NOTICE:-}
       SYNC_NOTICE_URL: ${SYNC_NOTICE_URL:-}
+      # Mail: all three or none. Unset means invitations and resets come back
+      # to you as links instead of being posted. See .env.example.
+      MAIL_API_URL: ${MAIL_API_URL:-}
+      MAIL_API_KEY: ${MAIL_API_KEY:-}
+      MAIL_API_FROM: ${MAIL_API_FROM:-}
+      # The AI proxy: both or neither. Unset means POST /v1/chat/completions
+      # answers the ordinary unknown-path 404 and /health reports no AI at all.
+      # The per-account daily allowance is in the database, not here.
+      UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:-}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+      UPSTREAM_TIMEOUT_MS: ${UPSTREAM_TIMEOUT_MS:-120000}
+      AI_ADVERTISED_MODEL: ${AI_ADVERTISED_MODEL:-}
+      AI_RATE_LIMIT_PER_MINUTE: ${AI_RATE_LIMIT_PER_MINUTE:-20}
+      # Sized for a camera photograph after base64, NOT for a stored blob.
+      AI_MAX_REQUEST_BYTES: ${AI_MAX_REQUEST_BYTES:-8000000}
       # Only for an EXTERNAL database. The bundled Postgres above speaks plain
       # TCP on the compose network.
       DATABASE_SSL: ${DATABASE_SSL:-false}

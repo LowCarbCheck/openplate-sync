@@ -22,6 +22,7 @@ import { accounts, researchContributions, researchWithdrawals } from '../../src/
 import { setupTestDatabase, type TestDatabase } from './db-harness.js';
 import {
   sampleAuthHash,
+  sampleRecoveryCode,
   sampleCiphertext,
   sampleContributionBody,
   sampleKdfDescriptor,
@@ -33,11 +34,6 @@ import {
 /** A plausible client-derived pseudonym: 128 bits, Crockford base32. The server never computes or verifies one. */
 const PSEUDONYM = 'J7K2QW9ZP4M6N8R3T5V0XB1CDE';
 const SCHEMA_TIER = 'daily-intake:v1';
-
-interface SessionBody {
-  account: { id: number };
-  tokens: { accessToken: string } | null;
-}
 
 interface Party {
   accountId: number;
@@ -91,15 +87,16 @@ beforeEach(async () => {
   await database.reset();
 });
 
-async function signUp(handle: string, seed: number): Promise<Party> {
-  const response = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: { handle, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
+/**
+ * An account, created the only way this service can: an invite is minted and
+ * redeemed. `signupThroughInvite` is the harness's helper for exactly that.
+ */
+async function signUp(name: string, seed: number): Promise<Party> {
+  const session = await service.signupThroughInvite({
+    email: `${name}@example.org`,
+    authHash: sampleAuthHash(seed),
   });
-  assert.equal(response.status, 201, `signup for ${handle}`);
-  assert.ok(response.body.tokens);
-  return { accountId: response.body.account.id, accessToken: response.body.tokens.accessToken };
+  return { accountId: session.account.id, accessToken: session.tokens.accessToken };
 }
 
 /** A contributor enrolled in one study, having pushed version 1. */
@@ -499,6 +496,9 @@ test('rotate-dek never touches a contribution — two unrelated key domains', as
         { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(3), wrappedDek: sampleWrappedDek(53) },
         { kind: 'recovery', kdfDescriptor: null, wrappedDek: sampleWrappedDek(54) },
       ],
+      // Required since the M192 addendum: a rotation always mints a new code.
+      newRecoveryAuthHash: sampleAuthHash(71),
+      recoveryCode: sampleRecoveryCode(5),
       shares: [],
     },
   });

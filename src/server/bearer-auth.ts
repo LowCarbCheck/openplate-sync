@@ -17,7 +17,12 @@
  */
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import { parseBearerHeader } from '../lib/tokens.js';
-import { resolveAccessToken, type AuthContext, type ResolvedSession } from '../accounts/auth-handlers.js';
+import {
+  ACCOUNT_SUSPENDED,
+  resolveAccessToken,
+  type AuthContext,
+  type ResolvedSession,
+} from '../accounts/auth-handlers.js';
 import type { SyncEntitledUser } from '../contract-types.js';
 
 const sessionsByRequest = new WeakMap<Request, ResolvedSession>();
@@ -32,6 +37,13 @@ export function getRequestSession(req: Request): ResolvedSession | null {
  * malformed, unknown, expired and revoked tokens are all the same `401` with
  * the same message — telling them apart tells an attacker which guesses were
  * close.
+ *
+ * A SUSPENDED ACCOUNT IS A `403`, NOT A `401`, and the distinction is the
+ * whole reason `resolveAccessToken` returns three answers instead of two. A
+ * `401` means "sign in again", and a client that got one for a suspension
+ * would try, fail at the login door with a different status, and have learned
+ * nothing it could show the person. `403 account-suspended` is the one answer
+ * that lets a client say what happened.
  */
 export function createBearerAuthMiddleware(ctx: AuthContext): RequestHandler {
   return function requireAuth(req: Request, res: Response, next: NextFunction): void {
@@ -45,12 +57,16 @@ export function createBearerAuthMiddleware(ctx: AuthContext): RequestHandler {
     // and every rejection is handed to `next` explicitly.
     void (async () => {
       try {
-        const session = await resolveAccessToken(rawToken, ctx);
-        if (session === null) {
+        const resolution = await resolveAccessToken(rawToken, ctx);
+        if (resolution.status === 'suspended') {
+          res.status(403).json({ error: ACCOUNT_SUSPENDED });
+          return;
+        }
+        if (resolution.status !== 'valid') {
           res.status(401).json({ error: 'authentication required' });
           return;
         }
-        sessionsByRequest.set(req, session);
+        sessionsByRequest.set(req, resolution.session);
         next();
       } catch (cause) {
         next(cause);

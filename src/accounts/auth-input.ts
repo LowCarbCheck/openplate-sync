@@ -15,7 +15,7 @@
  * in that module; nothing here re-inspects a representation.
  */
 import { isSyncKeyRecordKind, type SyncKeyRecordKind } from '../protocol.js';
-import { normalizeHandle, parseAuthHash } from '../lib/verifier.js';
+import { normalizeEmail, parseAuthHash } from '../lib/verifier.js';
 import { parseKdfDescriptor, type KdfDescriptor } from '../lib/kdf-descriptor.js';
 import { asArray, asObject, asString, asTrimmedString, type JsonObject, type JsonValue } from '../lib/json.js';
 import type { KeyRecordSubmission } from './account-store.js';
@@ -24,40 +24,102 @@ export type ParseResult<T> = { ok: true; value: T } | { ok: false; reason: strin
 
 /** Bounded so a display name can never be used as free storage on a service that stores nothing else in the clear. */
 export const MAX_DISPLAY_NAME_LENGTH = 64;
+/** RFC 5321's ceiling on a whole address. A longer string is not an address anybody has. */
+export const MAX_EMAIL_LENGTH = 254;
+
 /**
- * Bounded to keep a malformed client from posting a megabyte of identifier.
- * 64 characters is far more than the client's generated handle needs and
- * still leaves room for a name somebody chose.
+ * The Crockford-style base32 alphabet the recovery code is rendered in
+ * (PROTOCOL.md §3.1). `O`, `I`, `L` and `U` are absent so a code survives
+ * being read aloud and typed back.
  */
-export const MAX_HANDLE_LENGTH = 64;
+export const RECOVERY_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+/**
+ * 32 base32 characters, which is exactly the 160 bits of §3.1's 20-byte code.
+ * A code of any other length is not one this client ever generated.
+ */
+export const RECOVERY_CODE_LENGTH = 32;
 
 function fail(reason: string): ParseResult<never> {
   return { ok: false, reason };
 }
 
 /**
- * Normalizes and structurally validates a handle. The normalized form
- * ({@link normalizeHandle}: NFKC, trim, lowercase) is what every store lookup
- * uses, so two spellings of the same handle collide on the unique index.
+ * Normalizes and structurally validates an email address. The normalized form
+ * ({@link normalizeEmail}: NFKC, trim, lowercase) is what every store lookup
+ * uses, so two spellings of one address collide on the unique index.
  *
- * THE `'@'` REJECTION IS LOAD BEARING, AND THIS IS THE ONLY PLACE IT LIVES.
- * It is what stops the handle column drifting back into being an address
- * register. A user who types their email into the handle box gets a `400` that
- * names the rule, and this service never stores a mailbox — which is the whole
- * point of M181, and is impossible to add later once the column holds
- * addresses. The service has no other opinion about the shape of a handle:
- * non-empty, no `'@'`, length-bounded, and unique. Handles are minted by the
- * client (never here), and the user may edit them.
+ * THIS IS THE ONLY EMAIL RULE IN THE REPO, and it replaced `parseHandle` —
+ * including its `'@'` REJECTION, which M181 made load-bearing and M192
+ * inverts on purpose (ADR-0005 supersedes ADR-0004 prohibition 1). The
+ * reversal is not a drift: it is the decision that an organization's people
+ * are identified by the address their invitation arrived at, because that is
+ * the one identifier they will still know in a month.
+ *
+ * THE RULE IS DELIBERATELY STRUCTURAL AND NOT RFC-COMPLETE. Exactly one `@`, a
+ * non-empty local part, a domain that contains a dot with non-empty labels,
+ * and at most {@link MAX_EMAIL_LENGTH} characters. A full RFC 5322 grammar
+ * would accept quoted strings, comments and bracketed literals that no
+ * organization's directory contains, and it would still not tell us whether
+ * the mailbox exists. What proves that is the invitation arriving, which is
+ * why the invite is the address verification and this function is only a
+ * typo gate.
  */
-export function parseHandle(value: JsonValue | undefined): ParseResult<string> {
+export function parseEmail(value: JsonValue | undefined): ParseResult<string> {
   const raw = asString(value);
-  if (raw === null) return fail('handle must be a string');
-  const handle = normalizeHandle(raw);
-  if (handle.length === 0 || handle.length > MAX_HANDLE_LENGTH) return fail('handle has an implausible length');
-  if (handle.includes('@')) {
-    return fail('handle must not contain "@": this service identifies accounts by handle, never by email address');
+  if (raw === null) return fail('email must be a string');
+  const email = normalizeEmail(raw);
+  if (email.length === 0 || email.length > MAX_EMAIL_LENGTH) return fail('email has an implausible length');
+
+  const parts = email.split('@');
+  // Exactly two parts means exactly one `@`. Splitting is total, so this
+  // covers "no @" and "several @" with one comparison.
+  if (parts.length !== 2) return fail('email must contain exactly one "@"');
+  const [local, domain] = parts;
+  if (local === undefined || local.length === 0) return fail('email must have a local part before the "@"');
+  if (domain === undefined) return fail('email must have a domain after the "@"');
+
+  const labels = domain.split('.');
+  if (labels.length < 2 || labels.some((label) => label.length === 0)) {
+    return fail('email domain must contain a dot and no empty labels');
   }
-  return { ok: true, value: handle };
+  // Whitespace anywhere else survives `trim`, and an address with a space in
+  // it is a paste accident rather than a mailbox.
+  if (/\s/.test(email)) return fail('email must not contain whitespace');
+
+  return { ok: true, value: email };
+}
+
+/**
+ * Canonicalizes and validates a recovery code as it arrives at signup or at a
+ * rotation — the value the server then SEALS into `accounts.recovery_code_escrow`.
+ *
+ * CANONICAL FORM FIRST, VALIDATION SECOND. The client shows the code in groups
+ * of five, and a person or a client may send it back with the spaces or the
+ * hyphens still in it. Stripping both and uppercasing before the check means
+ * one code has one sealed form, so a re-escrow after a rotation is comparable
+ * with what was there before.
+ *
+ * THE CODE IS NEVER IN A REASON STRING. Every rejection below describes the
+ * SHAPE and quotes nothing, because a `400` body ends up in a log and this
+ * value opens a diary.
+ */
+export function parseRecoveryCode(value: JsonValue | undefined): ParseResult<string> {
+  const raw = asString(value);
+  if (raw === null) return fail('recoveryCode must be a string');
+
+  const canonical = raw
+    .normalize('NFKC')
+    .replace(/[\s-]+/g, '')
+    .toUpperCase();
+  if (canonical.length !== RECOVERY_CODE_LENGTH) {
+    return fail(`recoveryCode must be ${RECOVERY_CODE_LENGTH} base32 characters once spaces and hyphens are removed`);
+  }
+  for (const character of canonical) {
+    if (!RECOVERY_CODE_ALPHABET.includes(character)) {
+      return fail('recoveryCode must use only the Crockford base32 alphabet (no O, I, L or U)');
+    }
+  }
+  return { ok: true, value: canonical };
 }
 
 /** The client's base64 auth-hash, kept as the ORIGINAL string: it is the HMAC input, so re-encoding it would change the verifier. */

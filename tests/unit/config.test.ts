@@ -19,9 +19,15 @@ function baseEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
 test('a minimal valid environment parses with sane defaults', () => {
   const config = parseConfig(baseEnv());
   assert.equal(config.port, 3000);
-  assert.equal(config.signupMode, 'open');
   assert.equal(config.trustProxy, false);
   assert.equal(config.logLevel, 'info');
+  assert.equal(config.instanceName, 'openplate');
+  assert.equal(config.instanceLanguage, 'en');
+  // No link bases and no mail: a self-hosted instance that configured neither
+  // still boots, and its invites come back as raw tokens.
+  assert.equal(config.serverPublicUrl, null);
+  assert.equal(config.clientBaseUrl, null);
+  assert.equal(config.mail, null);
   // Both dark features are OFF unless an operator opts in. This is the
   // default every deployment runs on, and it is what makes shipping the
   // routes before anyone opts in safe (ADR-0002 / ADR-0003).
@@ -43,22 +49,40 @@ test('a short SERVER_SECRET is fatal', () => {
   assert.throws(() => parseConfig(baseEnv({ SERVER_SECRET: 'too-short' })), /SERVER_SECRET/);
 });
 
-test('SIGNUP_MODE accepts its three values and rejects anything else', () => {
-  assert.equal(parseConfig(baseEnv({ SIGNUP_MODE: 'open' })).signupMode, 'open');
-  assert.equal(parseConfig(baseEnv({ SIGNUP_MODE: 'invite' })).signupMode, 'invite');
-  assert.equal(parseConfig(baseEnv({ SIGNUP_MODE: 'closed' })).signupMode, 'closed');
-  // A typo must not silently mean "open".
-  assert.throws(() => parseConfig(baseEnv({ SIGNUP_MODE: 'inviteonly' })), /SIGNUP_MODE/);
+test('SIGNUP_MODE is fatal, and the message says signup is invite-only', () => {
+  // The direction matters more than the rejection. An instance booting with a
+  // stale `SIGNUP_MODE=closed` would be an operator believing they had shut a
+  // door that is not implemented at all; one with `open` would be an operator
+  // believing public registration is on. Both spellings throw, and the message
+  // names the replacement so the fix is one line.
+  for (const value of ['open', 'invite', 'closed', 'inviteonly']) {
+    assert.throws(() => parseConfig(baseEnv({ SIGNUP_MODE: value })), /invite-only/, `SIGNUP_MODE=${value}`);
+  }
+  assert.throws(() => parseConfig(baseEnv({ SIGNUPS_OPEN: 'false' })), /invite-only/);
+  assert.throws(() => parseConfig(baseEnv({ SIGNUPS_OPEN: 'true' })), /invite-only/);
 });
 
-test('the removed SIGNUPS_OPEN is fatal rather than ignored', () => {
-  // The direction matters more than the rejection. SIGNUPS_OPEN defaulted to
-  // OPEN and is what has been holding the hosted instance shut; ignoring it
-  // would let a deploy that lands before the env change silently reopen public
-  // registration. Both spellings must throw, including the one an operator
-  // used to mean "closed".
-  assert.throws(() => parseConfig(baseEnv({ SIGNUPS_OPEN: 'false' })), /SIGNUP_MODE/);
-  assert.throws(() => parseConfig(baseEnv({ SIGNUPS_OPEN: 'true' })), /SIGNUP_MODE/);
+test('INSTANCE_NAME and INSTANCE_LANGUAGE are read, and a bad language is fatal', () => {
+  const config = parseConfig(baseEnv({ INSTANCE_NAME: 'Praxis Nord', INSTANCE_LANGUAGE: 'de' }));
+  assert.equal(config.instanceName, 'Praxis Nord');
+  assert.equal(config.instanceLanguage, 'de');
+  // Only the two languages the mails exist in. A third would silently fall
+  // back to English on the day somebody needs German.
+  assert.throws(() => parseConfig(baseEnv({ INSTANCE_LANGUAGE: 'fr' })), /INSTANCE_LANGUAGE/);
+});
+
+test('CLIENT_BASE_URL and SERVER_PUBLIC_URL are absolute http(s) URLs, or fatal', () => {
+  // They end up in a letter somebody clicks. A relative or misspelled value
+  // must be discovered by the operator at boot, not by the invited person.
+  const config = parseConfig(
+    baseEnv({ CLIENT_BASE_URL: 'https://openplate.de/', SERVER_PUBLIC_URL: 'https://sync.openplate.de' }),
+  );
+  // The trailing slash is stripped once, here, so no caller has to decide.
+  assert.equal(config.clientBaseUrl, 'https://openplate.de');
+  assert.equal(config.serverPublicUrl, 'https://sync.openplate.de');
+
+  assert.throws(() => parseConfig(baseEnv({ CLIENT_BASE_URL: '/join' })), /CLIENT_BASE_URL/);
+  assert.throws(() => parseConfig(baseEnv({ SERVER_PUBLIC_URL: 'javascript:alert(1)' })), /SERVER_PUBLIC_URL/);
 });
 
 test('TRUST_PROXY accepts a hop count as well as a boolean', () => {
@@ -73,15 +97,73 @@ test('an invalid PORT or LOG_LEVEL is fatal', () => {
   assert.throws(() => parseConfig(baseEnv({ LOG_LEVEL: 'chatty' })), /LOG_LEVEL/);
 });
 
-test('every variable M181 removed is fatal rather than ignored', () => {
-  // The same asymmetry SIGNUPS_OPEN is rejected under, applied to the mailer.
-  // A variable that is quietly ignored lets an operator believe mail is
-  // configured on a service that has no mailer, and believe their users can
-  // reset a passphrase they cannot — a false belief discovered by whoever
-  // needs it most, on the day they need it. Refusing to boot costs one deploy.
+test('the mail block is all-or-nothing, and a gap names the missing variable', () => {
+  const complete = {
+    MAIL_API_URL: 'http://pigeon:3601/v1/emails',
+    MAIL_API_KEY: 'a-pigeon-tenant-key',
+    MAIL_API_FROM: 'openplate <openplate@mail.openplate.de>',
+    SERVER_PUBLIC_URL: 'https://sync.openplate.de',
+    CLIENT_BASE_URL: 'https://openplate.de',
+  };
+  assert.deepEqual(parseConfig(baseEnv(complete)).mail, {
+    url: 'http://pigeon:3601/v1/emails',
+    apiKey: 'a-pigeon-tenant-key',
+    from: 'openplate <openplate@mail.openplate.de>',
+  });
+
+  // A HALF-CONFIGURED BLOCK IS A BOOT FAILURE, and the message NAMES the
+  // missing variable. The alternative is an operator who believes invitations
+  // are being delivered while every one of them silently comes back as a link
+  // nobody looks at.
+  for (const missing of ['MAIL_API_URL', 'MAIL_API_KEY', 'MAIL_API_FROM'] as const) {
+    const env = baseEnv(complete);
+    delete env[missing];
+    assert.throws(() => parseConfig(env), new RegExp(missing), `${missing} missing must be fatal`);
+  }
+
+  // ...and it names the VARIABLE, never a value: a key or a URL in a startup
+  // log is a credential in a log.
+  const withoutKey = baseEnv(complete);
+  delete withoutKey.MAIL_API_KEY;
+  assert.throws(
+    () => parseConfig(withoutKey),
+    (error: Error) => {
+      assert.ok(!error.message.includes('a-pigeon-tenant-key'), 'the message must not quote a configured value');
+      return true;
+    },
+  );
+});
+
+test('configured mail without the two link bases is a boot failure', () => {
+  // Both letters exist to carry a link, so mail with nowhere to point is a
+  // letter with nothing in it to click.
+  const mailOnly = {
+    MAIL_API_URL: 'http://pigeon:3601/v1/emails',
+    MAIL_API_KEY: 'k',
+    MAIL_API_FROM: 'f',
+  };
+  assert.throws(() => parseConfig(baseEnv(mailOnly)), /SERVER_PUBLIC_URL/);
+  assert.throws(
+    () => parseConfig(baseEnv({ ...mailOnly, SERVER_PUBLIC_URL: 'https://sync.openplate.de' })),
+    /CLIENT_BASE_URL/,
+  );
+  // Without mail, neither is required: a self-hoster who configured no mail
+  // still boots and hands out links themselves.
+  assert.equal(parseConfig(baseEnv()).mail, null);
+});
+
+test('every removed variable is fatal rather than ignored', () => {
+  // The same asymmetry SIGNUP_MODE is rejected under, applied to the old mail
+  // plumbing. A variable that is quietly ignored lets an operator believe mail
+  // is configured under a name this service does not read — a false belief
+  // discovered by whoever needs it most, on the day they need it. Refusing to
+  // boot costs one deploy.
+  //
+  // CLIENT_BASE_URL is deliberately NOT on this list any more: M181 made it
+  // fatal because nothing linked into the client, and M192 mails invitations
+  // and resets again, so it is read again.
   const removed = [
     'REQUIRE_EMAIL_VERIFICATION',
-    'CLIENT_BASE_URL',
     'EMAIL_FROM',
     'SMTP_HOST',
     'SMTP_PORT',

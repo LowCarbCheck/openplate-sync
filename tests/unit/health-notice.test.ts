@@ -1,5 +1,6 @@
 /**
- * The operator's notice on the `/health` handshake (M181 spec 07).
+ * The `/health` handshake: the operator's notice (M181 spec 07) and the
+ * instance block (M192).
  *
  * Boots the REAL app with fake stores, because the property under test is a
  * PUBLICATION property — "an instance with nothing to say sends no field at
@@ -14,13 +15,15 @@ import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createApp } from '../../src/server/create-app.js';
-import { isProtocolHandshake, type OperatorNotice } from '../../src/protocol.js';
+import { isProtocolHandshake, PROTOCOL_VERSION, type InstanceInfo, type OperatorNotice } from '../../src/protocol.js';
 import { asObject, type JsonObject, type JsonValue } from '../../src/lib/json.js';
 import { createThrottleStore } from '../../src/lib/throttle.js';
 import { createSilentLogger } from '../../src/logger.js';
 import { createAuthFixture } from './auth-context-fixture.js';
 import { createFakeStorageAdapter } from './fake-storage-adapter.js';
 import { createFakeRotationStore } from './fake-rotation-store.js';
+import { createFakeAdminStore } from './fake-admin-store.js';
+import { createFakeInviteStore } from './fake-invite-store.js';
 
 const servers: Server[] = [];
 
@@ -28,8 +31,8 @@ after(async () => {
   await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
 });
 
-/** Reads `/health` off a real listening app configured with (or without) a notice. */
-async function readHandshake(notice: OperatorNotice | null): Promise<JsonObject> {
+/** Reads `/health` off a real listening app configured with (or without) a notice and an instance block. */
+async function readHandshake(notice: OperatorNotice | null, instance: InstanceInfo | null = null): Promise<JsonObject> {
   const fixture = createAuthFixture();
   const app = createApp({
     authContext: fixture.ctx,
@@ -39,6 +42,8 @@ async function readHandshake(notice: OperatorNotice | null): Promise<JsonObject>
     logger: createSilentLogger(),
     trustProxy: false,
     notice,
+    instance,
+    admin: { token: null, metadata: createFakeAdminStore(), invites: createFakeInviteStore() },
   });
   const server = app.listen(0);
   servers.push(server);
@@ -83,4 +88,25 @@ test('a notice with no link publishes no url key', async () => {
   const body = await readHandshake({ text: 'Read this before you sync again.' });
 
   assert.deepEqual(body.notice, { text: 'Read this before you sync again.' });
+});
+
+test('the handshake reports protocol version 2 and no signupMode at all', async () => {
+  const body = await readHandshake(null);
+
+  assert.equal(body.protocolVersion, PROTOCOL_VERSION);
+  assert.equal(body.protocolVersion, 2);
+  // The field went with the setting. An instance that still published it would
+  // be describing a mode that no longer exists, and a client would draw a
+  // sign-up form for a door that is not there.
+  assert.ok(!('signupMode' in body), 'signupMode must be gone, not merely empty');
+});
+
+test('an instance block is published whole, and omitted entirely when there is none', async () => {
+  const withNone = await readHandshake(null, null);
+  // Omitted rather than sent as null, for the reason the notice is: a client
+  // older than protocol 2 must parse the body exactly as it always did.
+  assert.ok(!('instance' in withNone), 'an unconfigured instance must not add a field to the healthcheck body');
+
+  const body = await readHandshake(null, { name: 'Praxis Nord', language: 'de', mail: false, ai: null });
+  assert.deepEqual(body.instance, { name: 'Praxis Nord', language: 'de', mail: false, ai: null });
 });

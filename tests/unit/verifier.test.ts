@@ -1,7 +1,7 @@
 /**
  * The verifier's security properties, asserted directly: peppering actually
  * binds (a stolen table is useless without `SERVER_SECRET`), comparison is
- * length-safe, handle canonicalisation is total, and a malformed auth-hash is
+ * length-safe, address canonicalisation is total, and a malformed auth-hash is
  * refused rather than silently truncated.
  */
 import { test } from 'node:test';
@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import {
   AUTH_HASH_BYTES,
   computeVerifier,
-  normalizeHandle,
+  normalizeEmail,
   parseAuthHash,
   verifierMatches,
 } from '../../src/lib/verifier.js';
@@ -49,34 +49,45 @@ test('parseAuthHash accepts exactly 32 decoded bytes', () => {
   assert.equal(parseAuthHash(42), null);
 });
 
-test('normalizeHandle trims and lowercases', () => {
-  assert.equal(normalizeHandle('  Bright-Otter-42 '), 'bright-otter-42');
+test('normalizeEmail trims and lowercases', () => {
+  assert.equal(normalizeEmail('  Anna.Schmidt@Example.ORG '), 'anna.schmidt@example.org');
 });
 
-test('normalizeHandle applies NFKC before folding case', () => {
+test('normalizeEmail applies NFKC before folding case', () => {
   // Fullwidth Latin and a ligature are compatibility-equivalent to their ASCII
   // forms. Without NFKC each would be a SEPARATE row on the unique index, and
-  // one account could be impersonated by a look-alike handle.
-  assert.equal(normalizeHandle('ＢＲＩＧＨＴ-ｏｔｔｅｒ'), 'bright-otter');
-  assert.equal(normalizeHandle('\uFB01nch'), 'finch');
+  // one account could be shadowed by a look-alike address.
+  assert.equal(normalizeEmail('ＡＮＮＡ@ｅｘａｍｐｌｅ.ｏｒｇ'), 'anna@example.org');
+  assert.equal(normalizeEmail('\uFB01nch@example.org'), 'finch@example.org');
   // NFKC also maps a non-breaking space to an ordinary one, which the trim
-  // then removes — so a handle pasted out of a document still canonicalises.
-  assert.equal(normalizeHandle('\u00A0otter\u00A0'), 'otter');
+  // then removes — so an address pasted out of a document still canonicalises.
+  assert.equal(normalizeEmail('\u00A0anna@example.org\u00A0'), 'anna@example.org');
 });
 
-test('normalizeHandle is idempotent', () => {
+test('normalizeEmail is idempotent', () => {
   // The stored value is the normalized one, so normalizing it again on the way
   // in must be a no-op or a lookup would miss its own row.
-  for (const raw of ['  Bright-Otter-42 ', 'ＢＲＩＧＨＴ', '\uFB01nch', 'plain']) {
-    assert.equal(normalizeHandle(normalizeHandle(raw)), normalizeHandle(raw));
+  for (const raw of [
+    '  Anna@Example.ORG ',
+    'ＡＮＮＡ@ｅｘａｍｐｌｅ.ｏｒｇ',
+    '\uFB01nch@example.org',
+    'plain@x.test',
+  ]) {
+    assert.equal(normalizeEmail(normalizeEmail(raw)), normalizeEmail(raw));
   }
 });
 
-test('the two derived server subkeys differ and are stable', () => {
+test('the three derived server subkeys differ and are stable', () => {
   const first = deriveServerSecrets('a-root-secret-of-sufficient-length!!');
   const second = deriveServerSecrets('a-root-secret-of-sufficient-length!!');
   assert.deepEqual(first, second);
-  // Domain separation: reusing one key for the other purpose is the mistake
-  // this derivation exists to make impossible.
+  // Domain separation: reusing one key for another purpose is the mistake
+  // this derivation exists to make impossible. The escrow key is the one that
+  // DECRYPTS, so its separation from the pepper matters most of the three.
   assert.notEqual(first.verifierPepper, first.enumerationSecret);
+  assert.notEqual(first.verifierPepper, first.escrowKey.toString('hex'));
+  assert.notEqual(first.enumerationSecret, first.escrowKey.toString('hex'));
+  // AES-256 needs exactly 32 bytes, and a hex string would have been 64 bytes
+  // carrying half the entropy.
+  assert.equal(first.escrowKey.byteLength, 32);
 });

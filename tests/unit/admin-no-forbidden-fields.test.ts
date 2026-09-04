@@ -7,9 +7,12 @@
  * reason worth restating: ciphertext is still personal data, and an endpoint
  * that returns it is an exfiltration route whether or not anybody uses it; the
  * verifier is what a login is checked against; the KDF descriptor is what a
- * client needs to derive a key. None has an operational use that justifies
- * putting it where a screenshot, a log line or a paste into a chat window can
- * carry it.
+ * client needs to derive a key; and since M192 the ESCROWED RECOVERY CODE is
+ * the one value on `accounts` that a server-side key turns back into a
+ * credential. None has an operational use that justifies putting it where a
+ * screenshot, a log line or a paste into a chat window can carry it. The
+ * operator's legitimate need for the code is served by mailing it to the
+ * ACCOUNT HOLDER, never by printing it into a console.
  *
  * TWO ASSERTIONS, BECAUSE ONE OF THEM IS WEAK ON ITS OWN. The field NAMES
  * catch a whole object being spread into a response. The seeded VALUES catch
@@ -37,7 +40,16 @@ interface InviteSeedSecrets {
 const ADMIN_TOKEN = 'admin-token-for-the-unit-suite-0123456789';
 
 /** Names that must not appear as a key — or anywhere else — in an admin body. */
-const FORBIDDEN_NAMES = ['ciphertext', 'verifier', 'kdfDescriptor', 'kdf_descriptor', 'wrappedDek', 'tokenHash'];
+const FORBIDDEN_NAMES = [
+  'ciphertext',
+  'verifier',
+  'kdfDescriptor',
+  'kdf_descriptor',
+  'wrappedDek',
+  'tokenHash',
+  'recoveryCode',
+  'recovery_code_escrow',
+];
 
 let harness: AdminHarness;
 let secrets: AdminSeedSecrets;
@@ -51,7 +63,11 @@ before(async () => {
   // would leak.
   secrets = harness.admin.seed({
     id: 3,
-    handle: 'has-everything',
+    email: 'has-everything@example.org',
+    displayName: 'Has Everything',
+    role: 'admin',
+    dailyAiLimit: 200,
+    aiUsedToday: 3,
     blobSizeBytes: 4096,
     keyRecordKinds: ['passphrase', 'recovery'],
   });
@@ -60,11 +76,19 @@ before(async () => {
   // to leak, since it links a capability to an account. Its raw token is a
   // secret the mint response legitimately returned once; every read after that
   // must be free of both it and its digest.
-  const minted = await harness.invites.mint({ note: 'a person', expiresAt: new Date('2027-01-01T00:00:00.000Z') });
-  harness.invites.markRedeemed(minted.invite.id, 3);
-  const digest = harness.invites.digestOf(minted.invite.id);
+  const minted = await harness.invites.mint({
+    email: 'a-person@example.org',
+    displayName: 'A Person',
+    role: 'member',
+    dailyAiLimit: 0,
+    expiresAt: new Date('2027-01-01T00:00:00.000Z'),
+    now: new Date('2026-08-31T12:00:00.000Z'),
+  });
+  if (!minted.ok) throw new Error('expected the fake store to mint an invite');
+  harness.invites.markRedeemed(minted.minted.invite.id, 3);
+  const digest = harness.invites.digestOf(minted.minted.invite.id);
   if (digest === undefined) throw new Error('expected the fake store to hold a digest');
-  inviteSecrets = { token: minted.token, digest };
+  inviteSecrets = { token: minted.minted.token, digest };
 });
 
 after(async () => {
@@ -97,6 +121,7 @@ test('no admin response body contains the seeded secret values', async () => {
     secrets.wrappedDek,
     secrets.ciphertext,
     secrets.tokenHash,
+    secrets.recoveryCode,
     // The invite carve-out has exactly one exception, and this is what pins it
     // to that one place: the raw token may appear in the MINT response and
     // nowhere else. See ADR-0001.
@@ -121,7 +146,18 @@ test('the account body carries exactly the documented metadata fields and nothin
   const body: JsonValue = await response.json();
   const account = asObject(asObject(body)?.account);
 
-  assert.deepEqual(Object.keys(account ?? {}).toSorted(), ['blob', 'createdAt', 'handle', 'id', 'keyRecordKinds']);
+  assert.deepEqual(Object.keys(account ?? {}).toSorted(), [
+    'aiUsedToday',
+    'blob',
+    'createdAt',
+    'dailyAiLimit',
+    'displayName',
+    'email',
+    'id',
+    'keyRecordKinds',
+    'role',
+    'suspendedAt',
+  ]);
   assert.deepEqual(Object.keys(asObject(account?.blob) ?? {}).toSorted(), ['sizeBytes', 'updatedAt']);
 });
 
@@ -132,7 +168,9 @@ test('the responses are not empty, so the absence assertions above mean somethin
   const accountBody: JsonValue = await accountResponse.json();
   const account = asObject(asObject(accountBody)?.account);
   assert.equal(asNumber(account?.id), 3);
-  assert.equal(asString(account?.handle), 'has-everything');
+  assert.equal(asString(account?.email), 'has-everything@example.org');
+  assert.equal(asNumber(account?.dailyAiLimit), 200);
+  assert.equal(asNumber(account?.aiUsedToday), 3);
   assert.deepEqual(asArray(account?.keyRecordKinds), ['passphrase', 'recovery']);
 
   const statsResponse = await harness.request({ method: 'GET', path: '/v1/admin/stats', token: ADMIN_TOKEN });

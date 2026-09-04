@@ -18,12 +18,18 @@
  * ciphertext (see `db/schema.ts`), and here it also means the admin path has
  * no code that has ever held a blob in memory.
  *
+ * `recovery_code_escrow` JOINS THAT LIST OF COLUMNS NEVER NAMED HERE (M192).
+ * It is the one field on `accounts` that a server-side key can turn back into
+ * a credential, and an operator's legitimate need for it is served by the
+ * mailed reset — which delivers it to the ACCOUNT HOLDER — rather than by an
+ * endpoint that would print it into a console.
+ *
  * The per-account fan-out (blob summary, key-record kinds) is two extra
  * queries for a whole page rather than N+1: the page's ids go into one
  * `IN (...)` each. A page is at most `MAX_ADMIN_PAGE_LIMIT` rows, and this
  * endpoint is called by one operator at human speed.
  */
-import { count, countDistinct, desc, eq, inArray, sum } from 'drizzle-orm';
+import { and, count, countDistinct, desc, eq, gt, inArray, isNull, sum } from 'drizzle-orm';
 import type {
   AdminAccountPage,
   AdminAccountSummary,
@@ -32,16 +38,37 @@ import type {
   AdminStats,
   ListAccountsInput,
 } from '../admin/admin-store.js';
-import type { SyncKeyRecordKind } from '../protocol.js';
+import type { AccountRole, SyncKeyRecordKind } from '../protocol.js';
 import type { Database } from './client.js';
-import { accounts, syncBlobs, syncKeyRecords } from './schema.js';
+import { utcDayKey } from '../lib/utc-day.js';
+import { accounts, aiUsageDays, signupInvites, syncBlobs, syncKeyRecords } from './schema.js';
 
 /** The identity columns — deliberately enumerated, never `select()`. See the module header. */
 interface AccountIdentityRow {
   id: number;
-  handle: string;
+  email: string;
+  displayName: string | null;
+  role: AccountRole;
+  dailyAiLimit: number;
+  suspendedAt: Date | null;
   createdAt: Date;
 }
+
+/**
+ * The columns an operator may see. Named once so the list and the detail read
+ * cannot drift, and so the forbidden ones — `verifier`, `recovery_verifier`,
+ * `kdf_descriptor`, `recovery_code_escrow` — are absent in one visible place
+ * rather than in two.
+ */
+const IDENTITY_COLUMNS = {
+  id: accounts.id,
+  email: accounts.email,
+  displayName: accounts.displayName,
+  role: accounts.role,
+  dailyAiLimit: accounts.dailyAiLimit,
+  suspendedAt: accounts.suspendedAt,
+  createdAt: accounts.createdAt,
+} as const;
 
 /** `sum()` comes back as a numeric string (or `null` on an empty table), because a Postgres `bigint` does not fit a JS number by contract. */
 function toByteCount(value: string | null): number {
@@ -74,6 +101,20 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
     return summaries;
   }
 
+  /** Today's AI spend per account, for the given ids. A count, never a log — see `db/schema.ts`. */
+  async function aiUsage(accountIds: number[], day: string): Promise<Map<number, number>> {
+    const usage = new Map<number, number>();
+    if (accountIds.length === 0) return usage;
+
+    const rows = await db
+      .select({ accountId: aiUsageDays.accountId, count: aiUsageDays.count })
+      .from(aiUsageDays)
+      .where(and(inArray(aiUsageDays.accountId, accountIds), eq(aiUsageDays.day, day)));
+
+    for (const row of rows) usage.set(row.accountId, row.count);
+    return usage;
+  }
+
   /** Which key-record kinds exist per account, for the given ids. The wrapped DEK column is never named. */
   async function keyRecordKinds(accountIds: number[]): Promise<Map<number, SyncKeyRecordKind[]>> {
     const kinds = new Map<number, SyncKeyRecordKind[]>();
@@ -92,14 +133,20 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
     return kinds;
   }
 
-  async function summarize(identities: AccountIdentityRow[]): Promise<AdminAccountSummary[]> {
+  async function summarize(identities: AccountIdentityRow[], day: string): Promise<AdminAccountSummary[]> {
     const ids = identities.map((identity) => identity.id);
     const blobs = await blobSummaries(ids);
     const kinds = await keyRecordKinds(ids);
+    const usage = await aiUsage(ids, day);
 
     return identities.map((identity) => ({
       id: identity.id,
-      handle: identity.handle,
+      email: identity.email,
+      displayName: identity.displayName,
+      role: identity.role,
+      dailyAiLimit: identity.dailyAiLimit,
+      aiUsedToday: usage.get(identity.id) ?? 0,
+      suspendedAt: identity.suspendedAt,
       createdAt: identity.createdAt,
       blob: blobs.get(identity.id) ?? null,
       keyRecordKinds: (kinds.get(identity.id) ?? []).toSorted(),
@@ -109,11 +156,7 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
   return {
     async listAccounts(input: ListAccountsInput): Promise<AdminAccountPage> {
       const identities = await db
-        .select({
-          id: accounts.id,
-          handle: accounts.handle,
-          createdAt: accounts.createdAt,
-        })
+        .select(IDENTITY_COLUMNS)
         .from(accounts)
         // A stable order, or two pages of the same list can show the same
         // account twice and miss another.
@@ -123,27 +166,43 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
 
       const [totals] = await db.select({ total: count() }).from(accounts);
 
-      return { accounts: await summarize(identities), total: totals?.total ?? 0 };
+      return { accounts: await summarize(identities, input.day), total: totals?.total ?? 0 };
     },
 
-    async getAccount(accountId: number): Promise<AdminAccountSummary | null> {
+    async getAccount(input: { accountId: number; day: string }): Promise<AdminAccountSummary | null> {
       const [identity] = await db
-        .select({
-          id: accounts.id,
-          handle: accounts.handle,
-          createdAt: accounts.createdAt,
-        })
+        .select(IDENTITY_COLUMNS)
         .from(accounts)
-        .where(eq(accounts.id, accountId))
+        .where(eq(accounts.id, input.accountId))
         .limit(1);
       if (!identity) return null;
 
-      const [summary] = await summarize([identity]);
+      const [summary] = await summarize([identity], input.day);
       return summary ?? null;
     },
 
-    async stats(): Promise<AdminStats> {
+    async stats(input: { now: Date }): Promise<AdminStats> {
       const [accountTotals] = await db.select({ total: count() }).from(accounts);
+      const [adminTotals] = await db.select({ total: count() }).from(accounts).where(eq(accounts.role, 'admin'));
+
+      // PENDING means a letter is outstanding: not redeemed, not revoked, not
+      // expired. The three columns together, because any one of them alone
+      // would count invitations nobody can use.
+      const [inviteTotals] = await db
+        .select({ total: count() })
+        .from(signupInvites)
+        .where(
+          and(
+            isNull(signupInvites.redeemedAt),
+            isNull(signupInvites.revokedAt),
+            gt(signupInvites.expiresAt, input.now),
+          ),
+        );
+
+      const [aiTotals] = await db
+        .select({ total: sum(aiUsageDays.count) })
+        .from(aiUsageDays)
+        .where(eq(aiUsageDays.day, utcDayKey(input.now)));
 
       const [blobTotals] = await db
         .select({
@@ -161,6 +220,12 @@ export function createDrizzleAdminStore(db: Database): AdminMetadataStore {
         blobVersions: blobTotals?.versions ?? 0,
         keyRecords: keyRecordTotals?.total ?? 0,
         blobBytes: toByteCount(blobTotals?.bytes ?? null),
+        pendingInvites: inviteTotals?.total ?? 0,
+        admins: adminTotals?.total ?? 0,
+        // `sum()` comes back as a numeric string for the same reason
+        // `blobBytes` does: a Postgres `bigint` does not fit a JS number by
+        // contract, even when this one always will.
+        aiRequestsToday: toByteCount(aiTotals?.total ?? null),
       };
     },
   };

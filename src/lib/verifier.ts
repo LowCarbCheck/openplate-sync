@@ -32,11 +32,11 @@ export const AUTH_HASH_BYTES = 32;
 /**
  * Canonical account-identity form: NFKC, then trimmed, then lowercased.
  *
- * Applied on EVERY path that touches a handle (signup, login, descriptor
- * lookup) — an account must not be reachable under one spelling and invisible
- * under another, and the deterministic dummy descriptor must be stable for
- * `Bright-Otter` and `bright-otter` alike or the spelling itself becomes an
- * oracle.
+ * Applied on EVERY path that touches an address (signup, login, descriptor
+ * lookup, invite minting, reset request) — an account must not be reachable
+ * under one spelling and invisible under another, and the deterministic dummy
+ * descriptor must be stable for `Anna@Example.org` and `anna@example.org`
+ * alike or the spelling itself becomes an oracle.
  *
  * NFKC comes FIRST because compatibility composition is what folds the
  * look-alike forms Unicode offers for the same characters (fullwidth Latin,
@@ -44,13 +44,21 @@ export const AUTH_HASH_BYTES = 32;
  * catches the ASCII spaces NFKC produces from those; lowercasing last is what
  * makes the unique index a true case-insensitive guarantee.
  *
- * This is the whole opinion the server has about the SHAPE of a handle,
- * beyond the input layer's "non-empty, no `@`, length-bounded"
- * (`accounts/auth-input.ts`). Handles are minted by the client; the service
- * neither generates nor suggests them.
+ * LOWERCASING THE LOCAL PART IS A DELIBERATE OVER-REACH. RFC 5321 makes the
+ * part left of the `@` case-SENSITIVE, so `Anna@` and `anna@` are two
+ * mailboxes in theory. In practice every mail provider a person is invited
+ * from folds them, and treating them as two accounts would let one employee
+ * hold two diaries and one invite arrive at an address the account cannot be
+ * found under. Folding is the behaviour a user expects; the standard's
+ * latitude here is one nobody uses.
+ *
+ * This is the whole opinion the server has about the CANONICAL FORM. The
+ * structural rules — one `@`, a non-empty local part, a dotted domain, at most
+ * 254 characters — live in `accounts/auth-input.ts`'s `parseEmail`, which is
+ * the only email rule in the repo.
  */
-export function normalizeHandle(handle: string): string {
-  return handle.normalize('NFKC').trim().toLowerCase();
+export function normalizeEmail(email: string): string {
+  return email.normalize('NFKC').trim().toLowerCase();
 }
 
 /**

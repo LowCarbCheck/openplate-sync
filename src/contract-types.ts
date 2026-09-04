@@ -209,6 +209,23 @@ export interface RotateDekInput {
   keyRecords: RotateDekKeyRecordInput[];
   /** Only the shares to keep. Every other share row owned by `accountId` is deleted in the same transaction. */
   shares: RotateDekShareInput[];
+  /**
+   * The new recovery credential, and it is REQUIRED (M192 addendum).
+   *
+   * A ROTATION ALWAYS MINTS A FRESH RECOVERY CODE, because the `recovery` key
+   * record it re-wraps is wrapped under a KEK derived from that code. Leaving
+   * `accounts.recovery_verifier` and `accounts.recovery_code_escrow` on the
+   * OLD code produced an account whose escrowed code authenticated and then
+   * unwrapped nothing — latent since M181, and fatal the moment a mailed reset
+   * started delivering that code (PROTOCOL.md §5.12).
+   *
+   * Both land in the SAME transaction as the blob, the key records and the
+   * shares. A rotation that moved the record but not the verifier would be one
+   * more half-state in a list this operation exists to have none of.
+   */
+  recoveryVerifier: string;
+  /** The re-sealed recovery code (`lib/escrow.ts`), written beside the verifier above. */
+  recoveryCodeEscrow: Uint8Array;
 }
 
 export type RotateDekResult =

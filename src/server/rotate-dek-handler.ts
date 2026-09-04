@@ -19,6 +19,13 @@
  *    `recovery` record wrapping a DEK that no longer opens anything, so the
  *    recovery code would still log the account in and would never again
  *    decrypt it — discovered by the user on the worst possible day.
+ *  - A MISSING `newRecoveryAuthHash` OR `recoveryCode` is a 400 too, and for
+ *    the same reason one step further out (M192 addendum). The `recovery` wrap
+ *    above is sealed under a KEK derived from a code the client has just
+ *    minted, so the account's recovery verifier and its escrow have to move
+ *    with it. Those two are refused in the ROUTE, which is where the raw
+ *    values still exist; by the time they reach here they are a verifier and
+ *    a sealed blob, and "missing" is no longer representable.
  *  - A DUPLICATE GRANTEE in the keep list is a 400: two wraps for one row is
  *    a client that does not know its own state, and picking one silently
  *    would decide which clinician keeps access by array order.
@@ -129,6 +136,11 @@ export async function handleRotateDek(
     blob: request.blob,
     keyRecords: request.keyRecords,
     shares: request.shares,
+    // Already derived by the route from `newRecoveryAuthHash` and
+    // `recoveryCode`, both required (M192 addendum). They ride into the same
+    // transaction as everything else — see `SyncRotationStore`.
+    recoveryVerifier: request.recoveryVerifier,
+    recoveryCodeEscrow: request.recoveryCodeEscrow,
   });
 
   if (result.ok) {

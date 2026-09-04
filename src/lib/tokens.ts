@@ -75,10 +75,24 @@ export function generateToken(): GeneratedToken {
 }
 
 /**
+ * How long a mailed password-reset token is worth anything. One hour: long
+ * enough to survive a person reading their mail on the train, short enough
+ * that a letter forgotten in an inbox is not a live capability tomorrow.
+ *
+ * Deliberately not in {@link TOKEN_TTL_MS}, which is keyed by
+ * {@link AccountTokenKind} — a reset token is not an `account_tokens` row and
+ * never becomes a session (`password_resets`).
+ */
+export const RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
+
+/**
  * The shape a SIGNUP INVITE carries, and nothing else does. Kept beside
  * `generateToken` because the contrast is the point: session tokens stay bare.
  */
 export const SIGNUP_INVITE_TOKEN_PREFIX = 'si_';
+
+/** The shape a mailed PASSWORD RESET carries. Distinct from `si_` for the reason below. */
+export const PASSWORD_RESET_TOKEN_PREFIX = 'sr_';
 
 /**
  * Mints a signup invite: the same 256 bits, wearing its service's prefix.
@@ -99,12 +113,27 @@ export function generateSignupInviteToken(): GeneratedToken {
 }
 
 /**
+ * Mints a password reset: the same 256 bits, wearing its own prefix.
+ *
+ * A SECOND HUMAN-FACING TOKEN, and the second prefix is what keeps the two
+ * apart. Both arrive in a mail, both open a link in the client, and they mean
+ * very different things — one creates an account, one hands over a recovery
+ * code. A person forwarding the wrong letter, or a client reading the wrong
+ * fragment, is refused by shape rather than by a lookup that would have to
+ * decide what a cross-purpose token means.
+ */
+export function generatePasswordResetToken(): GeneratedToken {
+  const raw = `${PASSWORD_RESET_TOKEN_PREFIX}${randomBytes(32).toString('base64url')}`;
+  return { raw, hash: hashToken(raw) };
+}
+
+/**
  * Whether a presented string could be a signup invite at all.
  *
  * A SHAPE GATE, not a check: it is run BEFORE any lookup and its rejection is
  * the same generic `invite-invalid` a wrong, spent or expired token gets, so it
- * adds no oracle. What it buys is that a gateway token posted here is refused
- * without ever being hashed against this service's invite rows.
+ * adds no oracle. What it buys is that a token of another kind posted here is
+ * refused without ever being hashed against this service's invite rows.
  */
 export function isSignupInviteToken(raw: string): boolean {
   return raw.startsWith(SIGNUP_INVITE_TOKEN_PREFIX);

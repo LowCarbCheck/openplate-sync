@@ -12,7 +12,9 @@
  * kept in step with it.
  */
 import { isLogLevel, type LogLevel } from './logger.js';
-import { isSignupMode, SIGNUP_MODES, type OperatorNotice, type SignupMode } from './protocol.js';
+import { INSTANCE_LANGUAGES, isInstanceLanguage, type InstanceLanguage, type OperatorNotice } from './protocol.js';
+import type { HttpMailConfig } from './mail/mailer.js';
+import type { AiUpstreamConfig } from './ai/proxy.js';
 
 /**
  * Minimum accepted `SERVER_SECRET` length. 32 characters is the shortest
@@ -58,13 +60,67 @@ export interface ServiceConfig {
   databaseSsl: boolean;
   /** Root secret; `lib/server-secrets.ts` derives the domain-separated subkeys from it. Never used directly. */
   serverSecret: string;
+  /** What this instance calls itself on the handshake and in its mail. `INSTANCE_NAME`, default `openplate`. */
+  instanceName: string;
+  /** Which language its two letters are written in. `INSTANCE_LANGUAGE`, `en` or `de`, default `en`. */
+  instanceLanguage: InstanceLanguage;
   /**
-   * Whether this instance accepts new accounts, and on what terms — see
-   * {@link SignupMode}. Replaced the `SIGNUPS_OPEN` boolean in M166, which is
-   * now a boot-time error rather than a silently ignored name (see
-   * `parseSignupMode`).
+   * This service's own public base URL, or `null`. It goes into the `server=`
+   * fragment of a join or reset link, so a person who clicks one lands on a
+   * client already pointed at the right instance.
+   *
+   * Optional because a self-hosted instance reached only over a tailnet has no
+   * public URL, and inventing one would produce a link that goes nowhere. A
+   * link is then simply not built and the raw token is returned instead.
    */
-  signupMode: SignupMode;
+  serverPublicUrl: string | null;
+  /**
+   * Where the openplate client lives, or `null`. The other half of a link.
+   *
+   * IT CAME BACK FROM THE DEAD, AND THAT IS DELIBERATE. M181 made this name a
+   * BOOT FAILURE, because with the mailer deleted nothing in this service
+   * linked into a client and the variable had become required and unread. M192
+   * mails invitations and resets again, so it is read again. `SIGNUP_MODE`
+   * takes its place on the fatal list.
+   */
+  clientBaseUrl: string | null;
+  /**
+   * Mail configuration, or `null` for an instance that sends none — the
+   * default, and what every deployment gets until an operator points it at a
+   * relay.
+   *
+   * ALL THREE OR NONE, and any of them requires
+   * {@link ServiceConfig.serverPublicUrl} and {@link ServiceConfig.clientBaseUrl}:
+   * a letter with no link in it is not worth sending, and a half-configured
+   * block is an operator who believes mail works. See `parseMail`.
+   */
+  mail: HttpMailConfig | null;
+  /**
+   * The AI proxy's upstream, or `null` for an instance that offers no AI —
+   * the default, and what every deployment gets until an operator sets a key.
+   *
+   * `null` is not "mounted but refusing": `POST /v1/chat/completions` answers
+   * the ordinary unknown-path 404, to everybody, for the same reason the admin
+   * and share trees do (`server/create-app.ts`).
+   */
+  ai: AiUpstreamConfig | null;
+  /** What `/health` advertises as the model behind the proxy, or `null`. Descriptive, never a routing decision. */
+  aiAdvertisedModel: string | null;
+  /** Requests per account in any trailing 60 seconds on the proxy route. `AI_RATE_LIMIT_PER_MINUTE`, default 20. */
+  aiRateLimitPerMinute: number;
+  /**
+   * The largest request body the proxy route accepts, in bytes.
+   * `AI_MAX_REQUEST_BYTES`, default 8 MB.
+   *
+   * IT IS NOT THE BLOB LIMIT, and the first version of this route wrongly
+   * derived it from one. `MAX_BLOB_BYTES` bounds a diary — a compressed,
+   * encrypted document this service stores. A completion body carries a
+   * PHOTOGRAPH this service only forwards: a modern phone camera produces 3
+   * to 6 MB of JPEG, base64 inflates it by 4/3, and the blob-derived figure
+   * (2.73 MB) rejected every real plate scan with a 413 before the handler ran.
+   * 8 MB is the bound the retired gateway used, for the same reason.
+   */
+  aiMaxRequestBytes: number;
   /**
    * Express `trust proxy` setting. MUST be enabled behind a reverse proxy or
    * `req.ip` is the proxy's address and the per-IP throttle collapses into
@@ -117,7 +173,7 @@ export interface ServiceConfig {
    * config rather than a table with an admin endpoint. Both deliver the same
    * string to the same banner; only one of them needs a migration, a store, a
    * route, its own authorisation and its own tests. An operator who wants to
-   * change it redeploys, exactly as they already do for `SIGNUP_MODE`.
+   * change it redeploys, exactly as they do for every other setting here.
    *
    * It is not a notification system: nobody who does not open the app will
    * ever see it, and the service cannot know who did. See `README.md` — an
@@ -144,32 +200,58 @@ function parseAdminToken(env: NodeJS.ProcessEnv): string | null {
   return raw;
 }
 
+/** `INSTANCE_NAME` — what an instance calls itself in its mail and on the handshake. */
+const DEFAULT_INSTANCE_NAME = 'openplate';
+
 /**
- * `SIGNUP_MODE` is `open`, `invite` or `closed`, defaulting to `open` — a
- * self-hosted family instance should work with no signup configuration at all.
- *
- * THE OLD NAME IS FATAL, AND THE ASYMMETRY IS THE ARGUMENT. `SIGNUPS_OPEN` also
- * defaulted to open, and on the hosted instance it is the only thing that has
- * been holding registration shut. If it were merely ignored, a deploy that
- * shipped this binary before the environment was updated would silently reopen
- * public registration on a zero-knowledge service — a door quietly unlocked,
- * discovered by whoever walks through it first. Refusing to boot is loud, is
- * fixed by one deploy, and cannot be missed. So the removed name throws.
+ * A ceiling on `INSTANCE_NAME`, for the reason {@link MAX_SYNC_NOTICE_LENGTH}
+ * exists: this value is published on `/health`, which the container's own
+ * healthcheck polls continuously.
  */
-function parseSignupMode(env: NodeJS.ProcessEnv): SignupMode {
-  if (env.SIGNUPS_OPEN !== undefined) {
-    throw new Error(
-      'SIGNUPS_OPEN was replaced by SIGNUP_MODE (open|invite|closed). ' +
-        'It is rejected rather than ignored because it defaults to OPEN: ' +
-        'ignoring it would silently reopen registration on an instance that set it to false.',
-    );
-  }
-  const raw = env.SIGNUP_MODE?.trim().toLowerCase();
-  if (raw === undefined || raw === '') return 'open';
-  if (!isSignupMode(raw)) {
-    throw new Error(`Invalid SIGNUP_MODE: expected ${SIGNUP_MODES.join('/')}, got "${raw}"`);
+export const MAX_INSTANCE_NAME_LENGTH = 64;
+
+function parseInstanceName(env: NodeJS.ProcessEnv): string {
+  const raw = env.INSTANCE_NAME?.trim();
+  if (raw === undefined || raw === '') return DEFAULT_INSTANCE_NAME;
+  if (raw.length > MAX_INSTANCE_NAME_LENGTH) {
+    throw new Error(`INSTANCE_NAME must be at most ${MAX_INSTANCE_NAME_LENGTH} characters (got ${raw.length})`);
   }
   return raw;
+}
+
+/** `INSTANCE_LANGUAGE` — which of the two languages the invite and reset mails are written in. */
+function parseInstanceLanguage(env: NodeJS.ProcessEnv): InstanceLanguage {
+  const raw = env.INSTANCE_LANGUAGE?.trim().toLowerCase();
+  if (raw === undefined || raw === '') return 'en';
+  if (!isInstanceLanguage(raw)) {
+    throw new Error(`Invalid INSTANCE_LANGUAGE: expected ${INSTANCE_LANGUAGES.join('/')}, got "${raw}"`);
+  }
+  return raw;
+}
+
+/**
+ * An absolute `http(s)` base URL, or `null` when the variable is unset.
+ *
+ * A RELATIVE OR MISSPELLED VALUE IS A BOOT FAILURE, not a link that goes
+ * nowhere. These two values end up in a letter somebody clicks, and a broken
+ * one is discovered by the invited person rather than by the operator.
+ */
+function parseOptionalBaseUrl(env: NodeJS.ProcessEnv, key: string): string | null {
+  const raw = env[key]?.trim();
+  if (raw === undefined || raw === '') return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`Invalid ${key}: expected an absolute http(s) URL, got "${raw}"`);
+  }
+  if (!NOTICE_URL_SCHEMES.includes(parsed.protocol)) {
+    throw new Error(`Invalid ${key} scheme "${parsed.protocol}": only ${NOTICE_URL_SCHEMES.join('/')} are accepted`);
+  }
+  // Trailing slashes are stripped once, here, so every caller can concatenate
+  // a path without deciding whether to.
+  return raw.replace(/\/+$/, '');
 }
 
 /**
@@ -256,6 +338,111 @@ function parseTrustProxy(env: NodeJS.ProcessEnv): boolean | number {
   return hops;
 }
 
+/** The three names that make up the mail block. Listed once so every message below can name them all. */
+const MAIL_VARIABLES = ['MAIL_API_URL', 'MAIL_API_KEY', 'MAIL_API_FROM'] as const;
+
+/**
+ * `MAIL_API_URL` + `MAIL_API_KEY` + `MAIL_API_FROM`, all or none, and only
+ * alongside the two base URLs a link is built from.
+ *
+ * A HALF-CONFIGURED BLOCK IS A BOOT FAILURE THAT NAMES THE MISSING VARIABLE,
+ * and never a value: a key or a URL in a startup log is a credential in a log.
+ * The alternative — starting with mail half-configured — is an operator who
+ * believes invitations are being delivered while every one of them silently
+ * comes back as a link nobody looks at.
+ *
+ * REQUIRING THE LINK BASES IS THE SAME ARGUMENT ONE STEP OUT. Both letters
+ * exist to carry a link. Configured mail with no `CLIENT_BASE_URL` would send
+ * a letter with nothing in it to click.
+ */
+function parseMail(
+  env: NodeJS.ProcessEnv,
+  urls: { serverPublicUrl: string | null; clientBaseUrl: string | null },
+): HttpMailConfig | null {
+  const present = MAIL_VARIABLES.filter((name) => (env[name]?.trim() ?? '') !== '');
+  if (present.length === 0) return null;
+
+  const missing = MAIL_VARIABLES.filter((name) => !present.includes(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `Incomplete mail configuration: ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not set. ` +
+        `${MAIL_VARIABLES.join(', ')} are all-or-nothing — set all three, or none and hand out links yourself.`,
+    );
+  }
+
+  const missingUrls = [
+    urls.serverPublicUrl === null ? 'SERVER_PUBLIC_URL' : null,
+    urls.clientBaseUrl === null ? 'CLIENT_BASE_URL' : null,
+  ].filter((name): name is string => name !== null);
+  if (missingUrls.length > 0) {
+    throw new Error(
+      `Mail is configured but ${missingUrls.join(' and ')} ${missingUrls.length === 1 ? 'is' : 'are'} not set. ` +
+        'Both letters this service sends exist to carry a link, and a link needs both values.',
+    );
+  }
+
+  // SAFETY: `present.length === 3` above, so every name has a non-empty value.
+  return {
+    url: env.MAIL_API_URL?.trim() ?? '',
+    apiKey: env.MAIL_API_KEY?.trim() ?? '',
+    from: env.MAIL_API_FROM?.trim() ?? '',
+  };
+}
+
+/** The two names that make up the upstream block. Listed once so every message below can name both. */
+const AI_VARIABLES = ['UPSTREAM_BASE_URL', 'UPSTREAM_API_KEY'] as const;
+
+/** How long the proxy waits for headers, and then between chunks. See `ai/proxy.ts` on why undici and not global fetch. */
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 120_000;
+
+/**
+ * 8 MB, the figure the retired `openplate-gateway` used (`MAX_REQUEST_BYTES`).
+ * Sized for a camera photograph after base64, not for anything this service
+ * stores. See `Config.aiMaxRequestBytes`.
+ */
+const DEFAULT_AI_MAX_REQUEST_BYTES = 8_000_000;
+
+/**
+ * `UPSTREAM_BASE_URL` + `UPSTREAM_API_KEY`, both or neither.
+ *
+ * A HALF-CONFIGURED BLOCK IS A BOOT FAILURE THAT NAMES THE MISSING VARIABLE,
+ * and never a value: a provider key in a startup log is a provider key in a
+ * log. The alternative is an instance that mounts an AI route it cannot
+ * authenticate, so every scan fails with a 502 the operator reads as a provider
+ * outage.
+ */
+function parseAi(env: NodeJS.ProcessEnv): AiUpstreamConfig | null {
+  const present = AI_VARIABLES.filter((name) => (env[name]?.trim() ?? '') !== '');
+  if (present.length === 0) return null;
+
+  const missing = AI_VARIABLES.filter((name) => !present.includes(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `Incomplete AI configuration: ${missing.join(', ')} is not set. ` +
+        `${AI_VARIABLES.join(' and ')} are all-or-nothing — set both, or neither and this instance offers no AI.`,
+    );
+  }
+
+  const baseUrl = env.UPSTREAM_BASE_URL?.trim() ?? '';
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error(`Invalid UPSTREAM_BASE_URL: expected an absolute http(s) URL, got "${baseUrl}"`);
+  }
+  if (!NOTICE_URL_SCHEMES.includes(parsed.protocol)) {
+    throw new Error(`Invalid UPSTREAM_BASE_URL scheme "${parsed.protocol}": only ${NOTICE_URL_SCHEMES.join('/')} work`);
+  }
+
+  return {
+    // Trailing slashes stripped once, here, so `proxy.ts` can concatenate a
+    // path without deciding whether to.
+    baseUrl: baseUrl.replace(/\/+$/, ''),
+    apiKey: env.UPSTREAM_API_KEY?.trim() ?? '',
+    timeoutMs: parsePositiveInteger(env, 'UPSTREAM_TIMEOUT_MS', DEFAULT_UPSTREAM_TIMEOUT_MS),
+  };
+}
+
 function parseLogLevel(env: NodeJS.ProcessEnv): LogLevel {
   const raw = env.LOG_LEVEL?.trim().toLowerCase() ?? 'info';
   if (!isLogLevel(raw)) throw new Error(`Invalid LOG_LEVEL: expected debug/info/warn/error, got "${raw}"`);
@@ -267,51 +454,58 @@ function parseLogLevel(env: NodeJS.ProcessEnv): LogLevel {
  * environment, it is a BOOT FAILURE naming what happened, never a silent
  * no-op.
  *
- * THE ASYMMETRY IS THE ARGUMENT, and it is the one M166 already wrote down for
- * `SIGNUPS_OPEN` (see `parseSignupMode`). A container that refuses to boot is
- * loud and costs one deploy. A variable that is quietly ignored lets an
- * operator believe mail is configured on a service that has no mailer at all,
- * and believe their users can reset a passphrase they cannot — a false belief
- * discovered by whoever needs it most, on the day they need it.
+ * THE ASYMMETRY IS THE ARGUMENT, and it is the one M166 first wrote down for
+ * `SIGNUPS_OPEN`. A container that refuses to boot is loud and costs one
+ * deploy. A variable that is quietly ignored lets an operator believe a door
+ * is shut when it is open, or that mail is configured when it is not — a false
+ * belief discovered by whoever needs it most, on the day they need it.
  */
 function throwIfRemoved(env: NodeJS.ProcessEnv, name: string, because: string): void {
   if (env[name] === undefined) return;
   throw new Error(
-    `${name} was removed in M181 and is rejected rather than ignored: ${because}. Delete it from the environment.`,
+    `${name} is no longer read and is rejected rather than ignored: ${because}. Delete it from the environment.`,
   );
 }
 
-/** Why every mail variable went: there is no mailer left to configure. */
+/** Why the SMTP and pigeon-shaped variables went: M181 deleted those transports and M192 did not bring them back. */
 const MAILER_DELETED =
-  'openplate-sync sends no mail — src/mail/ and all three transports were deleted, and the gateway is the only service left that mails anybody';
+  "openplate-sync speaks only pigeon's HTTP API, configured as MAIL_API_URL, MAIL_API_KEY and MAIL_API_FROM — SMTP is a non-goal";
 
 /**
- * Every variable M181 removed, refused one by one.
+ * Every variable this service refuses, one by one.
  *
- * All of them are about EMAIL, directly or as its plumbing. The service now
- * identifies an account by a handle it cannot resolve to a person, and a lost
- * passphrase is recovered with the recovery code the user already holds — so
- * there is no address to verify, no link to send, and nowhere to link to.
+ * `SIGNUP_MODE` JOINED THE LIST IN M192, and `CLIENT_BASE_URL` left it. Signup
+ * is invite-only, always: an account is created by redeeming an addressed
+ * invite an operator minted, and there is no other door. An instance that
+ * booted with a stale `SIGNUP_MODE=open` in its environment would be an
+ * operator believing public registration is on, on a service where it is not
+ * implemented at all — and, worse, an operator believing they had turned it
+ * OFF with `closed` when the variable is simply unread.
  */
 function rejectRemovedEnvVars(env: NodeJS.ProcessEnv): void {
   throwIfRemoved(
     env,
-    'REQUIRE_EMAIL_VERIFICATION',
-    'there is no email address on an account to verify, and login no longer has a verification gate',
+    'SIGNUP_MODE',
+    'signup is invite-only on every instance, always: mint an addressed invite with POST /v1/admin/invites (there is no open or closed mode any more)',
   );
   throwIfRemoved(
     env,
-    'CLIENT_BASE_URL',
-    'nothing in this service links into the client any more, so it had become a required variable nothing read',
+    'SIGNUPS_OPEN',
+    'it was replaced by SIGNUP_MODE in M166, which M192 removed in turn: signup is invite-only, always',
   );
-  throwIfRemoved(env, 'EMAIL_FROM', MAILER_DELETED);
+  throwIfRemoved(
+    env,
+    'REQUIRE_EMAIL_VERIFICATION',
+    'the invitation IS the verification — an account is created by redeeming an invite addressed to that mailbox, so there is nothing left to confirm afterwards',
+  );
+  throwIfRemoved(env, 'EMAIL_FROM', 'the sending address is MAIL_API_FROM');
   throwIfRemoved(env, 'SMTP_HOST', MAILER_DELETED);
   throwIfRemoved(env, 'SMTP_PORT', MAILER_DELETED);
   throwIfRemoved(env, 'SMTP_USER', MAILER_DELETED);
   throwIfRemoved(env, 'SMTP_PASSWORD', MAILER_DELETED);
   throwIfRemoved(env, 'SMTP_SECURE', MAILER_DELETED);
-  throwIfRemoved(env, 'PIGEON_API_KEY', MAILER_DELETED);
-  throwIfRemoved(env, 'PIGEON_BASE_URL', MAILER_DELETED);
+  throwIfRemoved(env, 'PIGEON_API_KEY', 'the mail credential is MAIL_API_KEY');
+  throwIfRemoved(env, 'PIGEON_BASE_URL', 'the mail endpoint is MAIL_API_URL');
 }
 
 /** Pure: builds the config from an arbitrary env bag. Throws on anything invalid — see the module header. */
@@ -323,12 +517,25 @@ export function parseConfig(env: NodeJS.ProcessEnv): ServiceConfig {
     throw new Error(`SERVER_SECRET must be at least ${MIN_SERVER_SECRET_LENGTH} characters (see .env.example)`);
   }
 
+  // Read before the block below, because `parseMail` refuses a mail
+  // configuration that has no link to put in a letter.
+  const serverPublicUrl = parseOptionalBaseUrl(env, 'SERVER_PUBLIC_URL');
+  const clientBaseUrl = parseOptionalBaseUrl(env, 'CLIENT_BASE_URL');
+
   return {
     port: parsePositiveInteger(env, 'PORT', 3000),
     databaseUrl: required(env, 'DATABASE_URL'),
     databaseSsl: parseBoolean(env, 'DATABASE_SSL', false),
     serverSecret,
-    signupMode: parseSignupMode(env),
+    instanceName: parseInstanceName(env),
+    instanceLanguage: parseInstanceLanguage(env),
+    serverPublicUrl,
+    clientBaseUrl,
+    mail: parseMail(env, { serverPublicUrl, clientBaseUrl }),
+    ai: parseAi(env),
+    aiAdvertisedModel: env.AI_ADVERTISED_MODEL?.trim() || null,
+    aiRateLimitPerMinute: parsePositiveInteger(env, 'AI_RATE_LIMIT_PER_MINUTE', 20),
+    aiMaxRequestBytes: parsePositiveInteger(env, 'AI_MAX_REQUEST_BYTES', DEFAULT_AI_MAX_REQUEST_BYTES),
     trustProxy: parseTrustProxy(env),
     adminToken: parseAdminToken(env),
     sharingEnabled: parseBoolean(env, 'SYNC_SHARING', false),

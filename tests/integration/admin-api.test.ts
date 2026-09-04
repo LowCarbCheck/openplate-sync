@@ -34,20 +34,20 @@ import {
 } from './service-harness.js';
 
 const ADMIN_TOKEN = 'integration-admin-token-0123456789abcdef';
-const HANDLE = 'admin-subject';
+const EMAIL = 'admin-subject@example.org';
 const AUTH_HASH = sampleAuthHash(31);
 const CIPHERTEXT = sampleCiphertext(5, 1024);
 const WRAPPED_DEK = sampleWrappedDek(13);
 
-interface SessionBody {
-  account: { id: number; handle: string };
-  tokens: { accessToken: string; refreshToken: string } | null;
-}
-
 interface AccountBody {
   account: {
     id: number;
-    handle: string;
+    email: string;
+    displayName: string | null;
+    role: string;
+    dailyAiLimit: number;
+    aiUsedToday: number;
+    suspendedAt: string | null;
     createdAt: string;
     blob: { sizeBytes: number; updatedAt: string } | null;
     keyRecordKinds: string[];
@@ -91,18 +91,25 @@ beforeEach(async () => {
 
 /** A fully-furnished account: session tokens, both key records, and a pushed blob. */
 async function seedFurnishedAccount(): Promise<{ accountId: number; accessToken: string }> {
-  const signup = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: { handle: HANDLE, authHash: AUTH_HASH, kdfDescriptor: sampleKdfDescriptor(), displayName: 'Admin Subject' },
+  const session = await service.signupThroughInvite({
+    email: EMAIL,
+    displayName: 'Admin Subject',
+    role: 'member',
+    dailyAiLimit: 200,
+    authHash: AUTH_HASH,
   });
-  assert.equal(signup.status, 201);
-  // Read without an `assert.ok(... !== undefined)` narrowing call: an
-  // assertion function forces every later `const` in the same scope to carry
-  // an explicit annotation (TS7022), which is noise this file does not need.
-  const accessToken = signup.body.tokens?.accessToken ?? '';
-  const accountId = signup.body.account.id;
-  assert.notEqual(accessToken, '', 'signup must issue a session');
+  const accessToken = session.tokens.accessToken;
+  const accountId = session.account.id;
+
+  // The signup already wrote both key records, so these are ROTATIONS: the CAS
+  // token is what the records came back with, and `null` would now be a 409.
+  const listed = await service.request<{ records: { kind: string; updatedAt: string }[] }>({
+    method: 'GET',
+    path: '/v1/sync/key-records',
+    accessToken,
+  });
+  assert.equal(listed.status, 200);
+  const currentUpdatedAt = new Map(listed.body.records.map((record) => [record.kind, record.updatedAt]));
 
   for (const kind of ['passphrase', 'recovery']) {
     const put = await service.request({
@@ -112,7 +119,7 @@ async function seedFurnishedAccount(): Promise<{ accountId: number; accessToken:
       body: {
         kdfDescriptor: kind === 'passphrase' ? sampleKdfDescriptor(2) : null,
         wrappedDek: WRAPPED_DEK,
-        expectedUpdatedAt: null,
+        expectedUpdatedAt: currentUpdatedAt.get(kind) ?? null,
       },
     });
     assert.equal(put.status, 200, `${kind} key record must be stored`);
@@ -138,7 +145,11 @@ test('the metadata endpoints describe the real rows', async () => {
     adminToken: ADMIN_TOKEN,
   });
   assert.equal(single.status, 200);
-  assert.equal(single.body.account.handle, HANDLE);
+  assert.equal(single.body.account.email, EMAIL);
+  assert.equal(single.body.account.role, 'member');
+  assert.equal(single.body.account.dailyAiLimit, 200);
+  assert.equal(single.body.account.aiUsedToday, 0);
+  assert.equal(single.body.account.suspendedAt, null);
   // 1024 base64 characters decode to 768 bytes — the DECODED length is what
   // `size_bytes` holds and what an operator is told.
   assert.equal(single.body.account.blob?.sizeBytes, Buffer.from(CIPHERTEXT, 'base64').byteLength);
@@ -176,15 +187,19 @@ test('no admin response carries the ciphertext, the wrapped DEK, the verifier or
 
   const forbiddenValues = [
     accountRow?.verifier,
+    accountRow?.recoveryVerifier ?? undefined,
     accountRow?.kdfDescriptor.salt,
+    accountRow?.recoveryCodeEscrow?.toString('base64'),
     tokenRow?.tokenHash,
     blobRow?.ciphertext.toString('base64'),
     WRAPPED_DEK,
   ].filter((value): value is string => value !== undefined);
 
-  // The seeded account really does hold all five, so the absence assertions
-  // below are about material that exists rather than about an empty list.
-  assert.equal(forbiddenValues.length, 5, 'the fixture must hold every forbidden value');
+  // The seeded account really does hold all seven, so the absence assertions
+  // below are about material that exists rather than about an empty list. The
+  // escrow is the newest of them and the one that a server-side key turns back
+  // into a credential.
+  assert.equal(forbiddenValues.length, 7, 'the fixture must hold every forbidden value');
 
   for (const path of ['/v1/admin/accounts', `/v1/admin/accounts/${accountId}`, '/v1/admin/stats']) {
     const response = await fetch(`${service.baseUrl}${path}`, {
@@ -196,7 +211,7 @@ test('no admin response carries the ciphertext, the wrapped DEK, the verifier or
     for (const value of forbiddenValues) {
       assert.ok(!body.includes(value), `${path} leaked a real stored secret`);
     }
-    for (const name of ['ciphertext', 'verifier', 'kdfDescriptor', 'wrappedDek', 'tokenHash']) {
+    for (const name of ['ciphertext', 'verifier', 'kdfDescriptor', 'wrappedDek', 'tokenHash', 'recoveryCode']) {
       assert.ok(!body.includes(name), `${path} names the forbidden field "${name}"`);
     }
   }

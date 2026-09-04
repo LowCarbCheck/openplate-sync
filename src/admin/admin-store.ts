@@ -26,13 +26,31 @@
  * self-service path calls too, so the two erasure paths cannot drift apart.
  * See `server/admin-routes.ts`.
  */
-import type { SyncKeyRecordKind } from '../protocol.js';
+import type { AccountRole, SyncKeyRecordKind } from '../protocol.js';
 
-/** What the admin surface knows about an account. Everything else about it is out of reach by construction. */
+/**
+ * What the admin surface knows about an account. Everything else about it is
+ * out of reach by construction.
+ *
+ * IT IS A SUPERSET OF THE WIRE'S `AccountView`, NOT A DIFFERENT SHAPE. The
+ * M192 contract says the admin account endpoints return `AccountView[]`, and
+ * every field of one is here; `blob` and `keyRecordKinds` are the two extra
+ * operator facts ADR-0001 requires, and they exist because a storage bill and
+ * "does this person have a recovery path" are questions only an operator asks.
+ * A client decoding an `AccountView` from an admin response therefore works
+ * unchanged, and reads two fields it did not ask for.
+ */
 export interface AdminAccountSummary {
   id: number;
-  /** The account's opaque per-server identifier. It is not an address and cannot be resolved to a person. */
-  handle: string;
+  /** The account's identity: the canonical address it signs in with. */
+  email: string;
+  displayName: string | null;
+  role: AccountRole;
+  dailyAiLimit: number;
+  /** AI requests spent on the current UTC day — a count, never a log of what was asked. */
+  aiUsedToday: number;
+  /** Non-`null` while the account is suspended. */
+  suspendedAt: Date | null;
   createdAt: Date;
   /**
    * The account's current blob, described and never handed over: how many
@@ -73,15 +91,24 @@ export interface AdminStats {
   keyRecords: number;
   /** Summed `size_bytes` across every retained blob version. */
   blobBytes: number;
+  /** Invites minted, not yet redeemed, not revoked, not expired — the letters still outstanding. */
+  pendingInvites: number;
+  /** Accounts whose `role` is `admin`. An operator's answer to "who else can do this". */
+  admins: number;
+  /** AI requests every account together spent on the current UTC day. A count, never a log. */
+  aiRequestsToday: number;
 }
 
 export interface ListAccountsInput {
   limit: number;
   offset: number;
+  /** The UTC day `aiUsedToday` is counted over (`lib/utc-day.ts`). Injected, so a test controls "today". */
+  day: string;
 }
 
 export interface AdminMetadataStore {
   listAccounts(input: ListAccountsInput): Promise<AdminAccountPage>;
-  getAccount(accountId: number): Promise<AdminAccountSummary | null>;
-  stats(): Promise<AdminStats>;
+  getAccount(input: { accountId: number; day: string }): Promise<AdminAccountSummary | null>;
+  /** `now` is injected for the same reason every clock in this repo is: `pendingInvites` and `aiRequestsToday` both key on it. */
+  stats(input: { now: Date }): Promise<AdminStats>;
 }

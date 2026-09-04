@@ -19,7 +19,6 @@ import { setupTestDatabase, type TestDatabase } from './db-harness.js';
 import {
   sampleAuthHash,
   sampleCiphertext,
-  sampleKdfDescriptor,
   sampleShareWrap,
   sampleWrappedDek,
   startService,
@@ -27,11 +26,6 @@ import {
 } from './service-harness.js';
 
 const FINGERPRINT = 'K3TB-9WQZ-4M7N';
-
-interface SessionBody {
-  account: { id: number };
-  tokens: { accessToken: string } | null;
-}
 
 interface Party {
   accountId: number;
@@ -71,15 +65,16 @@ beforeEach(async () => {
   await database.reset();
 });
 
-async function signUp(handle: string, seed: number): Promise<Party> {
-  const response = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: { handle, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
+/**
+ * An account, created the only way this service can: an invite is minted and
+ * redeemed. `signupThroughInvite` is the harness's helper for exactly that.
+ */
+async function signUp(name: string, seed: number): Promise<Party> {
+  const session = await service.signupThroughInvite({
+    email: `${name}@example.org`,
+    authHash: sampleAuthHash(seed),
   });
-  assert.equal(response.status, 201, `signup for ${handle}`);
-  assert.ok(response.body.tokens);
-  return { accountId: response.body.account.id, accessToken: response.body.tokens.accessToken };
+  return { accountId: session.account.id, accessToken: session.tokens.accessToken };
 }
 
 /** A patient who has pushed one blob, and a clinician holding a grant on it. */
@@ -266,17 +261,33 @@ test('a grantee can revoke a share aimed at them, so nobody can park junk in the
   assert.deepEqual(grantorView.body.shares, []);
 });
 
+/**
+ * The patient's `recovery` wrap, and it must be a value no other account
+ * carries: the read-only test asserts its ABSENCE from the clinician's own
+ * records, and every signup shares the harness's default wraps.
+ */
+const GRANTOR_RECOVERY_WRAP = sampleWrappedDek(77);
+
 test('grantee is read-only: no key records, no push, no history, no third-party blob', async () => {
   const { patient, clinician } = await grantedPair();
 
   // The patient's key records exist, and are the thing that must stay out of
   // reach: a grantee who could pull the `recovery` wrap would be one
   // brute-forced recovery code away from rotation authority over the account.
+  // A DISTINCTIVE seed, so the absence assertion below is about the PATIENT's
+  // wrap and not about a value every account happens to share: the harness
+  // gives every signup the same default wraps, so the default would be present
+  // in the clinician's own records too and prove nothing.
   const seedRecord = await service.request({
     method: 'PUT',
     path: '/v1/sync/key-records/recovery',
     accessToken: patient.accessToken,
-    body: { kdfDescriptor: null, wrappedDek: sampleWrappedDek(), expectedUpdatedAt: null },
+    // A rotation: signup wrote the record, so this presents its current token.
+    body: {
+      kdfDescriptor: null,
+      wrappedDek: GRANTOR_RECOVERY_WRAP,
+      expectedUpdatedAt: await service.currentKeyRecordToken({ accessToken: patient.accessToken, kind: 'recovery' }),
+    },
   });
   assert.equal(seedRecord.status, 200);
 
@@ -304,13 +315,26 @@ test('grantee is read-only: no key records, no push, no history, no third-party 
 
   // The owner-only routes still resolve to the CALLER, never to the grantor:
   // holding a share must not turn the clinician into the patient.
-  const ownRecords = await service.request<{ records: unknown[] }>({
+  const ownRecords = await service.request<{ records: { kind: string; wrappedDek: string }[] }>({
     method: 'GET',
     path: '/v1/sync/key-records',
     accessToken: clinician.accessToken,
   });
   assert.equal(ownRecords.status, 200);
-  assert.deepEqual(ownRecords.body.records, [], "the grantee's own key records, not the grantor's");
+  // THE GRANTOR'S WRAP IS THE THING THAT MUST BE ABSENT, and naming it is a
+  // stronger assertion than the empty list this used to make: an empty list
+  // would also have been what a broken route returned. The clinician has key
+  // records of their own (signup writes both since M192); what they must never
+  // see is the patient's `recovery` wrap, which is one brute-forced recovery
+  // code away from rotation authority over that account.
+  assert.ok(
+    ownRecords.body.records.length > 0,
+    'the route must resolve to the caller and answer, not merely return nothing',
+  );
+  assert.ok(
+    !ownRecords.body.records.some((record) => record.wrappedDek === GRANTOR_RECOVERY_WRAP),
+    "the grantee's own key records, never the grantor's",
+  );
 
   const ownBlob = await service.request({
     method: 'GET',

@@ -21,16 +21,19 @@
  */
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { eq } from 'drizzle-orm';
+import { accounts } from '../../src/db/schema.js';
 import { setupTestDatabase, type TestDatabase } from './db-harness.js';
 import {
   sampleAuthHash,
   sampleKdfDescriptor,
+  sampleRecoveryCode,
   sampleWrappedDek,
   startService,
   type ServiceHarness,
 } from './service-harness.js';
 
-const HANDLE = 'bright-otter-42';
+const EMAIL = 'bright-otter@example.org';
 const OLD_AUTH_HASH = sampleAuthHash(11);
 const NEW_AUTH_HASH = sampleAuthHash(12);
 const RECOVERY_AUTH_HASH = sampleAuthHash(31);
@@ -39,11 +42,8 @@ const OLD_PASSPHRASE_WRAP = sampleWrappedDek(51);
 const OLD_RECOVERY_WRAP = sampleWrappedDek(52);
 const NEW_PASSPHRASE_WRAP = sampleWrappedDek(61);
 const NEW_RECOVERY_WRAP = sampleWrappedDek(62);
-
-interface SessionBody {
-  account: { id: number; handle: string };
-  tokens: { accessToken: string } | null;
-}
+const OLD_RECOVERY_CODE = sampleRecoveryCode(0);
+const NEW_RECOVERY_CODE = sampleRecoveryCode(3);
 
 interface KeyRecordList {
   records: { kind: string; wrappedDek: string }[];
@@ -72,25 +72,36 @@ beforeEach(async () => {
 
 /** An account set up the way a real one is: a recovery code, and both key records. */
 async function setUpAccount(): Promise<{ accountId: number; accessToken: string }> {
-  const signup = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: {
-      handle: HANDLE,
-      authHash: OLD_AUTH_HASH,
-      kdfDescriptor: sampleKdfDescriptor(1),
-      recoveryAuthHash: RECOVERY_AUTH_HASH,
-    },
+  const session = await service.signupThroughInvite({
+    email: EMAIL,
+    authHash: OLD_AUTH_HASH,
+    recoveryAuthHash: RECOVERY_AUTH_HASH,
+    recoveryCode: OLD_RECOVERY_CODE,
   });
-  assert.equal(signup.status, 201);
-  assert.ok(signup.body.tokens);
-  const accessToken = signup.body.tokens.accessToken;
+  const accessToken = session.tokens.accessToken;
+
+  // SIGNUP ALREADY WROTE BOTH KEY RECORDS (M192), so these are ROTATIONS
+  // rather than first-time writes: the CAS token is the `updatedAt` the
+  // records came back with, and `null` would now be the 409 that asserts "no
+  // record exists yet". They exist to replace the harness's generic wraps with
+  // the named ones every "did it change" assertion below compares against.
+  const listed = await service.request<{ records: { kind: string; updatedAt: string }[] }>({
+    method: 'GET',
+    path: '/v1/sync/key-records',
+    accessToken,
+  });
+  assert.equal(listed.status, 200);
+  const currentUpdatedAt = new Map(listed.body.records.map((record) => [record.kind, record.updatedAt]));
 
   const passphrase = await service.request({
     method: 'PUT',
     path: '/v1/sync/key-records/passphrase',
     accessToken,
-    body: { kdfDescriptor: sampleKdfDescriptor(1), wrappedDek: OLD_PASSPHRASE_WRAP, expectedUpdatedAt: null },
+    body: {
+      kdfDescriptor: sampleKdfDescriptor(1),
+      wrappedDek: OLD_PASSPHRASE_WRAP,
+      expectedUpdatedAt: currentUpdatedAt.get('passphrase') ?? null,
+    },
   });
   assert.equal(passphrase.status, 200);
 
@@ -98,26 +109,32 @@ async function setUpAccount(): Promise<{ accountId: number; accessToken: string 
     method: 'PUT',
     path: '/v1/sync/key-records/recovery',
     accessToken,
-    body: { kdfDescriptor: null, wrappedDek: OLD_RECOVERY_WRAP, expectedUpdatedAt: null },
+    body: {
+      kdfDescriptor: null,
+      wrappedDek: OLD_RECOVERY_WRAP,
+      expectedUpdatedAt: currentUpdatedAt.get('recovery') ?? null,
+    },
   });
   assert.equal(recovery.status, 200);
 
-  return { accountId: signup.body.account.id, accessToken };
+  return { accountId: session.account.id, accessToken };
 }
 
 /** The `POST /v1/auth/recover-rotate` request body, named so a test overriding one field cannot invent another. */
 interface RecoverRotateBody {
-  handle: string;
+  email: string;
   recoveryAuthHash: string;
   newAuthHash: string;
   newRecoveryAuthHash?: string;
+  /** Required whenever `newRecoveryAuthHash` is present: the escrow must move with the verifier. */
+  recoveryCode?: string;
   kdfDescriptor: ReturnType<typeof sampleKdfDescriptor>;
   keyRecords: { kind: string; kdfDescriptor: ReturnType<typeof sampleKdfDescriptor> | null; wrappedDek: string }[];
 }
 
 function recoverRotateBody(overrides: Partial<RecoverRotateBody> = {}): RecoverRotateBody {
   return {
-    handle: HANDLE,
+    email: EMAIL,
     recoveryAuthHash: RECOVERY_AUTH_HASH,
     newAuthHash: NEW_AUTH_HASH,
     kdfDescriptor: sampleKdfDescriptor(2),
@@ -130,7 +147,7 @@ async function login(authHash: string): Promise<number> {
   const response = await service.request({
     method: 'POST',
     path: '/v1/auth/login',
-    body: { handle: HANDLE, authHash },
+    body: { email: EMAIL, authHash },
   });
   return response.status;
 }
@@ -151,16 +168,16 @@ test('recover, set a new passphrase, log in with it', async () => {
   await setUpAccount();
 
   // 1. The recovery code alone authenticates.
-  const recovered = await service.request<SessionBody>({
+  const recovered = await service.request<{ account: { email: string } }>({
     method: 'POST',
     path: '/v1/auth/recover',
-    body: { handle: HANDLE, recoveryAuthHash: RECOVERY_AUTH_HASH },
+    body: { email: EMAIL, recoveryAuthHash: RECOVERY_AUTH_HASH },
   });
   assert.equal(recovered.status, 200);
-  assert.equal(recovered.body.account.handle, HANDLE);
+  assert.equal(recovered.body.account.email, EMAIL);
 
   // 2. It buys the right to set a new passphrase and re-wrap the DEK.
-  const rotated = await service.request<SessionBody>({
+  const rotated = await service.request<{ tokens: { accessToken: string } | null }>({
     method: 'POST',
     path: '/v1/auth/recover-rotate',
     body: recoverRotateBody(),
@@ -179,14 +196,18 @@ test('recover, set a new passphrase, log in with it', async () => {
   assert.equal(records.get('recovery'), OLD_RECOVERY_WRAP);
 });
 
-test('rotating the recovery code moves its verifier and its key record together', async () => {
-  await setUpAccount();
+test('rotating the recovery code moves its verifier, its key record AND its escrow together', async () => {
+  const account = await setUpAccount();
+  const [rowBefore] = await database.db.select().from(accounts).where(eq(accounts.id, account.accountId));
+  const escrowBefore = rowBefore?.recoveryCodeEscrow ?? null;
+  assert.ok(escrowBefore !== null, 'signup must have written an escrow');
 
-  const rotated = await service.request<SessionBody>({
+  const rotated = await service.request<{ tokens: { accessToken: string } | null }>({
     method: 'POST',
     path: '/v1/auth/recover-rotate',
     body: recoverRotateBody({
       newRecoveryAuthHash: NEW_RECOVERY_AUTH_HASH,
+      recoveryCode: NEW_RECOVERY_CODE,
       keyRecords: [
         { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: NEW_PASSPHRASE_WRAP },
         { kind: 'recovery', kdfDescriptor: null, wrappedDek: NEW_RECOVERY_WRAP },
@@ -200,48 +221,75 @@ test('rotating the recovery code moves its verifier and its key record together'
   const withNewCode = await service.request({
     method: 'POST',
     path: '/v1/auth/recover',
-    body: { handle: HANDLE, recoveryAuthHash: NEW_RECOVERY_AUTH_HASH },
+    body: { email: EMAIL, recoveryAuthHash: NEW_RECOVERY_AUTH_HASH },
   });
   assert.equal(withNewCode.status, 200);
   const withOldCode = await service.request({
     method: 'POST',
     path: '/v1/auth/recover',
-    body: { handle: HANDLE, recoveryAuthHash: RECOVERY_AUTH_HASH },
+    body: { email: EMAIL, recoveryAuthHash: RECOVERY_AUTH_HASH },
   });
   assert.equal(withOldCode.status, 401);
 
   const records = await readKeyRecords(rotated.body.tokens.accessToken);
   assert.equal(records.get('recovery'), NEW_RECOVERY_WRAP);
+
+  // AND THE ESCROW MOVED WITH THEM. An escrow still holding the OLD code is a
+  // mailed reset that hands somebody a credential the account no longer
+  // accepts, discovered on the day they need it.
+  const [rowAfter] = await database.db.select().from(accounts).where(eq(accounts.id, account.accountId));
+  assert.ok(rowAfter?.recoveryCodeEscrow !== null && rowAfter?.recoveryCodeEscrow !== undefined);
+  assert.notDeepEqual(rowAfter.recoveryCodeEscrow, escrowBefore);
+});
+
+test('rotating the recovery code without a new recoveryCode is a 400, so no escrow goes stale', async () => {
+  await setUpAccount();
+
+  const refused = await service.request<ErrorBody>({
+    method: 'POST',
+    path: '/v1/auth/recover-rotate',
+    body: recoverRotateBody({
+      newRecoveryAuthHash: NEW_RECOVERY_AUTH_HASH,
+      keyRecords: [
+        { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: NEW_PASSPHRASE_WRAP },
+        { kind: 'recovery', kdfDescriptor: null, wrappedDek: NEW_RECOVERY_WRAP },
+      ],
+    }),
+  });
+  assert.equal(refused.status, 400);
+  assert.match(refused.body.error, /recoveryCode/);
+  // Nothing moved.
+  assert.equal(await login(OLD_AUTH_HASH), 200);
 });
 
 // ── One generic failure ────────────────────────────────────────────────────
 
-test('an unknown handle and a wrong recovery code produce the SAME failure', async () => {
+test('an unknown address and a wrong recovery code produce the SAME failure', async () => {
   await setUpAccount();
 
-  const unknownHandle = await service.request<ErrorBody>({
+  const unknownAddress = await service.request<ErrorBody>({
     method: 'POST',
     path: '/v1/auth/recover',
-    body: { handle: 'nobody-at-all', recoveryAuthHash: RECOVERY_AUTH_HASH },
+    body: { email: 'nobody@example.org', recoveryAuthHash: RECOVERY_AUTH_HASH },
   });
   const wrongCode = await service.request<ErrorBody>({
     method: 'POST',
     path: '/v1/auth/recover',
-    body: { handle: HANDLE, recoveryAuthHash: NEW_RECOVERY_AUTH_HASH },
+    body: { email: EMAIL, recoveryAuthHash: NEW_RECOVERY_AUTH_HASH },
   });
 
-  assert.equal(unknownHandle.status, 401);
+  assert.equal(unknownAddress.status, 401);
   assert.equal(wrongCode.status, 401);
   // Byte-identical, not merely "both a 401". A different sentence would be an
   // enumeration oracle wearing the same status code.
-  assert.deepEqual(unknownHandle.body, wrongCode.body);
+  assert.deepEqual(unknownAddress.body, wrongCode.body);
 
   // The rotation endpoint answers the same way, and it must: it is reached
   // with a guessed code far more often than the read-only one is.
   const rotateUnknown = await service.request<ErrorBody>({
     method: 'POST',
     path: '/v1/auth/recover-rotate',
-    body: recoverRotateBody({ handle: 'nobody-at-all' }),
+    body: recoverRotateBody({ email: 'nobody@example.org' }),
   });
   const rotateWrong = await service.request<ErrorBody>({
     method: 'POST',
@@ -269,6 +317,7 @@ test('a rotation interrupted between the verifier and the key record is rolled b
       path: '/v1/auth/recover-rotate',
       body: recoverRotateBody({
         newRecoveryAuthHash: NEW_RECOVERY_AUTH_HASH,
+        recoveryCode: NEW_RECOVERY_CODE,
         keyRecords: [
           { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: NEW_PASSPHRASE_WRAP },
           { kind: 'recovery', kdfDescriptor: null, wrappedDek: NEW_RECOVERY_WRAP },
@@ -297,13 +346,13 @@ test('a rotation interrupted between the verifier and the key record is rolled b
   const oldCode = await service.request({
     method: 'POST',
     path: '/v1/auth/recover',
-    body: { handle: HANDLE, recoveryAuthHash: RECOVERY_AUTH_HASH },
+    body: { email: EMAIL, recoveryAuthHash: RECOVERY_AUTH_HASH },
   });
   assert.equal(oldCode.status, 200);
   const newCode = await service.request({
     method: 'POST',
     path: '/v1/auth/recover',
-    body: { handle: HANDLE, recoveryAuthHash: NEW_RECOVERY_AUTH_HASH },
+    body: { email: EMAIL, recoveryAuthHash: NEW_RECOVERY_AUTH_HASH },
   });
   assert.equal(newCode.status, 401);
 
@@ -320,7 +369,7 @@ test('a rotation interrupted between the verifier and the key record is rolled b
   // (e) The account is not wedged: with the constraint gone, the same
   //     rotation now applies in full. A rollback that left invisible damage
   //     would surface here.
-  const retried = await service.request<SessionBody>({
+  const retried = await service.request({
     method: 'POST',
     path: '/v1/auth/recover-rotate',
     body: recoverRotateBody(),

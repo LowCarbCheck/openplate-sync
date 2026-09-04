@@ -37,7 +37,10 @@ export type { Database, DatabaseHandle } from './db/client.js';
 export { createDrizzleAccountStore } from './db/account-store.js';
 export { createDrizzleStorageAdapter } from './db/storage-adapter.js';
 export { createDrizzleAdminStore } from './db/admin-store.js';
+export { createDrizzleInviteStore } from './db/invite-store.js';
 export type * from './admin/admin-store.js';
+export { inviteStatus } from './admin/invite-store.js';
+export type * from './admin/invite-store.js';
 export * as schema from './db/schema.js';
 
 // Configuration and cross-cutting utilities.
@@ -50,4 +53,10 @@ export { createThrottleStore } from './lib/throttle.js';
 export * from './lib/tokens.js';
 export * from './lib/verifier.js';
 export * from './lib/kdf-descriptor.js';
+export * from './lib/escrow.js';
+export { utcDayKey } from './lib/utc-day.js';
 export { SERVICE_VERSION } from './version.js';
+
+// The mail PORT, and the no-op behind it. Spec 02 adds the pigeon transport.
+export { createNoopMailer } from './mail/mailer.js';
+export type { Mailer, SendInviteInput, SendResetInput } from './mail/mailer.js';

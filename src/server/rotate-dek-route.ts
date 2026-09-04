@@ -31,6 +31,16 @@
  * definition — an owner rotating their own DEK — so the ordinary resolver
  * answers the only question there is. `SyncEntitledUser` stays a one-field
  * type; ADR-0002 rejects extending it, and nothing here needs it extended.
+ *
+ * A ROTATION CARRIES A NEW RECOVERY CODE, AND BOTH FIELDS ARE REQUIRED (M192
+ * addendum). The `recovery` key record this submission re-wraps is wrapped
+ * under a KEK derived from the account's recovery code, so a rotation that
+ * left `accounts.recovery_verifier` and the escrow on the OLD code produced an
+ * account whose escrowed code authenticated and then unwrapped nothing. That
+ * was latent from M181 and became fatal the moment a mailed reset started
+ * handing that code to people (PROTOCOL.md §5.12). A request missing either
+ * field is a `400` that names it, rather than the generic body rejection: a
+ * client upgrading needs to know which field it forgot.
  */
 import express from 'express';
 import type { Express, Request, Response } from 'express';
@@ -42,6 +52,9 @@ import type {
 } from '../contract-types.js';
 import { MAX_BLOB_BYTES, SYNC_API_PREFIX, isSyncKeyRecordKind } from '../protocol.js';
 import { asArray, asNumber, asObject, asPositiveInteger, asString, type JsonValue } from '../lib/json.js';
+import { parseAuthHashField, parseRecoveryCode } from '../accounts/auth-input.js';
+import { computeVerifier } from '../lib/verifier.js';
+import { sealRecoveryCode } from '../lib/escrow.js';
 import { asyncHandler } from './async-handler.js';
 import { handleRotateDek } from './rotate-dek-handler.js';
 
@@ -60,6 +73,16 @@ export interface RotateDekHostContext {
   resolveEntitledUser: (req: Request) => Promise<SyncEntitledUser | null>;
   /** Whether `SYNC_SHARING` is on. Not a gate on this route — see the module header — only on what a keep list may say. */
   sharingEnabled: boolean;
+  /**
+   * The two `SERVER_SECRET` subkeys this route needs to turn the submitted
+   * recovery credential into what the account row stores: the verifier pepper,
+   * and the AES key the escrow is sealed under.
+   *
+   * Both come from `deriveServerSecrets`, and both are used here exactly as
+   * the auth handlers use them — one `computeVerifier`, one `sealRecoveryCode`.
+   * Nothing on this path derives a KEK or unwraps a DEK.
+   */
+  recoveryCredentials: { pepper: string; escrowKey: Buffer };
 }
 
 function fromBase64(value: JsonValue | undefined): Uint8Array | null {
@@ -96,7 +119,14 @@ function parseShare(value: JsonValue): RotateDekShareInput | null {
 
 export function registerRotateDekRoute(app: Express, context: RotateDekHostContext): void {
   const router = express.Router();
-  router.use(express.json({ limit: JSON_BODY_LIMIT }));
+  // SCOPED TO THE SYNC PREFIX, and the prefix is load-bearing. This router is
+  // mounted with `app.use(router)` at the ROOT, so an unscoped parser here runs
+  // on EVERY path in the service before routing. `express.json()` marks a
+  // request as parsed, so whichever parser runs first wins and every other
+  // router's declared limit becomes unreachable. That was a live defect until
+  // M192/03: it capped the AI proxy at the sync limit and, through the auth
+  // router, capped everything at 64 KB. See `accounts/register-auth-routes.ts`.
+  router.use(SYNC_API_PREFIX, express.json({ limit: JSON_BODY_LIMIT }));
 
   router.post(
     ROTATE_DEK_PATH,
@@ -131,6 +161,23 @@ export function registerRotateDekRoute(app: Express, context: RotateDekHostConte
         return;
       }
 
+      // THE NEW RECOVERY CREDENTIAL, both halves required (M192 addendum).
+      // Named errors rather than the generic body rejection: a client that
+      // predates the addendum needs to be told which field it is missing.
+      const newRecoveryAuthHash = parseAuthHashField(body.newRecoveryAuthHash, 'newRecoveryAuthHash');
+      if (!newRecoveryAuthHash.ok) {
+        res.status(400).json({ error: `rotate-dek requires ${newRecoveryAuthHash.reason}` });
+        return;
+      }
+      // THE SAME PARSER SIGNUP AND recover-rotate USE, so one recovery code has
+      // one canonical form everywhere: grouped or ungrouped text in, 32
+      // uppercase Crockford characters sealed.
+      const recoveryCode = parseRecoveryCode(body.recoveryCode);
+      if (!recoveryCode.ok) {
+        res.status(400).json({ error: `rotate-dek requires ${recoveryCode.reason}` });
+        return;
+      }
+
       const keyRecords: RotateDekKeyRecordInput[] = [];
       for (const entry of keyRecordEntries) {
         const record = parseKeyRecord(entry);
@@ -157,6 +204,16 @@ export function registerRotateDekRoute(app: Express, context: RotateDekHostConte
           blob: { baseVersion, envelopeVersion, ciphertext },
           keyRecords,
           shares,
+          // The raw code exists in this handler and inside `sealRecoveryCode`,
+          // and nowhere else. It is never logged and never returned.
+          recoveryVerifier: computeVerifier({
+            authHash: newRecoveryAuthHash.value,
+            pepper: context.recoveryCredentials.pepper,
+          }),
+          recoveryCodeEscrow: sealRecoveryCode({
+            code: recoveryCode.value,
+            escrowKey: context.recoveryCredentials.escrowKey,
+          }),
           sharingEnabled: context.sharingEnabled,
         },
         context.rotation,

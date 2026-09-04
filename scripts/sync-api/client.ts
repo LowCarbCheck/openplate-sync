@@ -41,20 +41,36 @@ export class CliError extends Error {
 }
 
 /** The verbs the admin API actually uses. Anything else is a typo, not a feature. */
-export type HttpMethod = 'GET' | 'POST' | 'DELETE';
+export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 /** The body of a mint request. The only request in this CLI that sends one. */
 export interface MintInviteRequestBody {
-  note: string | null;
+  /** Who the invite is for. Required: it becomes the account's identity at redemption. */
+  email: string;
+  displayName: string | null;
+  role?: string;
+  dailyAiLimit?: number;
   expiresInDays?: number;
+}
+
+/**
+ * The body of `PATCH /v1/admin/accounts/:id`. Every field optional and every
+ * absent field meaning "leave it alone", which is what lets the CLI's four
+ * one-shot commands share one endpoint.
+ */
+export interface AccountPatchBody {
+  role?: string;
+  dailyAiLimit?: number;
+  suspended?: boolean;
+  displayName?: string | null;
 }
 
 export interface AdminRequest {
   readonly method: HttpMethod;
   /** Absolute path on the service, e.g. `/v1/admin/accounts`. */
   readonly path: string;
-  /** Sent as JSON on a `POST`. Never carries a credential — the token stays in the header. */
-  readonly body?: MintInviteRequestBody;
+  /** Sent as JSON on a `POST` or a `PATCH`. Never carries a credential — the token stays in the header. */
+  readonly body?: MintInviteRequestBody | AccountPatchBody;
 }
 
 export interface AdminClientOptions {
@@ -130,7 +146,7 @@ export class AdminClient {
     return this.readJson(response, url);
   }
 
-  private async send(url: string, method: HttpMethod, body?: MintInviteRequestBody): Promise<Response> {
+  private async send(url: string, method: HttpMethod, body?: MintInviteRequestBody | AccountPatchBody): Promise<Response> {
     // Named rather than an open dictionary, so the one header that carries the
     // credential is part of a fixed shape and cannot be joined by a key some
     // later edit computes.

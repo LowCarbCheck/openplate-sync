@@ -16,7 +16,7 @@ import type {
   AdminStats,
   ListAccountsInput,
 } from '../../src/admin/admin-store.js';
-import type { SyncKeyRecordKind } from '../../src/protocol.js';
+import type { AccountRole, SyncKeyRecordKind } from '../../src/protocol.js';
 
 /**
  * The material an account really has in the database and which the admin API
@@ -28,11 +28,18 @@ export interface AdminSeedSecrets {
   wrappedDek: string;
   ciphertext: string;
   tokenHash: string;
+  /** The plaintext recovery code behind `accounts.recovery_code_escrow` — the newest thing that must never be emitted. */
+  recoveryCode: string;
 }
 
 export interface AdminSeedInput {
   id: number;
-  handle: string;
+  email: string;
+  displayName?: string | null;
+  role?: AccountRole;
+  dailyAiLimit?: number;
+  aiUsedToday?: number;
+  suspendedAt?: Date | null;
   blobSizeBytes?: number;
   keyRecordKinds?: SyncKeyRecordKind[];
 }
@@ -52,7 +59,12 @@ export function createFakeAdminStore(): FakeAdminStore {
       const kinds = input.keyRecordKinds ?? [];
       summaries.set(input.id, {
         id: input.id,
-        handle: input.handle,
+        email: input.email,
+        displayName: input.displayName ?? null,
+        role: input.role ?? 'member',
+        dailyAiLimit: input.dailyAiLimit ?? 0,
+        aiUsedToday: input.aiUsedToday ?? 0,
+        suspendedAt: input.suspendedAt ?? null,
         createdAt: new Date('2026-08-01T09:00:00.000Z'),
         blob:
           input.blobSizeBytes === undefined
@@ -67,6 +79,7 @@ export function createFakeAdminStore(): FakeAdminStore {
         wrappedDek: `wrappeddek-${input.id}-3aa71bd05fe6`,
         ciphertext: `ciphertext-${input.id}-0f9d8c7b6a5e4d3c`,
         tokenHash: `tokenhash-${input.id}-c1d2e3f4a5b6`,
+        recoveryCode: `RECOVERYCODE${String(input.id).padStart(2, '0')}ABCDEFGHJKMNPQR`,
       };
       secrets.set(input.id, seeded);
       return seeded;
@@ -82,8 +95,8 @@ export function createFakeAdminStore(): FakeAdminStore {
       return { accounts: ordered.slice(input.offset, input.offset + input.limit), total: ordered.length };
     },
 
-    async getAccount(accountId: number): Promise<AdminAccountSummary | null> {
-      return summaries.get(accountId) ?? null;
+    async getAccount(input: { accountId: number; day: string }): Promise<AdminAccountSummary | null> {
+      return summaries.get(input.accountId) ?? null;
     },
 
     async stats(): Promise<AdminStats> {
@@ -95,6 +108,12 @@ export function createFakeAdminStore(): FakeAdminStore {
         blobVersions: withBlob.length,
         keyRecords: all.reduce((total, account) => total + account.keyRecordKinds.length, 0),
         blobBytes: withBlob.reduce((total, account) => total + (account.blob?.sizeBytes ?? 0), 0),
+        // This fake holds no invites, so the count is what the store would
+        // report for an instance with none. `admins` and `aiRequestsToday` come
+        // off the seeded accounts, so they are real.
+        pendingInvites: 0,
+        admins: all.filter((account) => account.role === 'admin').length,
+        aiRequestsToday: all.reduce((total, account) => total + account.aiUsedToday, 0),
       };
     },
   };

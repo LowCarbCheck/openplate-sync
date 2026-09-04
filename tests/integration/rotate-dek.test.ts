@@ -20,9 +20,12 @@
  */
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { eq } from 'drizzle-orm';
+import { accounts } from '../../src/db/schema.js';
 import { setupTestDatabase, type TestDatabase } from './db-harness.js';
 import {
   sampleAuthHash,
+  sampleRecoveryCode,
   sampleCiphertext,
   sampleKdfDescriptor,
   sampleShareWrap,
@@ -32,11 +35,6 @@ import {
 } from './service-harness.js';
 
 const FINGERPRINT = 'K3TB-9WQZ-4M7N';
-
-interface SessionBody {
-  account: { id: number };
-  tokens: { accessToken: string } | null;
-}
 
 interface Party {
   accountId: number;
@@ -87,15 +85,16 @@ beforeEach(async () => {
   await database.reset();
 });
 
-async function signUp(handle: string, seed: number): Promise<Party> {
-  const response = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: { handle, authHash: sampleAuthHash(seed), kdfDescriptor: sampleKdfDescriptor(seed) },
+/**
+ * An account, created the only way this service can: an invite is minted and
+ * redeemed. `signupThroughInvite` is the harness's helper for exactly that.
+ */
+async function signUp(name: string, seed: number): Promise<Party> {
+  const session = await service.signupThroughInvite({
+    email: `${name}@example.org`,
+    authHash: sampleAuthHash(seed),
   });
-  assert.equal(response.status, 201, `signup for ${handle}`);
-  assert.ok(response.body.tokens);
-  return { accountId: response.body.account.id, accessToken: response.body.tokens.accessToken };
+  return { accountId: session.account.id, accessToken: session.tokens.accessToken };
 }
 
 /** The pre-rotation wraps, so every "did it change" assertion compares against known bytes. */
@@ -106,6 +105,9 @@ const NEW_RECOVERY_WRAP = sampleWrappedDek(22);
 const OLD_SHARE_WRAP = sampleShareWrap(31);
 const NEW_SHARE_WRAP = sampleShareWrap(41);
 const OLD_CIPHERTEXT = sampleCiphertext(17, 512);
+/** The recovery credential every rotation below mints (M192 addendum). */
+const NEW_RECOVERY_AUTH_HASH = sampleAuthHash(71);
+const NEW_RECOVERY_CODE = sampleRecoveryCode(5);
 const NEW_CIPHERTEXT = sampleCiphertext(23, 512);
 
 /** An account set up the way a real one is: one blob, both key records. */
@@ -120,11 +122,19 @@ async function setUpOwner(): Promise<Party> {
   });
   assert.equal(push.status, 200);
 
+  // ROTATIONS, not creations: signup wrote both records since M192, so the CAS
+  // token is the one each is carrying and `null` would be the 409 that says a
+  // record already exists. These replace the harness's generic wraps with the
+  // named ones every "did it change" assertion below compares against.
   const passphrase = await service.request({
     method: 'PUT',
     path: '/v1/sync/key-records/passphrase',
     accessToken: owner.accessToken,
-    body: { kdfDescriptor: sampleKdfDescriptor(41), wrappedDek: OLD_PASSPHRASE_WRAP, expectedUpdatedAt: null },
+    body: {
+      kdfDescriptor: sampleKdfDescriptor(41),
+      wrappedDek: OLD_PASSPHRASE_WRAP,
+      expectedUpdatedAt: await service.currentKeyRecordToken({ accessToken: owner.accessToken, kind: 'passphrase' }),
+    },
   });
   assert.equal(passphrase.status, 200);
 
@@ -132,7 +142,11 @@ async function setUpOwner(): Promise<Party> {
     method: 'PUT',
     path: '/v1/sync/key-records/recovery',
     accessToken: owner.accessToken,
-    body: { kdfDescriptor: null, wrappedDek: OLD_RECOVERY_WRAP, expectedUpdatedAt: null },
+    body: {
+      kdfDescriptor: null,
+      wrappedDek: OLD_RECOVERY_WRAP,
+      expectedUpdatedAt: await service.currentKeyRecordToken({ accessToken: owner.accessToken, kind: 'recovery' }),
+    },
   });
   assert.equal(recovery.status, 200);
 
@@ -156,6 +170,11 @@ function rotationBody(shares: { granteeAccountId: number; wrappedDek: string }[]
       { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(77), wrappedDek: NEW_PASSPHRASE_WRAP },
       { kind: 'recovery', kdfDescriptor: null, wrappedDek: NEW_RECOVERY_WRAP },
     ],
+    // BOTH REQUIRED (M192 addendum). The `recovery` wrap above is sealed under
+    // a KEK derived from this code, so the account's recovery verifier and its
+    // escrow move with it in the same transaction.
+    newRecoveryAuthHash: NEW_RECOVERY_AUTH_HASH,
+    recoveryCode: NEW_RECOVERY_CODE,
     shares: shares.map((share) => ({ ...share, recipientKeyFingerprint: FINGERPRINT })),
   };
 }
@@ -331,6 +350,93 @@ test('old DEK opens nothing after rotation: every wrap the server held for it is
   assert.equal(keptBlob.body.blobVersion, 2);
   assert.equal(keptBlob.body.ciphertext, NEW_CIPHERTEXT);
   assert.notEqual(keptBlob.body.ciphertext, OLD_CIPHERTEXT);
+});
+
+test('a rotation without the new recovery credential is a 400, and nothing moves', async () => {
+  // THE M192 ADDENDUM, pinned. The `recovery` key record a rotation re-wraps is
+  // sealed under a KEK derived from a code the client has just minted, so a
+  // rotation that left the account's recovery verifier and escrow on the OLD
+  // code produced an escrowed code that authenticated and unwrapped nothing.
+  // Latent since M181; fatal once a mailed reset started delivering that code.
+  const owner = await setUpOwner();
+  const complete = rotationBody([]);
+
+  for (const missing of ['newRecoveryAuthHash', 'recoveryCode'] as const) {
+    // Inference keeps the builder's own shape, so `delete` below names a key
+    // the compiler knows exists rather than an open dictionary's.
+    const body: Partial<ReturnType<typeof rotationBody>> = { ...complete };
+    delete body[missing];
+    const refused = await service.request<{ error: string }>({
+      method: 'POST',
+      path: '/v1/sync/rotate-dek',
+      accessToken: owner.accessToken,
+      body,
+    });
+    assert.equal(refused.status, 400, `omitting ${missing} must be refused`);
+    // The message NAMES the field: a client upgrading past the addendum has to
+    // be able to tell which one it forgot.
+    assert.match(refused.body.error, new RegExp(missing));
+  }
+
+  // A malformed code is refused too, by the same parser signup uses.
+  const badCode = await service.request({
+    method: 'POST',
+    path: '/v1/sync/rotate-dek',
+    accessToken: owner.accessToken,
+    body: { ...complete, recoveryCode: 'not-base32' },
+  });
+  assert.equal(badCode.status, 400);
+
+  // And nothing moved: the blob is still at the version `setUpOwner` left.
+  const blob = await readBlob(owner);
+  assert.equal(blob.blobVersion, 1);
+});
+
+test('a rotation replaces the recovery verifier and the escrow in the same transaction', async () => {
+  const owner = await setUpOwner();
+  const [rowBefore] = await database.db.select().from(accounts).where(eq(accounts.id, owner.accountId));
+  assert.ok(rowBefore?.recoveryCodeEscrow, 'signup must have written an escrow');
+
+  const rotated = await service.request({
+    method: 'POST',
+    path: '/v1/sync/rotate-dek',
+    accessToken: owner.accessToken,
+    body: rotationBody([]),
+  });
+  assert.equal(rotated.status, 200);
+
+  const [rowAfter] = await database.db.select().from(accounts).where(eq(accounts.id, owner.accountId));
+  assert.ok(rowAfter?.recoveryCodeEscrow);
+  assert.notDeepEqual(rowAfter.recoveryCodeEscrow, rowBefore.recoveryCodeEscrow, 'the escrow must be re-sealed');
+  assert.notEqual(rowAfter.recoveryVerifier, rowBefore.recoveryVerifier, 'the verifier must move with it');
+
+  // THE PROPERTY ALL OF THAT EXISTS FOR: the NEW code is what a mailed reset
+  // now hands back, and it is the code the re-wrapped `recovery` record is
+  // sealed under. Read through the real endpoints, not out of the column.
+  const requested = await service.request({
+    method: 'POST',
+    path: '/v1/auth/reset/request',
+    body: { email: 'patient@example.org' },
+  });
+  assert.equal(requested.status, 202);
+  const resetToken = service.mailer.resets.at(-1)?.resetToken;
+  assert.ok(resetToken, 'a reset must have been mailed');
+
+  const opened = await service.request<{ recoveryCode: string }>({
+    method: 'POST',
+    path: '/v1/auth/reset/open',
+    body: { resetToken },
+  });
+  assert.equal(opened.status, 200);
+  assert.equal(opened.body.recoveryCode, NEW_RECOVERY_CODE.replaceAll('-', ''));
+
+  // ...and it authenticates, which the OLD code no longer does.
+  const recovered = await service.request({
+    method: 'POST',
+    path: '/v1/auth/recover',
+    body: { email: 'patient@example.org', recoveryAuthHash: NEW_RECOVERY_AUTH_HASH },
+  });
+  assert.equal(recovered.status, 200);
 });
 
 test('rotation CAS: a stale baseVersion is refused, and the tokens a rotation writes survive the wire', async () => {

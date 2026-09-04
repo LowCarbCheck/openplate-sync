@@ -30,13 +30,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { setupTestDatabase, type TestDatabase } from './db-harness.js';
-import {
-  sampleAuthHash,
-  sampleContributionBody,
-  sampleKdfDescriptor,
-  startService,
-  type ServiceHarness,
-} from './service-harness.js';
+import { sampleAuthHash, sampleContributionBody, startService, type ServiceHarness } from './service-harness.js';
 
 /** Every path the research family would occupy if it were mounted. */
 const RESEARCH_ROUTES: readonly { method: string; path: string; body?: unknown }[] = [
@@ -62,11 +56,6 @@ let database: TestDatabase;
 let service: ServiceHarness;
 let accessToken: string;
 
-interface SessionBody {
-  account: { id: number };
-  tokens: { accessToken: string } | null;
-}
-
 before(async () => {
   database = await setupTestDatabase();
   // This file signs up in `before`, so it resets the database itself rather
@@ -75,14 +64,11 @@ before(async () => {
   // No `research: true` — this is how every deployment boots today. `sharing`
   // IS on, which is what makes the two flags' independence assertable below.
   service = await startService({ db: database.db, sharing: true });
-  const signup = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: { handle: 'dark-study', authHash: sampleAuthHash(61), kdfDescriptor: sampleKdfDescriptor(6) },
+  const session = await service.signupThroughInvite({
+    email: 'dark-study@example.org',
+    authHash: sampleAuthHash(61),
   });
-  assert.equal(signup.status, 201);
-  assert.ok(signup.body.tokens);
-  accessToken = signup.body.tokens.accessToken;
+  accessToken = session.tokens.accessToken;
 });
 
 after(async () => {
@@ -134,13 +120,18 @@ test('research disabled: the owner-only sync routes are untouched by the termina
   // prefix itself. If it ever widened, this is what would catch it.
   const blob = await service.request({ method: 'GET', path: '/v1/sync/blob', accessToken });
   assert.equal(blob.status, 404, 'a fresh account has no blob — but the route must still be the sync route');
-  const records = await service.request<{ records: unknown[] }>({
+  const records = await service.request<{ records: { kind: string }[] }>({
     method: 'GET',
     path: '/v1/sync/key-records',
     accessToken,
   });
+  // 200 WITH THE ACCOUNT'S OWN RECORDS is what proves this is the sync route
+  // and not the terminator — a 404 here would be the terminator having widened
+  // from its two subtrees onto the prefix itself. The list is no longer empty
+  // because signup writes both records (M192), which makes the assertion
+  // stronger: an empty list would also have been what a broken route returned.
   assert.equal(records.status, 200);
-  assert.deepEqual(records.body.records, []);
+  assert.deepEqual(records.body.records.map((record) => record.kind).toSorted(), ['passphrase', 'recovery']);
 });
 
 test('research disabled: SYNC_SHARING does not imply SYNC_RESEARCH', async () => {

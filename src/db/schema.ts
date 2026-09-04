@@ -21,16 +21,18 @@ import { relations, sql, type InferInsertModel, type InferSelectModel } from 'dr
 import {
   check,
   customType,
+  date,
   index,
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   serial,
   text,
   timestamp,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
-import type { SyncKeyRecordKind } from '../protocol.js';
+import type { AccountRole, SyncKeyRecordKind } from '../protocol.js';
 import type { AccountTokenKind } from '../lib/tokens.js';
 import type { KdfDescriptor } from '../lib/kdf-descriptor.js';
 import type { JsonObject } from '../lib/json.js';
@@ -52,10 +54,11 @@ const bytea = customType<{ data: Buffer; driverData: Buffer }>({
 // =============================================================================
 
 /**
- * DELIBERATELY MINIMAL. An account is an identity plus the material needed to
- * authenticate it — nothing else. There is no profile, no display avatar, no
- * settings blob, because everything a user actually owns lives inside the
- * encrypted sync blob that this service cannot read.
+ * DELIBERATELY MINIMAL, and since M192 minimal about an ORGANIZATION rather
+ * than about a stranger. An account is an identity, the material needed to
+ * authenticate it, and the standing an operator granted it. There is still no
+ * profile and no settings blob, because everything a user actually owns lives
+ * inside the encrypted sync blob that this service cannot read.
  *
  * Future community features do NOT extend this table with a second set of
  * credentials; they authenticate through a separate lane that shares only the
@@ -67,16 +70,88 @@ export const accounts = pgTable(
   {
     id: serial('id').primaryKey(),
     /**
-     * The account identifier, and the ONLY thing this service knows that a
-     * person chose. An opaque per-server string: the client mints a short one
-     * at signup and the user may edit it, the service never generates or
-     * suggests one, and an `'@'` is refused at the input layer
-     * (`accounts/auth-input.ts`) so this column cannot drift back into being
-     * an address register. Stored already-normalized — see the index below.
+     * The account identifier: the person's EMAIL ADDRESS, canonicalised.
+     *
+     * It replaced the opaque `handle` of M181 in M192, and the inversion is
+     * deliberate rather than a drift back (ADR-0005 supersedes ADR-0004's
+     * prohibition 1). A handle was the right identity for a beta of one and
+     * the wrong one for an organization: an employee who is invited by mail,
+     * signs in on a second device a month later, and forgets everything in
+     * between still knows their address. The address is also what makes an
+     * invitation and a password reset deliverable at all.
+     *
+     * Stored already-normalized — NFKC, trim, lowercase, at most 254
+     * characters, exactly one `@` (`accounts/auth-input.ts`'s `parseEmail`).
+     * See the index below for why normalizing before the write is what makes
+     * uniqueness true.
      */
-    handle: text('handle').notNull(),
-    /** Optional, cosmetic, and the ONLY non-authentication field here on purpose (see the table doc). */
+    email: text('email').notNull(),
+    /** Optional, cosmetic, editable by the owner and by an admin. */
     displayName: text('display_name'),
+    /**
+     * `'admin'` or `'member'`. An admin's own access token authenticates the
+     * `/v1/admin` tree (`server/admin-auth.ts`), beside the operator's static
+     * break-glass `ADMIN_TOKEN`.
+     *
+     * A TEXT COLUMN WITH A TYPE, not a Postgres enum: adding a role to an
+     * enum needs its own migration and a lock, and the set of roles here is a
+     * protocol constant (`protocol.ts`'s `ACCOUNT_ROLES`) that the input layer
+     * already validates.
+     */
+    role: text('role').$type<AccountRole>().default('member').notNull(),
+    /**
+     * How many AI requests this account may make per UTC day. `0` — the
+     * default, and what an invite that says nothing grants — means no AI at
+     * all, refused with `403 ai-not-allowed` rather than silently ignored.
+     * Spend is counted in `ai_usage_days`.
+     */
+    dailyAiLimit: integer('daily_ai_limit').default(0).notNull(),
+    /**
+     * Set when an operator suspends the account, `NULL` while it is in good
+     * standing. A suspended account cannot log in, refresh, sync or use AI:
+     * every such call is `403 {"error":"account-suspended"}`.
+     *
+     * NOT A DELETION, and deliberately reversible. Deletion is the erasure
+     * path and takes the ciphertext with it; suspension is the answer to
+     * "this person left on Friday and we are not sure yet", and it must be
+     * possible to undo without a restore.
+     */
+    suspendedAt: timestamp('suspended_at'),
+    /**
+     * The last time this account presented a live access token. Operator
+     * diagnostics only — never a rate limit, never an authorization input.
+     * Nullable because an account that has never signed in since the column
+     * existed has no honest value to report.
+     *
+     * WRITTEN BY THE AI PROXY ALONE (`ai/proxy.ts`), and deliberately not by
+     * the bearer middleware: that would be one UPDATE on every authenticated
+     * request, including every sync poll, to answer a question no code asks. A
+     * proxied completion is a request a person made on purpose, so the column
+     * means what an operator reads it as.
+     */
+    lastSeenAt: timestamp('last_seen_at'),
+    /**
+     * THE RECOVERY CODE, SEALED — and the one column on this service that a
+     * reader should stop and think about.
+     *
+     * `iv(12) ‖ AES-256-GCM(escrowKey, recoveryCode) ‖ tag(16)`, under a
+     * subkey of `SERVER_SECRET` derived at the frozen label
+     * `openplate-sync:escrow-key:v1` (`lib/server-secrets.ts`, `lib/escrow.ts`).
+     * The key lives in the environment, so a dumped table alone does not open
+     * it; the operator of a managed instance holds both, so the operator can.
+     *
+     * SAID PLAINLY: this is a decryption capability on the server, and
+     * ADR-0004 prohibition 5 forbade exactly that. ADR-0005 supersedes it with
+     * its eyes open. An organization cannot hand every employee a code they
+     * must never lose, and the operator of a managed instance already sees
+     * every plate photo that passes through the AI proxy. The self-hosted,
+     * personal instance keeps the old promise by simply being its own
+     * operator.
+     *
+     * NULLABLE only transiently: `POST /v1/auth/signup` always writes one, and
+     * an account with a `NULL` here is an account no mailed reset can restore.
+     */
+    recoveryCodeEscrow: bytea('recovery_code_escrow'),
     /**
      * `HMAC-SHA-256(serverPepper, clientAuthHash)`, hex — never the auth-hash
      * itself and never anything that can decrypt a blob. See
@@ -119,12 +194,12 @@ export const accounts = pgTable(
       .$onUpdate(() => new Date())
       .notNull(),
   },
-  // Handles are stored already-normalized (`lib/verifier.ts`'s
-  // `normalizeHandle`: NFKC, trim, lowercase), so a plain unique index is a
+  // Addresses are stored already-normalized (`lib/verifier.ts`'s
+  // `normalizeEmail`: NFKC, trim, lowercase), so a plain unique index is a
   // true case-insensitive AND Unicode-form-insensitive uniqueness guarantee.
-  // This index is also what makes concurrent signups for the same handle safe
+  // This index is also what makes concurrent signups for the same address safe
   // — never a read-then-insert check.
-  (table) => [uniqueIndex('accounts_handle_idx').on(table.handle)],
+  (table) => [uniqueIndex('accounts_email_idx').on(table.email)],
 );
 
 export type InsertAccount = InferInsertModel<typeof accounts>;
@@ -183,20 +258,28 @@ export type InsertAccountToken = InferInsertModel<typeof accountTokens>;
 export type SelectAccountToken = InferSelectModel<typeof accountTokens>;
 
 // =============================================================================
-// Signup invites (M166)
+// Signup invites (M166, addressed in M192)
 // =============================================================================
 
 /**
- * One single-use capability to create an account on an instance running
- * `SIGNUP_MODE=invite`.
+ * One single-use capability to create ONE named account. Signup is invite-only
+ * and always has been since M192: there is no open mode and no closed mode,
+ * so this table is the only door.
  *
- * DELIBERATELY NOT ADDRESSED TO ANYBODY. There is no column naming the person
- * it is for, and that is the design rather than an omission. Binding an invite
- * to an identifier would make this service store something about a person who
- * has NO account and gave no consent, and it would break the ordinary case
- * where somebody registers under a different name than the operator guessed.
- * `note` carries who the invite was for, in the operator's own words; the
- * service does not need to know.
+ * ADDRESSED TO ONE PERSON, which reverses M166's design on purpose. An invite
+ * used to name nobody, so that the service stored nothing about a person who
+ * had no account; it also meant the invite could not be mailed, the address
+ * had to be typed again at signup, and nothing verified it. Addressing the
+ * invite makes the mail deliverable and makes the invite ITSELF the address
+ * verification: the person who received it at that mailbox is the person who
+ * redeems it, and `POST /v1/auth/signup` reads the email from this row rather
+ * than from the request body, which is why the body cannot claim another
+ * address.
+ *
+ * The cost is stated rather than hidden: between minting and redemption this
+ * table holds the address, the display name and the allowance of somebody who
+ * has no account yet. An operator inviting their own colleagues is the case
+ * this service is for; `DELETE /v1/admin/invites/:id` withdraws the row.
  *
  * NOT IN `account_tokens`, though the lifecycle rhymes. Every row in that
  * table belongs to an account (`account_id` is `NOT NULL`), and an invite by
@@ -209,9 +292,30 @@ export const signupInvites = pgTable(
     id: serial('id').primaryKey(),
     /** SHA-256 hex of the raw token, exactly as `account_tokens` stores its own. The raw value is shown once, at mint, and never persisted. */
     tokenHash: text('token_hash').notNull(),
-    /** The operator's own label — who this was for, and why. Never parsed; never matched against a signup. */
-    note: text('note'),
+    /**
+     * The address this invite is for, canonicalised by the same `parseEmail`
+     * the account column uses. It becomes `accounts.email` at redemption and
+     * is never taken from the signup body.
+     */
+    email: text('email').notNull(),
+    /** What the operator typed as the person's name, carried onto the account at redemption. Optional. */
+    displayName: text('display_name'),
+    /** The role the redeemed account gets. Defaults to `member`; an operator inviting a second admin says so here. */
+    role: text('role').$type<AccountRole>().default('member').notNull(),
+    /** The daily AI allowance the redeemed account gets. `0` means no AI, which is what an invite that says nothing grants. */
+    dailyAiLimit: integer('daily_ai_limit').default(0).notNull(),
     expiresAt: timestamp('expires_at').notNull(),
+    /**
+     * Set when an operator withdraws a still-spendable invite, or when a newer
+     * invite for the same address supersedes it. A revoked invite is refused
+     * exactly as an expired one is, and with the same words.
+     *
+     * A COLUMN RATHER THAN A DELETE, unlike M166's `revoke`. An addressed
+     * invite is re-issued by superseding it (`POST /v1/admin/invites` for an
+     * address that already has a pending one), and an operator looking at the
+     * list needs to see that the first letter went out and was replaced.
+     */
+    revokedAt: timestamp('revoked_at'),
     /** Set once, by the transaction that also creates the account. NULL means still redeemable. */
     redeemedAt: timestamp('redeemed_at'),
     /**
@@ -233,11 +337,115 @@ export const signupInvites = pgTable(
     uniqueIndex('signup_invites_hash_idx').on(table.tokenHash),
     // Supports the operator listing outstanding invites newest-first.
     index('signup_invites_created_idx').on(table.createdAt),
+    // Supports "is there a pending invite for this address?", which every mint
+    // asks in order to supersede one. NOT unique: an address may legitimately
+    // have several rows over time — one redeemed, one revoked, one live.
+    index('signup_invites_email_idx').on(table.email),
   ],
 );
 
 export type InsertSignupInvite = InferInsertModel<typeof signupInvites>;
 export type SelectSignupInvite = InferSelectModel<typeof signupInvites>;
+
+// =============================================================================
+// Password resets (M192)
+// =============================================================================
+
+/**
+ * One single-use capability to be told this account's escrowed recovery code,
+ * once, at the address the account is named by.
+ *
+ * WHY THIS IS NOT THE MAILED RESET ADR-0004 DELETED. That flow let the link
+ * holder REPLACE the verifier and the key records: a takeover that returned no
+ * recovery, because the DEK stayed wrapped under keys the server never held.
+ * This one writes nothing to the account. It hands back the recovery code the
+ * server already holds in escrow (`accounts.recovery_code_escrow`), and the
+ * CLIENT then runs the ordinary `POST /v1/auth/recover-rotate` ceremony with
+ * it: prove the code, set a new passphrase, re-wrap the DEK, re-escrow a new
+ * code — one transaction, exactly as before. The link is a delivery mechanism
+ * for a credential the operator already has, never a new authority.
+ *
+ * The honest consequence is on `accounts.recovery_code_escrow`, not here: what
+ * makes this endpoint possible is that the operator holds what opens a diary.
+ *
+ * ONE LIVE TOKEN PER ACCOUNT. A new request marks every older unconsumed row
+ * for that account consumed, in the same transaction, so an old letter cannot
+ * be redeemed after a new one was asked for.
+ */
+export const passwordResets = pgTable(
+  'password_resets',
+  {
+    id: serial('id').primaryKey(),
+    accountId: integer('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** SHA-256 hex of the raw `sr_` token. The raw value exists only in the mail that was sent. */
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: timestamp('expires_at').notNull(),
+    /**
+     * Set once, by the statement that spends the token or by a later request
+     * that supersedes it. Rows are kept rather than deleted so a spent token
+     * is refused by the same predicate an expired one is, with no branch that
+     * could tell the two apart.
+     */
+    consumedAt: timestamp('consumed_at'),
+    createdAt: timestamp('created_at').defaultNow().notNull(),
+  },
+  (table) => [
+    // Lookup is always by digest, and a collision across accounts would hand
+    // one person another person's recovery code — uniqueness here is a
+    // security property, exactly as it is on `account_tokens`.
+    uniqueIndex('password_resets_hash_idx').on(table.tokenHash),
+    // Supports superseding an account's older unconsumed rows on every request.
+    index('password_resets_account_idx').on(table.accountId),
+  ],
+);
+
+export type InsertPasswordReset = InferInsertModel<typeof passwordResets>;
+export type SelectPasswordReset = InferSelectModel<typeof passwordResets>;
+
+// =============================================================================
+// AI usage (M192)
+// =============================================================================
+
+/**
+ * One row per account per UTC day: how many AI requests it has spent against
+ * `accounts.daily_ai_limit`.
+ *
+ * A COUNTER, NOT A LOG. There is no prompt, no response, no model, no
+ * timestamp beyond the day, and no request id — nothing here says what anybody
+ * asked. That is the whole design: a quota needs a number, and a number is all
+ * this table is allowed to hold on a service that stores health-adjacent data
+ * it cannot read.
+ *
+ * THE DAY IS UTC AND THE COLUMN IS A `date`, so the reset boundary is one the
+ * client and the server agree on without a timezone negotiation, and
+ * "yesterday" is never a range query. Rows accumulate at one per account per
+ * active day; nothing prunes them yet, which is a decision to revisit when an
+ * instance has years of them, not a leak.
+ *
+ * WRITTEN BY SPEC 03, which owns the proxy. Spec 01 creates the table and
+ * reads today's count for `AccountView.aiUsedToday`.
+ */
+export const aiUsageDays = pgTable(
+  'ai_usage_days',
+  {
+    accountId: integer('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    /** The UTC calendar day, `YYYY-MM-DD`. `mode: 'string'` because a date has no instant and a `Date` here would invent one. */
+    day: date('day', { mode: 'string' }).notNull(),
+    count: integer('count').default(0).notNull(),
+  },
+  (table) => [
+    // The composite primary key IS the upsert target: one row per account per
+    // day, reserved with an `ON CONFLICT DO UPDATE` that increments.
+    primaryKey({ columns: [table.accountId, table.day] }),
+  ],
+);
+
+export type InsertAiUsageDay = InferInsertModel<typeof aiUsageDays>;
+export type SelectAiUsageDay = InferSelectModel<typeof aiUsageDays>;
 
 // =============================================================================
 // Sync blobs (relocated from the openplate app, M128 spec 02)
@@ -594,6 +802,8 @@ export const accountsRelations = relations(accounts, ({ many }) => ({
   tokens: many(accountTokens),
   blobs: many(syncBlobs),
   keyRecords: many(syncKeyRecords),
+  passwordResets: many(passwordResets),
+  aiUsageDays: many(aiUsageDays),
   // Both directions of the share graph hang off the same account row; the
   // relation names say which end this account is standing at.
   sharesGranted: many(syncShares, { relationName: 'sharesGranted' }),
@@ -606,6 +816,14 @@ export const accountsRelations = relations(accounts, ({ many }) => ({
 
 export const accountTokensRelations = relations(accountTokens, ({ one }) => ({
   account: one(accounts, { fields: [accountTokens.accountId], references: [accounts.id] }),
+}));
+
+export const passwordResetsRelations = relations(passwordResets, ({ one }) => ({
+  account: one(accounts, { fields: [passwordResets.accountId], references: [accounts.id] }),
+}));
+
+export const aiUsageDaysRelations = relations(aiUsageDays, ({ one }) => ({
+  account: one(accounts, { fields: [aiUsageDays.accountId], references: [accounts.id] }),
 }));
 
 export const syncBlobsRelations = relations(syncBlobs, ({ one }) => ({

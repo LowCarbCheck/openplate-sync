@@ -28,6 +28,12 @@ function request(overrides: Partial<RotateDekRequest> = {}): RotateDekRequest {
       { kind: 'recovery', kdfDescriptor: null, wrappedDek: new Uint8Array(60).fill(2) },
     ],
     shares: [],
+    // Already derived by the route from `newRecoveryAuthHash` and
+    // `recoveryCode` (M192 addendum): by the time the handler sees them they
+    // are a verifier and a sealed blob, which is why "missing" is refused in
+    // the route and not here.
+    recoveryVerifier: 'a'.repeat(64),
+    recoveryCodeEscrow: new Uint8Array(60).fill(9),
     sharingEnabled: true,
     ...overrides,
   };

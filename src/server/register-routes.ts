@@ -80,7 +80,14 @@ async function requireEntitledUser(
 
 export function registerSyncRoutes(app: Express, context: SyncHostContext): void {
   const router = express.Router();
-  router.use(express.json({ limit: JSON_BODY_LIMIT }));
+  // SCOPED TO THE SYNC PREFIX, and the prefix is load-bearing. This router is
+  // mounted with `app.use(router)` at the ROOT, so an unscoped parser here runs
+  // on EVERY path in the service before routing. `express.json()` marks a
+  // request as parsed, so whichever parser runs first wins and every other
+  // router's declared limit becomes unreachable. That was a live defect until
+  // M192/03: it capped the AI proxy at the sync limit and, through the auth
+  // router, capped everything at 64 KB. See `accounts/register-auth-routes.ts`.
+  router.use(SYNC_ROUTE_PREFIX, express.json({ limit: JSON_BODY_LIMIT }));
 
   router.post(`${SYNC_ROUTE_PREFIX}/blob`, async (req, res, next) => {
     try {

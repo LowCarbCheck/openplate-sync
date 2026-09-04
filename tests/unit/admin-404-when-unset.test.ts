@@ -41,7 +41,7 @@ const VALID_LOOKING_TOKEN = 'a'.repeat(48);
 
 before(async () => {
   harness = await startAdminHarness({ adminToken: null });
-  harness.admin.seed({ id: 1, handle: 'seeded' });
+  harness.admin.seed({ id: 1, email: 'seeded@example.org' });
 });
 
 after(async () => {

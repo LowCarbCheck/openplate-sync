@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 import { setupTestDatabase, type TestDatabase } from './db-harness.js';
 import {
   sampleAuthHash,
+  sampleRecoveryCode,
   sampleCiphertext,
   sampleKdfDescriptor,
   sampleShareWrap,
@@ -50,11 +51,6 @@ let database: TestDatabase;
 let service: ServiceHarness;
 let accessToken: string;
 
-interface SessionBody {
-  account: { id: number };
-  tokens: { accessToken: string } | null;
-}
-
 before(async () => {
   database = await setupTestDatabase();
   // This file signs up once, in `before`, so it resets the database itself
@@ -62,14 +58,11 @@ before(async () => {
   await database.reset();
   // No `sharing: true` — this is how every deployment boots today.
   service = await startService({ db: database.db });
-  const signup = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: { handle: 'dark-otter', authHash: sampleAuthHash(31), kdfDescriptor: sampleKdfDescriptor() },
+  const session = await service.signupThroughInvite({
+    email: 'dark-otter@example.org',
+    authHash: sampleAuthHash(31),
   });
-  assert.equal(signup.status, 201);
-  assert.ok(signup.body.tokens);
-  accessToken = signup.body.tokens.accessToken;
+  accessToken = session.tokens.accessToken;
 });
 
 after(async () => {
@@ -121,26 +114,28 @@ test('sharing disabled: the owner-only sync routes are untouched by the terminat
   // prefix itself. If it ever widened, this is what would catch it.
   const blob = await service.request({ method: 'GET', path: '/v1/sync/blob', accessToken });
   assert.equal(blob.status, 404, 'a fresh account has no blob — but the route must still be the sync route');
-  const records = await service.request<{ records: unknown[] }>({
+  const records = await service.request<{ records: { kind: string }[] }>({
     method: 'GET',
     path: '/v1/sync/key-records',
     accessToken,
   });
+  // 200 WITH THE ACCOUNT'S OWN RECORDS is what proves this is the sync route
+  // and not the terminator — a 404 here would be the terminator having widened
+  // from its two subtrees onto the prefix itself. The list is no longer empty
+  // because signup writes both records (M192), which makes the assertion
+  // stronger: an empty list would also have been what a broken route returned.
   assert.equal(records.status, 200);
-  assert.deepEqual(records.body.records, []);
+  assert.deepEqual(records.body.records.map((record) => record.kind).toSorted(), ['passphrase', 'recovery']);
 });
 
 test('sharing disabled: rotate-dek is NOT part of the dark surface, and refuses a keep list', async () => {
   // Uses its OWN account, so the fresh-account assertions above stay true
   // whatever order these run in.
-  const signup = await service.request<SessionBody>({
-    method: 'POST',
-    path: '/v1/auth/signup',
-    body: { handle: 'rotator-otter', authHash: sampleAuthHash(32), kdfDescriptor: sampleKdfDescriptor(2) },
+  const session = await service.signupThroughInvite({
+    email: 'rotator-otter@example.org',
+    authHash: sampleAuthHash(32),
   });
-  assert.equal(signup.status, 201);
-  assert.ok(signup.body.tokens);
-  const owner = signup.body.tokens.accessToken;
+  const owner = session.tokens.accessToken;
 
   const keyRecords = [
     { kind: 'passphrase', kdfDescriptor: sampleKdfDescriptor(2), wrappedDek: sampleWrappedDek(51) },
@@ -161,6 +156,9 @@ test('sharing disabled: rotate-dek is NOT part of the dark surface, and refuses 
     body: {
       blob: { baseVersion: 0, envelopeVersion: 1, ciphertext: sampleCiphertext(29, 128) },
       keyRecords,
+      // Required since the M192 addendum: a rotation always mints a new code.
+      newRecoveryAuthHash: sampleAuthHash(71),
+      recoveryCode: sampleRecoveryCode(5),
       shares: [],
     },
   });
@@ -178,6 +176,8 @@ test('sharing disabled: rotate-dek is NOT part of the dark surface, and refuses 
     body: {
       blob: { baseVersion: 1, envelopeVersion: 1, ciphertext: sampleCiphertext(30, 128) },
       keyRecords,
+      newRecoveryAuthHash: sampleAuthHash(71),
+      recoveryCode: sampleRecoveryCode(5),
       shares: [{ granteeAccountId: 1, wrappedDek: sampleShareWrap(), recipientKeyFingerprint: 'ABCD' }],
     },
   });

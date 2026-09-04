@@ -29,7 +29,7 @@
  * command in this tool that cannot be undone.
  */
 import { parseArgs } from 'node:util';
-import { AdminClient, CliError, type MintInviteRequestBody } from './client.js';
+import { AdminClient, CliError, type AccountPatchBody, type MintInviteRequestBody } from './client.js';
 import {
   decodeAccountPage,
   decodeHandshake,
@@ -42,6 +42,7 @@ import {
   decodeMintedInvite,
   formatInviteTable,
   formatMintedInvite,
+  decodeResetMail,
 } from './views.js';
 
 const DEFAULT_BASE_URL = 'http://localhost:3000';
@@ -56,9 +57,15 @@ const USAGE = `sync-api — the openplate-sync admin CLI
     accounts list              List accounts (metadata only)
     accounts get <id>          One account's metadata
     accounts delete <id> --yes Erase an account and everything attached to it
+    accounts set-role <id> admin|member   Change what an account may do
+    accounts set-limit <id> <n>           Change its AI requests per UTC day
+    accounts suspend <id>      Lock it out and revoke every session, reversibly
+    accounts reactivate <id>   Let it back in
     invites list               Outstanding and spent signup invites
-    invites create             Mint one invite; prints the token ONCE
+    invites create --email <address>   Mint one addressed invite; prints the link ONCE
+    invites resend <id>        Mint a NEW token for the same invite and send it
     invites revoke <id> --yes  Withdraw an unredeemed invite
+    accounts reset-mail <id>   Send this account a password-reset letter
 
   Options:
     --url <base>   Service base URL (default: SYNC_SERVER_URL, else ${DEFAULT_BASE_URL})
@@ -66,9 +73,11 @@ const USAGE = `sync-api — the openplate-sync admin CLI
     --offset <n>   Page offset for "accounts list" (default 0)
     --json         Print the decoded response as JSON (read commands only)
     --yes          Required by "accounts delete" and "invites revoke"
-    --note <text>  Who an invite is for. Stored as an operator label only
-    --expires-in-days <n>  Invite lifetime, 1–365 (default 14)
-    --client-url <base>    Render the invite as a sign-up link on this origin
+    --email <address>      Who the invite is for. Becomes the account's identity
+    --display-name <text>  The person's name, carried onto the account
+    --role <admin|member>  What the redeemed account may do (default member)
+    --daily-ai-limit <n>   AI requests a day for the redeemed account (default 0)
+    --expires-in-days <n>  Invite lifetime, 1–30 (default 7)
 
   Authentication:
     ADMIN_TOKEN must be set in the environment. There is no --token flag, on
@@ -80,9 +89,11 @@ interface Invocation {
   baseUrl: string;
   limit: string | null;
   offset: string | null;
-  note: string | null;
+  email: string | null;
+  displayName: string | null;
+  role: string | null;
+  dailyAiLimit: string | null;
   expiresInDays: string | null;
-  clientUrl: string | null;
   json: boolean;
   yes: boolean;
   help: boolean;
@@ -96,9 +107,11 @@ function parseInvocation(argv: string[]): Invocation {
       url: { type: 'string' },
       limit: { type: 'string' },
       offset: { type: 'string' },
-      note: { type: 'string' },
+      email: { type: 'string' },
+      'display-name': { type: 'string' },
+      role: { type: 'string' },
+      'daily-ai-limit': { type: 'string' },
       'expires-in-days': { type: 'string' },
-      'client-url': { type: 'string' },
       json: { type: 'boolean', default: false },
       yes: { type: 'boolean', default: false },
       help: { type: 'boolean', default: false },
@@ -111,9 +124,11 @@ function parseInvocation(argv: string[]): Invocation {
     baseUrl: parsed.values.url ?? process.env.SYNC_SERVER_URL ?? DEFAULT_BASE_URL,
     limit: parsed.values.limit ?? null,
     offset: parsed.values.offset ?? null,
-    note: parsed.values.note ?? null,
+    email: parsed.values.email ?? null,
+    displayName: parsed.values['display-name'] ?? null,
+    role: parsed.values.role ?? null,
+    dailyAiLimit: parsed.values['daily-ai-limit'] ?? null,
     expiresInDays: parsed.values['expires-in-days'] ?? null,
-    clientUrl: parsed.values['client-url'] ?? process.env.CLIENT_BASE_URL ?? null,
     json: parsed.values.json === true,
     yes: parsed.values.yes === true,
     help: parsed.values.help === true,
@@ -129,6 +144,23 @@ function requireAdminToken(): string {
     );
   }
   return token;
+}
+
+/** The role argument of `accounts set-role`, or a refusal. Checked here so an obvious typo costs no round trip. */
+function roleFrom(value: string): AccountPatchBody {
+  if (value !== 'admin' && value !== 'member') {
+    throw new CliError('accounts set-role needs a role: `accounts set-role <id> admin` or `... member`.');
+  }
+  return { role: value };
+}
+
+/** The allowance argument of `accounts set-limit`, or a refusal. `0` is meaningful: it turns AI off for the account. */
+function limitFrom(value: string): AccountPatchBody {
+  const limit = Number(value);
+  if (!Number.isInteger(limit) || limit < 0) {
+    throw new CliError('accounts set-limit needs a whole number of requests a day, 0 or more.');
+  }
+  return { dailyAiLimit: limit };
 }
 
 function inviteIdArgument(invocation: Invocation): string {
@@ -190,7 +222,64 @@ async function runAccounts(client: AdminClient, invocation: Invocation): Promise
     return;
   }
 
-  throw new CliError(`Unknown accounts subcommand "${subcommand}". Try: list, get, delete.`);
+  if (subcommand === 'reset-mail') {
+    const id = accountIdArgument(invocation);
+    const sent = decodeResetMail(await client.request({ method: 'POST', path: `/v1/admin/accounts/${id}/reset-mail` }));
+    if (sent.emailed) {
+      print(`A password-reset letter was sent to account ${decodeURIComponent(id)}.`);
+      return;
+    }
+    // No mail on this instance, so the operator carries the link. It opens the
+    // account's recovery code ONCE, so it goes to the account holder and to
+    // nobody else.
+    print(
+      [
+        `This instance sends no mail, so nothing was sent to account ${decodeURIComponent(id)}.`,
+        '',
+        'Give this link to the account holder and to nobody else. It works once.',
+        '',
+        sent.link ?? '(no link: set CLIENT_BASE_URL and SERVER_PUBLIC_URL on the service)',
+      ].join('\n'),
+    );
+    return;
+  }
+
+  if (subcommand === 'set-role' || subcommand === 'set-limit') {
+    const id = accountIdArgument(invocation);
+    // The third positional, because a value this short is clearer beside the id
+    // than behind a flag: `accounts set-role 7 admin` reads as the sentence it is.
+    const value = invocation.command[3] ?? '';
+    const patch = subcommand === 'set-role' ? roleFrom(value) : limitFrom(value);
+    const account = decodeSingleAccount(
+      await client.request({ method: 'PATCH', path: `/v1/admin/accounts/${id}`, body: patch }),
+    );
+    print(invocation.json ? JSON.stringify(account, null, 2) : formatAccountDetail(account));
+    return;
+  }
+
+  if (subcommand === 'suspend' || subcommand === 'reactivate') {
+    const id = accountIdArgument(invocation);
+    const account = decodeSingleAccount(
+      await client.request({
+        method: 'PATCH',
+        path: `/v1/admin/accounts/${id}`,
+        body: { suspended: subcommand === 'suspend' },
+      }),
+    );
+    if (subcommand === 'suspend') {
+      // Say what it did rather than only that it worked: revoking the sessions
+      // is the half an operator does not see in the row.
+      print(`Suspended account ${decodeURIComponent(id)}. Every session is revoked and its next request is refused.`);
+    } else {
+      print(`Reactivated account ${decodeURIComponent(id)}. It signs in again with its own password.`);
+    }
+    if (invocation.json) print(JSON.stringify(account, null, 2));
+    return;
+  }
+
+  throw new CliError(
+    `Unknown accounts subcommand "${subcommand}". Try: list, get, delete, set-role, set-limit, suspend, reactivate, reset-mail.`,
+  );
 }
 
 async function runInvites(client: AdminClient, invocation: Invocation): Promise<void> {
@@ -205,22 +294,51 @@ async function runInvites(client: AdminClient, invocation: Invocation): Promise<
   }
 
   if (subcommand === 'create') {
-    const body: MintInviteRequestBody = { note: invocation.note };
+    // Checked BEFORE the request is built. An invite with no address is not an
+    // invite: the address is what the letter goes to and what the account is
+    // identified by, and there is nothing sensible to default it to.
+    if (invocation.email === null || invocation.email.trim() === '') {
+      throw new CliError('invites create needs --email <address>: an invite is addressed to one person.');
+    }
+
+    const body: MintInviteRequestBody = { email: invocation.email.trim(), displayName: invocation.displayName };
+    if (invocation.role !== null) {
+      // Rejected here as well as by the service, so an obvious typo costs no
+      // round trip and cannot mint an invite nobody meant.
+      if (invocation.role !== 'admin' && invocation.role !== 'member') {
+        throw new CliError('--role must be "admin" or "member".');
+      }
+      body.role = invocation.role;
+    }
+    if (invocation.dailyAiLimit !== null) {
+      const limit = Number(invocation.dailyAiLimit);
+      if (!Number.isInteger(limit) || limit < 0) {
+        throw new CliError('--daily-ai-limit must be a whole number of requests, 0 or more.');
+      }
+      body.dailyAiLimit = limit;
+    }
     if (invocation.expiresInDays !== null) {
       const days = Number(invocation.expiresInDays);
-      // Rejected here as well as by the service, so an obvious typo costs no
-      // round trip and cannot mint an invite with a lifetime nobody meant.
       if (!Number.isInteger(days) || days <= 0) {
-        throw new CliError('--expires-in-days must be a whole number of days, 1–365.');
+        throw new CliError('--expires-in-days must be a whole number of days, 1–30.');
       }
       body.expiresInDays = days;
     }
 
     const minted = decodeMintedInvite(await client.request({ method: 'POST', path: '/v1/admin/invites', body }));
-    // The token IS printed — this is the one command whose whole purpose is to
-    // hand the operator a secret. It is not logged by the service and cannot
-    // be fetched again.
-    print(invocation.json ? JSON.stringify(minted, null, 2) : formatMintedInvite(minted, invocation.clientUrl));
+    // The capability IS printed — this is the one command whose whole purpose
+    // is to hand the operator a secret. It is not logged by the service and
+    // cannot be fetched again.
+    print(invocation.json ? JSON.stringify(minted, null, 2) : formatMintedInvite(minted));
+    return;
+  }
+
+  if (subcommand === 'resend') {
+    const id = inviteIdArgument(invocation);
+    const resent = decodeMintedInvite(await client.request({ method: 'POST', path: `/v1/admin/invites/${id}/resend` }));
+    // A NEW token on the same invite, so the previous link is dead. Printed
+    // under the same rule `create` uses: the capability is shown once.
+    print(invocation.json ? JSON.stringify(resent, null, 2) : formatMintedInvite(resent));
     return;
   }
 
@@ -237,7 +355,7 @@ async function runInvites(client: AdminClient, invocation: Invocation): Promise<
     return;
   }
 
-  throw new CliError(`Unknown invites subcommand "${subcommand}". Try: list, create, revoke.`);
+  throw new CliError(`Unknown invites subcommand "${subcommand}". Try: list, create, resend, revoke.`);
 }
 
 async function runStatus(client: AdminClient, invocation: Invocation): Promise<void> {
@@ -252,6 +370,7 @@ async function runStatus(client: AdminClient, invocation: Invocation): Promise<v
   }
   print(
     [
+      `instance        ${handshake.instanceName ?? 'unnamed'}`,
       `service         ${handshake.serviceVersion}`,
       `protocol        v${handshake.protocolVersion} (envelope v${handshake.envelopeVersion})`,
       `admin API       reachable, token accepted`,

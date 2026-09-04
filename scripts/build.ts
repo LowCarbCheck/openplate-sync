@@ -7,7 +7,7 @@
  * externals, rather than a `node_modules` tree a self-hoster has to trust and
  * scan, and the artifact is reproducible from one command.
  *
- * WHY THESE THREE ARE EXTERNAL:
+ * WHY THESE FOUR ARE EXTERNAL:
  *  - `pg` resolves optional native/dialect helpers at runtime; bundling it is a
  *    well-known source of "cannot find module" failures that only appear in
  *    production.
@@ -19,6 +19,11 @@
  *    unit or integration test can see, because neither runs `dist/`. Found by
  *    actually starting the built image; the lesson is that "the bundle builds"
  *    and "the bundle runs" are different claims.
+ *  - `undici` is the AI proxy's HTTP client (`src/ai/proxy.ts`), and it is
+ *    there because Node's global `fetch` caps `headersTimeout` at 300 s in a
+ *    way an `AbortSignal` cannot raise. It ships native-ish internals and its
+ *    own dispatcher registry, so a bundled second copy would be a second
+ *    connection pool with the operator's provider key in it.
  *
  * All four are ordinary production dependencies installed into the image
  * (`pnpm install --prod`), so the bundle resolves them at runtime.
@@ -107,7 +112,7 @@ async function main(): Promise<void> {
     platform: 'node',
     format: 'esm',
     target: 'node20',
-    external: ['express', 'pg', 'dotenv'],
+    external: ['express', 'pg', 'dotenv', 'undici'],
     sourcemap: true,
     logLevel: 'info',
     define: { 'globalThis.__SERVICE_VERSION__': JSON.stringify(await packageVersion()) },

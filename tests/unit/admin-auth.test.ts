@@ -18,6 +18,7 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { hashToken } from '../../src/lib/tokens.js';
 import { startAdminHarness, type AdminHarness } from './admin-harness.js';
 
 const ADMIN_TOKEN = 'admin-token-for-the-unit-suite-0123456789';
@@ -26,7 +27,7 @@ let harness: AdminHarness;
 
 before(async () => {
   harness = await startAdminHarness({ adminToken: ADMIN_TOKEN });
-  harness.admin.seed({ id: 7, handle: 'operator-can-see-me' });
+  harness.admin.seed({ id: 7, email: 'operator@example.org' });
 });
 
 after(async () => {
@@ -105,4 +106,71 @@ test('the presented token is never echoed, in the response or the log', async ()
     harness.logLines.some((line) => line.message === 'Admin request rejected'),
     'an admin rejection must be logged',
   );
+});
+
+// ── An admin ACCOUNT's own access token (M192) ─────────────────────────────
+
+test("an admin account's own access token reaches the admin API", async () => {
+  // The console lives in the client at /admin, behind the same sign-in as
+  // everything else, so the person using it holds a session rather than a
+  // shell variable. This is the credential that makes that possible.
+  const admin = await harness.fakeAccounts.seedAccount({ email: 'boss@example.org', role: 'admin' });
+  await harness.fakeAccounts.insertTokens([
+    {
+      accountId: admin.id,
+      kind: 'access',
+      tokenHash: hashToken('an-admin-session-token'),
+      familyId: 'family-admin',
+      expiresAt: new Date(harness.fixture.now().getTime() + 60_000),
+    },
+  ]);
+
+  const response = await harness.request({
+    method: 'GET',
+    path: '/v1/admin/stats',
+    token: 'an-admin-session-token',
+  });
+  assert.equal(response.status, 200);
+});
+
+test("a MEMBER's valid session gets the same answer a garbage token gets", async () => {
+  // Saying "you are signed in but not an admin" would confirm to any account
+  // holder that the surface exists and is worth attacking from another angle.
+  const member = await harness.fakeAccounts.seedAccount({ email: 'member@example.org', role: 'member' });
+  await harness.fakeAccounts.insertTokens([
+    {
+      accountId: member.id,
+      kind: 'access',
+      tokenHash: hashToken('a-member-session-token'),
+      familyId: 'family-member',
+      expiresAt: new Date(harness.fixture.now().getTime() + 60_000),
+    },
+  ]);
+
+  const asMember = await requestWithHeader('/v1/admin/stats', 'Bearer a-member-session-token');
+  const asGarbage = await requestWithHeader('/v1/admin/stats', `Bearer ${'z'.repeat(41)}`);
+  assert.equal(asMember.status, 401);
+  assert.equal(asMember.status, asGarbage.status);
+  assert.equal(await asMember.text(), await asGarbage.text());
+});
+
+test('a SUSPENDED admin gets 403 account-suspended, not 401 and not a way in', async () => {
+  const admin = await harness.fakeAccounts.seedAccount({ email: 'suspended-boss@example.org', role: 'admin' });
+  await harness.fakeAccounts.suspendAccount({ accountId: admin.id, suspendedAt: harness.fixture.now() });
+  // Minted AFTER the suspension revoked everything, so the token itself is
+  // live and the account is not — the combination the middleware must catch.
+  await harness.fakeAccounts.insertTokens([
+    {
+      accountId: admin.id,
+      kind: 'access',
+      tokenHash: hashToken('a-suspended-admin-token'),
+      familyId: 'family-suspended',
+      expiresAt: new Date(harness.fixture.now().getTime() + 60_000),
+    },
+  ]);
+
+  const response = await requestWithHeader('/v1/admin/stats', 'Bearer a-suspended-admin-token');
+  assert.equal(response.status, 403);
+  // They have proved who they are; the honest answer is why the door is shut.
+  assert.match(await response.text(), /account-suspended/);
 });

@@ -4,34 +4,53 @@
  * status code and wires the per-IP throttle, which is the one concern that
  * genuinely needs the request object (`req.ip`).
  *
- * `express.json()` is applied to THIS router only, with a small limit. The
- * blob router mounts its own, far larger one (`server/register-routes.ts`) —
- * a 2 MiB body limit has no business anywhere near a login endpoint.
+ * `express.json()` is applied to the `/v1/auth` PREFIX only, with a small
+ * limit. Other routers mount their own, far larger ones
+ * (`server/register-routes.ts`, `ai/register-ai-route.ts`) — a multi-megabyte
+ * body limit has no business anywhere near a login endpoint.
+ *
+ * THE PREFIX ON THAT `use` IS LOAD-BEARING, and its absence was a live defect
+ * until M192/03. This router is mounted with `app.use(router)` — at the ROOT,
+ * with no path — so a `router.use(parser)` with no path of its own ran the
+ * 64 KB parser on EVERY request to EVERY path in the service, before routing.
+ * `express.json()` marks a request as parsed, so the second parser on the
+ * blob, share, research and AI routers found the work already done and their
+ * own declared limits were unreachable. The observable effect: a blob push
+ * over 64 KB answered `413` even though `MAX_BLOB_BYTES` is 2 MiB, and every
+ * plate photograph posted to `/v1/chat/completions` did too. Nothing caught
+ * it because no test in either tier ever sent a body larger than a sentence.
  *
  * THROTTLE POLICY, per route and deliberately different:
- *  - **login** — keyed by IP **and** handle, cleared on success. Slows a
+ *  - **login** — keyed by IP **and** email, cleared on success. Slows a
  *    single-source brute force without letting anyone lock a victim out of
  *    their own account from a different IP.
- *  - **recover** and **recover-rotate** — keyed by IP **and** handle, exactly
+ *  - **recover** and **recover-rotate** — keyed by IP **and** email, exactly
  *    like login and for the same reason, but they matter more: both accept a
  *    guess at the ONE authenticator left to a user who has lost their
  *    passphrase, and a success on either hands over the account. Neither is
  *    cleared on success — a legitimate recovery happens once, so there is no
  *    honest client that needs its allowance back.
- *  - **signup** and **kdf** — keyed by IP ALONE, and every attempt counts,
- *    successful or not. These are volume controls (account-farming, bulk
- *    handle probing), not credential guards, and keying them by the submitted
- *    handle would let an attacker evade them by simply rotating handles —
- *    which is precisely the attack, in the `kdf` case.
+ *  - **reset/request** — keyed by IP **and** email, never cleared, for the
+ *    same reason. It does not accept a guess at anything, but it is the one
+ *    endpoint whose two branches do measurably different work (one INSERT and
+ *    one mail send on the known branch), and a residual timing signal that
+ *    small only emerges from many samples per address. It is also what a
+ *    caller would use to fill somebody's mailbox.
+ *  - **signup**, **kdf**, **invite-lookup** and **reset/open** — keyed by IP
+ *    ALONE, and every attempt counts, successful or not. These are volume
+ *    controls (account-farming, bulk address probing, token guessing), not
+ *    credential guards, and keying them by a submitted value would let an
+ *    attacker evade them by simply rotating it — which is precisely the
+ *    attack, in the `kdf` case.
  *
  * `kdf` is throttled for two reasons that are easy to miss because its
- * RESPONSE already gives nothing away (unknown handles get a real-shaped
+ * RESPONSE already gives nothing away (unknown addresses get a real-shaped
  * dummy). First, it is an unauthenticated endpoint that hits the database on
  * every call, so without a bound it is free amplification. Second, the
  * indistinguishability is statistical, not absolute: `handleGetKdfDescriptor`
  * equalises the work both branches do, but no server-side measure makes two
  * paths bit-identical in wall-clock terms, and a timing signal that small only
- * emerges from many samples per handle. Denying the samples is what closes
+ * emerges from many samples per address. Denying the samples is what closes
  * the gap. Its traffic is genuinely low — a client fetches a descriptor on a
  * fresh login, and refresh tokens last 30 days — so the shared allowance is
  * not a burden on a household behind one NAT.
@@ -44,12 +63,16 @@ import {
   handleDeleteAccount,
   handleGetAccount,
   handleGetKdfDescriptor,
+  handleInviteLookup,
   handleLogin,
   handleLogout,
   handleRecover,
   handleRecoverRotate,
   handleRefresh,
+  handleResetOpen,
+  handleResetRequest,
   handleSignup,
+  handleUpdateAccount,
 } from './auth-handlers.js';
 import { getRequestSession } from '../server/bearer-auth.js';
 import { throttleKey, type ThrottleStore } from '../lib/throttle.js';
@@ -78,6 +101,9 @@ function sendOutcome<T>(res: Response, outcome: AuthOutcome<T>): void {
     case 'created':
       res.status(201).json(outcome.body);
       return;
+    case 'accepted':
+      res.status(202).json(outcome.body);
+      return;
     case 'no-content':
       res.status(204).end();
       return;
@@ -89,6 +115,9 @@ function sendOutcome<T>(res: Response, outcome: AuthOutcome<T>): void {
       return;
     case 'forbidden':
       res.status(403).json({ error: outcome.reason });
+      return;
+    case 'not-found':
+      res.status(404).json({ error: outcome.reason });
       return;
     case 'conflict':
       res.status(409).json({ error: outcome.reason });
@@ -115,7 +144,9 @@ function clientIp(req: Request): string {
 export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): void {
   const { ctx, throttle, requireAuth } = options;
   const router = express.Router();
-  router.use(express.json({ limit: AUTH_JSON_BODY_LIMIT }));
+  // SCOPED TO THE PREFIX. See the module header: unscoped, this parser applies
+  // to every path in the service and silently caps them all at 64 KB.
+  router.use(AUTH_API_PREFIX, express.json({ limit: AUTH_JSON_BODY_LIMIT }));
 
   router.post(`${AUTH_API_PREFIX}/kdf`, async (req, res, next) => {
     try {
@@ -125,12 +156,30 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
         sendThrottled(res, decision.retryAfterMs);
         return;
       }
-      // Counts every attempt. Keying this by the submitted handle would be
-      // worse than useless: probing many handles is the attack, so a
-      // per-handle bucket would hand the attacker a fresh allowance for each
+      // Counts every attempt. Keying this by the submitted address would be
+      // worse than useless: probing many addresses is the attack, so a
+      // per-address bucket would hand the attacker a fresh allowance for each
       // one he wants to test.
       throttle.recordFailure(key);
-      sendOutcome(res, await handleGetKdfDescriptor({ handle: asFields(req.body).handle }, ctx));
+      sendOutcome(res, await handleGetKdfDescriptor({ email: asFields(req.body).email }, ctx));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post(`${AUTH_API_PREFIX}/invite-lookup`, async (req, res, next) => {
+    try {
+      // By IP alone, and every attempt counts. Guessing invite tokens is the
+      // attack, so a bucket keyed by the submitted token would hand out a fresh
+      // allowance for every guess.
+      const key = throttleKey({ namespace: 'invite-lookup', ip: clientIp(req) });
+      const decision = throttle.check(key);
+      if (decision.locked) {
+        sendThrottled(res, decision.retryAfterMs);
+        return;
+      }
+      throttle.recordFailure(key);
+      sendOutcome(res, await handleInviteLookup(req.body, ctx));
     } catch (error) {
       next(error);
     }
@@ -154,11 +203,11 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
 
   router.post(`${AUTH_API_PREFIX}/login`, async (req, res, next) => {
     try {
-      const submittedHandle = asString(asFields(req.body).handle);
+      const submittedEmail = asString(asFields(req.body).email);
       const key = throttleKey({
         namespace: 'login',
         ip: clientIp(req),
-        identifier: submittedHandle ?? undefined,
+        identifier: submittedEmail ?? undefined,
       });
       const decision = throttle.check(key);
       if (decision.locked) {
@@ -178,14 +227,14 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
     }
   });
 
-  // Both recovery routes share ONE throttle bucket per (IP, handle), on
+  // Both recovery routes share ONE throttle bucket per (IP, email), on
   // purpose: they authenticate the same secret, so letting an attacker spend a
   // fresh allowance on each would halve the cost of guessing it.
   const recoveryThrottleKey = (req: Request): string =>
     throttleKey({
       namespace: 'recover',
       ip: clientIp(req),
-      identifier: asString(asFields(req.body).handle) ?? undefined,
+      identifier: asString(asFields(req.body).email) ?? undefined,
     });
 
   router.post(`${AUTH_API_PREFIX}/recover`, async (req, res, next) => {
@@ -221,6 +270,45 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
       const outcome = await handleRecoverRotate(req.body, ctx);
       throttle.recordFailure(key);
       sendOutcome(res, outcome);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post(`${AUTH_API_PREFIX}/reset/request`, async (req, res, next) => {
+    try {
+      // Per (IP, email), and NEVER cleared. A person forgets their password
+      // once; a caller measuring the difference between a known and an unknown
+      // address, or filling somebody's mailbox, does it thousands of times.
+      const key = throttleKey({
+        namespace: 'reset-request',
+        ip: clientIp(req),
+        identifier: asString(asFields(req.body).email) ?? undefined,
+      });
+      const decision = throttle.check(key);
+      if (decision.locked) {
+        sendThrottled(res, decision.retryAfterMs);
+        return;
+      }
+      throttle.recordFailure(key);
+      sendOutcome(res, await handleResetRequest(req.body, ctx));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post(`${AUTH_API_PREFIX}/reset/open`, async (req, res, next) => {
+    try {
+      // By IP alone: the submitted value IS the secret being guessed, so a
+      // bucket keyed by it would reset on every guess.
+      const key = throttleKey({ namespace: 'reset-open', ip: clientIp(req) });
+      const decision = throttle.check(key);
+      if (decision.locked) {
+        sendThrottled(res, decision.retryAfterMs);
+        return;
+      }
+      throttle.recordFailure(key);
+      sendOutcome(res, await handleResetOpen(req.body, ctx));
     } catch (error) {
       next(error);
     }
@@ -268,6 +356,19 @@ export function registerAuthRoutes(app: Express, options: AuthRoutesOptions): vo
         return;
       }
       sendOutcome(res, await handleGetAccount({ accountId: session.accountId }, ctx));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.patch(`${AUTH_API_PREFIX}/account`, requireAuth, async (req, res, next) => {
+    try {
+      const session = getRequestSession(req);
+      if (session === null) {
+        res.status(401).json({ error: 'authentication required' });
+        return;
+      }
+      sendOutcome(res, await handleUpdateAccount({ accountId: session.accountId, body: req.body }, ctx));
     } catch (error) {
       next(error);
     }

@@ -1,6 +1,6 @@
 /**
  * Drizzle-backed `SyncRotationStore` — ADR-0002's Tier 2 revocation, and the
- * only write path in this service that crosses `sync_blobs`,
+ * only write path in this service that crosses `accounts`, `sync_blobs`,
  * `sync_key_records` and `sync_shares` at once.
  *
  * IT IS ONE TRANSACTION, AND THAT IS THE WHOLE POINT. ADR-0002 prohibition 8
@@ -17,6 +17,13 @@
  * deliberately unable to reach each other's tables; composing a rotation out
  * of them would produce precisely the individually-committing sequence the
  * prohibition forbids, and it would look reasonable while doing it.
+ *
+ * `accounts` JOINED THE LIST IN M192. A rotation re-wraps the `recovery` key
+ * record under a KEK derived from a NEW recovery code, so the account's
+ * recovery verifier and its escrow have to move with it. Before that, a
+ * rotation left both on the old code: the escrowed code still authenticated
+ * and no longer unwrapped anything, which was latent until a mailed reset
+ * began handing that code to people.
  *
  * SILENCE IS REVOCATION HERE, INVERTING §5.14. In a credential rotation, a
  * key-record kind that was not submitted is left untouched, because those
@@ -38,7 +45,7 @@ import type { RotateDekInput, RotateDekResult, SyncRotationStore } from '../cont
 import { BLOB_VERSION_RETENTION } from '../protocol.js';
 import { isUniqueViolation } from '../lib/storage-conflict.js';
 import type { Database } from './client.js';
-import { syncBlobs, syncKeyRecords, syncShares } from './schema.js';
+import { accounts, syncBlobs, syncKeyRecords, syncShares } from './schema.js';
 
 /**
  * How a rotation refuses: thrown inside the transaction so Postgres rolls
@@ -129,6 +136,21 @@ export function createDrizzleRotationStore(db: Database): SyncRotationStore {
                 },
               });
           }
+
+          // ---- The new recovery credential, in this same transaction
+          //
+          // The `recovery` key record written just above is wrapped under a KEK
+          // derived from a code the client has just minted. These two columns
+          // are what that code authenticates against and what a mailed reset
+          // hands back, so all three move together or the account ends up with
+          // an escrowed code that logs in and opens nothing.
+          await tx
+            .update(accounts)
+            .set({
+              recoveryVerifier: input.recoveryVerifier,
+              recoveryCodeEscrow: Buffer.from(input.recoveryCodeEscrow),
+            })
+            .where(eq(accounts.id, input.accountId));
 
           // ---- Shares not resubmitted are DELETED, in this same transaction
           //

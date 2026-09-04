@@ -30,9 +30,12 @@ import { createDrizzleRotationStore } from './db/rotation-store.js';
 import { createDrizzleResearchStore } from './db/research-store.js';
 import { deriveServerSecrets } from './lib/server-secrets.js';
 import { createThrottleStore } from './lib/throttle.js';
-import { generateFamilyId, generateToken } from './lib/tokens.js';
+import { generateFamilyId, generatePasswordResetToken, generateToken } from './lib/tokens.js';
+import { createMailer } from './mail/mailer.js';
+import { createDrizzleAiQuotaStore } from './ai/quota-store.js';
 import { createApp } from './server/create-app.js';
 import type { AuthContext } from './accounts/auth-handlers.js';
+import type { InstanceInfo } from './protocol.js';
 import { SERVICE_VERSION } from './version.js';
 
 /** How long a fully-expired token row is kept before the sweeper drops it. */
@@ -54,39 +57,85 @@ async function main(): Promise<void> {
   });
   logger.info('Migrations applied');
 
+  // Both or neither, by construction: `parseConfig` refuses to boot with mail
+  // configured and no link bases, so this is a narrowing rather than a policy.
+  // With no mail an instance gets the no-op mailer, and every invitation comes
+  // back as a link for the operator to paste.
+  const links =
+    config.clientBaseUrl !== null && config.serverPublicUrl !== null
+      ? { clientBaseUrl: config.clientBaseUrl, serverPublicUrl: config.serverPublicUrl }
+      : null;
+  const mailer = createMailer({
+    mail: config.mail,
+    links,
+    language: config.instanceLanguage,
+    logger,
+  });
+
   const authContext: AuthContext = {
     store: createDrizzleAccountStore(database.db),
     pepper: secrets.verifierPepper,
     enumerationSecret: secrets.enumerationSecret,
-    signupMode: config.signupMode,
+    escrowKey: secrets.escrowKey,
+    mailer,
     now: () => new Date(),
     mintToken: generateToken,
+    mintResetToken: generatePasswordResetToken,
     mintFamilyId: generateFamilyId,
     logger,
   };
 
-  // `null` unless ADMIN_TOKEN is set, which leaves the whole `/v1/admin` tree
-  // answering the ordinary unknown-path 404 — see `server/create-app.ts`.
-  const admin =
-    config.adminToken === null
-      ? null
-      : {
-          token: config.adminToken,
-          metadata: createDrizzleAdminStore(database.db),
-          invites: createDrizzleInviteStore(database.db),
-        };
+  // ALWAYS PRESENT, because signup is invite-only and the invite store is the
+  // only door onto this service. `token: null` means no static break-glass
+  // credential, which leaves the tree answering the ordinary unknown-path 404
+  // until an admin account signs in — see `server/admin-auth.ts`.
+  const admin = {
+    token: config.adminToken,
+    metadata: createDrizzleAdminStore(database.db),
+    invites: createDrizzleInviteStore(database.db),
+    // The same pair the mailer builds its links from, so an admin response and
+    // a letter can never disagree about where a link points.
+    links,
+  };
 
-  // An invite-only instance with no admin API can never mint an invite, so
-  // nobody can ever register on it. That is a misconfiguration worth shouting
-  // about — and deliberately NOT fatal: invites minted before the token was
-  // removed are still valid, and refusing to boot would lock out people who
-  // are already holding one.
-  if (config.signupMode === 'invite' && admin === null) {
+  // An instance with no static token and no admin account can never mint an
+  // invite, so nobody can ever register on it. That is a misconfiguration worth
+  // shouting about — and deliberately NOT fatal: an admin account created
+  // before the token was removed still works, and refusing to boot would lock
+  // out the very person who could fix it.
+  if (config.adminToken === null) {
     logger.warn(
-      'SIGNUP_MODE=invite with no ADMIN_TOKEN: no new invite can be minted on this instance. ' +
-        'Existing invites still work. Set ADMIN_TOKEN to mint more.',
+      'No ADMIN_TOKEN: only an account with role "admin" can reach /v1/admin. ' +
+        'Set ADMIN_TOKEN if you need a break-glass credential that does not depend on an account.',
     );
   }
+
+  // `null` unless UPSTREAM_API_KEY is set, which leaves
+  // `POST /v1/chat/completions` answering the ordinary unknown-path 404 — see
+  // `server/create-app.ts`.
+  const ai =
+    config.ai === null
+      ? null
+      : {
+          upstream: config.ai,
+          quota: createDrizzleAiQuotaStore(database.db),
+          perMinute: config.aiRateLimitPerMinute,
+          maxRequestBytes: config.aiMaxRequestBytes,
+        };
+
+  const instance: InstanceInfo = {
+    name: config.instanceName,
+    language: config.instanceLanguage,
+    // Both reported honestly rather than omitted: a client that sees
+    // `mail: false` knows to show the operator a link instead of promising a
+    // letter, and one that sees `ai: null` knows not to offer a scan.
+    mail: config.mail !== null,
+    // DESCRIPTIVE, NEVER A GRANT. It says an upstream is configured, not that
+    // the caller may use it: an account with `dailyAiLimit: 0` gets a 403
+    // whatever this says. The model name is advertising copy the operator
+    // chose, and `null` when they chose none.
+    ai: ai === null ? null : { model: config.aiAdvertisedModel },
+  };
 
   // `null` unless SYNC_SHARING is on, which leaves both share subtrees
   // answering the ordinary unknown-path 404 — see `server/create-app.ts`.
@@ -106,7 +155,11 @@ async function main(): Promise<void> {
     logger,
     trustProxy: config.trustProxy,
     notice: config.notice,
+    instance,
+    mailer,
+    mailConfigured: config.mail !== null,
     admin,
+    ai,
     shares,
     research,
   });
@@ -115,9 +168,12 @@ async function main(): Promise<void> {
     logger.info('openplate-sync listening', {
       port: config.port,
       serviceVersion: SERVICE_VERSION,
-      signupMode: config.signupMode,
-      // Whether the operator API exists on this instance, never its token.
-      adminApi: admin !== null,
+      instanceName: config.instanceName,
+      instanceLanguage: config.instanceLanguage,
+      // Whether a break-glass credential exists on this instance, never its value.
+      adminToken: config.adminToken !== null,
+      mail: config.mail !== null,
+      ai: ai !== null,
       sharing: shares !== null,
       research: research !== null,
     });

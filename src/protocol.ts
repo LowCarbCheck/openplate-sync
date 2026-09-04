@@ -32,7 +32,7 @@ import { asNumber, asObject, asString, type JsonObject, type JsonValue } from '.
  * Purely additive changes (a new optional response field, a new endpoint that
  * older clients simply never call) do not require a bump.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /**
  * The encrypted-blob wire format version — INDEPENDENT of
@@ -108,29 +108,99 @@ export function isSyncKeyRecordKind(value: JsonValue | undefined): value is Sync
 }
 
 // ---------------------------------------------------------------------------
-// Signup policy
+// Accounts
 // ---------------------------------------------------------------------------
 
 /**
- * Whether, and on what terms, an instance accepts new accounts.
+ * What an account may do on this instance.
  *
- *  - `'open'` — anyone may register. The default for a self-hosted instance.
- *  - `'invite'` — registration requires a single-use token the operator minted
- *    (`POST /v1/admin/invites`). What the hosted instance runs.
- *  - `'closed'` — nobody may register. Existing accounts keep working.
+ *  - `'member'` — the default, and what every invite that says nothing grants.
+ *  - `'admin'` — may also call `/v1/admin`, authenticated by its OWN access
+ *    token. That is the whole difference; an admin holds no key an ordinary
+ *    account does not, and cannot read anybody's diary.
  *
- * This is deliberately NOT a secret. `POST /v1/auth/signup` already discloses
- * it to anyone who calls it, and any instance with a sign-up page shows it to
- * every visitor. Publishing it on the handshake only saves the client from
- * having to provoke a `403` to render the right form.
+ * There is no third role and no permission matrix, deliberately. One server,
+ * one organization (M192 non-goal: multi-tenancy).
  */
-export type SignupMode = 'open' | 'invite' | 'closed';
+export type AccountRole = 'admin' | 'member';
 
-/** Every valid {@link SignupMode}, for validation and exhaustive iteration. */
-export const SIGNUP_MODES: readonly SignupMode[] = ['open', 'invite', 'closed'];
+/** Every valid {@link AccountRole}, for validation and exhaustive iteration. */
+export const ACCOUNT_ROLES: readonly AccountRole[] = ['admin', 'member'];
 
-export function isSignupMode(value: JsonValue | undefined): value is SignupMode {
-  return value === 'open' || value === 'invite' || value === 'closed';
+export function isAccountRole(value: JsonValue | undefined): value is AccountRole {
+  return value === 'admin' || value === 'member';
+}
+
+/**
+ * WHAT USED TO BE HERE, AND WHY IT IS NOT (M192).
+ *
+ * `SignupMode` (`open` | `invite` | `closed`) stood here, was published on the
+ * handshake, and was read from `SIGNUP_MODE`. Signup is now invite-only,
+ * always: an account is created by redeeming an addressed invite an operator
+ * minted, and there is no other door. A mode that has one value is not a mode,
+ * so the type, the env var and the handshake field are gone together. Setting
+ * `SIGNUP_MODE` is a boot failure (`config.ts`), never a silent no-op.
+ */
+
+/**
+ * One account, as every endpoint that returns one reports it. The same shape
+ * comes back from `POST /signup`, `POST /login`, `GET /account`,
+ * `PATCH /account`, `POST /recover`, `POST /recover-rotate` and the admin
+ * account endpoints, so a client has exactly one account decoder.
+ *
+ * NOTHING SECRET IS IN IT, and nothing can be: no verifier, no KDF
+ * descriptor, no wrapped DEK, no escrow, no token. Every field below is
+ * either the person's own information or the standing an operator granted
+ * them.
+ */
+export interface AccountView {
+  id: number;
+  /** The canonical address — NFKC, trimmed, lowercased (see `PROTOCOL.md` §5.8). */
+  email: string;
+  displayName: string | null;
+  role: AccountRole;
+  /** AI requests allowed per UTC day. `0` means this account has no AI. */
+  dailyAiLimit: number;
+  /** AI requests already spent on the current UTC day. */
+  aiUsedToday: number;
+  /** Non-`null` while the account is suspended; every authenticated call then answers `403 account-suspended`. */
+  suspendedAt: IsoTimestamp | null;
+  createdAt: IsoTimestamp;
+}
+
+/**
+ * What an instance says about itself on the handshake, beside the version
+ * numbers. Descriptive only: a client renders it, and never authorizes on it.
+ */
+export interface InstanceInfo {
+  /** The operator's name for this instance (`INSTANCE_NAME`, default `openplate`). */
+  name: string;
+  /** The language its mail is written in (`INSTANCE_LANGUAGE`, `en` or `de`). */
+  language: InstanceLanguage;
+  /** Whether this instance can send mail at all. `false` means invites and resets are printed as links instead. */
+  mail: boolean;
+  /** The AI proxy this instance offers, or `null` when it has no upstream key. Wired by spec 03. */
+  ai: InstanceAi | null;
+}
+
+/** The two languages the invite and reset mails exist in. */
+export type InstanceLanguage = 'en' | 'de';
+
+/** Every valid {@link InstanceLanguage}, for validation and exhaustive iteration. */
+export const INSTANCE_LANGUAGES: readonly InstanceLanguage[] = ['en', 'de'];
+
+export function isInstanceLanguage(value: JsonValue | undefined): value is InstanceLanguage {
+  return value === 'en' || value === 'de';
+}
+
+/**
+ * What the instance's AI proxy advertises. Diagnostics and UI copy only, never
+ * a routing decision: `instance.ai` being non-`null` says an upstream is
+ * configured, not that the caller may use it.
+ */
+export interface InstanceAi {
+  /** `AI_ADVERTISED_MODEL`, or `null` when the operator named none. Never the upstream URL and never a key. */
+  model: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,19 +222,21 @@ export interface ProtocolHandshake {
   /** Human-readable build identifier — diagnostics only, never compared. */
   serviceVersion: string;
   /**
-   * How this instance treats new accounts — see {@link SignupMode}.
+   * What this instance calls itself, what language it writes in, whether it
+   * can send mail, and what AI it offers — see {@link InstanceInfo}.
    *
-   * OPTIONAL, and it must stay optional. A service older than this field
-   * omits it entirely, and a client that required it would refuse to talk to
-   * every such instance: a compatibility break wearing the clothes of an
-   * additive change. Absent means "ask by trying" — attempt the signup and
-   * handle the `403`.
+   * OPTIONAL, and it must stay optional. A service older than this field omits
+   * it entirely, and a client that required it would refuse to talk to every
+   * such instance: a compatibility break wearing the clothes of an additive
+   * change. It replaced `signupMode`, which described a setting that no longer
+   * exists (signup is invite-only, always).
    *
-   * It is a HINT, never the contract. An operator can close signups between
-   * the handshake and the submit, so the client keeps its `403` handling even
-   * when this said `'open'`.
+   * It is DESCRIPTIVE, never authoritative. `mail: true` does not promise a
+   * letter arrives, and `ai` is what the operator configured rather than a
+   * capability grant — an account with `dailyAiLimit: 0` gets `403` whatever
+   * this says.
    */
-  signupMode?: SignupMode;
+  instance?: InstanceInfo;
   /**
    * A short message the operator wants every client to show — a planned
    * migration, a shutdown date, a "read this before you sync again".
@@ -176,8 +248,9 @@ export interface ProtocolHandshake {
    * is real and is written down rather than papered over — it is not a
    * notification system and must never be relied on as one.
    *
-   * OPTIONAL, for the same reason `signupMode` is: an instance with nothing to
-   * say omits it, and an older client that has never heard of it ignores it.
+   * OPTIONAL, for the same reason {@link ProtocolHandshake.instance} is: an
+   * instance with nothing to say omits it, and an older client that has never
+   * heard of it ignores it.
    * Its text is bounded by the service's config (`MAX_SYNC_NOTICE_LENGTH`)
    * because `/health` is the container's own HEALTHCHECK path and is polled
    * continuously.
@@ -202,7 +275,7 @@ export type ProtocolCompatibility = { status: 'compatible' } | { status: 'incomp
 export function isProtocolHandshake(value: JsonValue | undefined): boolean {
   const candidate = asObject(value);
   if (candidate === null) return false;
-  // `signupMode` is deliberately absent from this check. It is optional on the
+  // `instance` is deliberately absent from this check. It is optional on the
   // wire, so demanding it here would reject every service older than the field.
   return (
     asNumber(candidate.protocolVersion) !== null &&

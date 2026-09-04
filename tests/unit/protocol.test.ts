@@ -33,7 +33,13 @@ import {
 } from '../../src/protocol.js';
 
 // --- Transcribed from openplate/app/lib/sync/engine/protocol.ts. Keep in lockstep. ---
-const EXPECTED_PROTOCOL_VERSION = 1;
+// M192 bumped this to 2: the account identifier changed from an opaque handle
+// to an email address, signup takes an addressed invite, and `signupMode` left
+// the handshake. Every one of those is a breaking change to a documented shape,
+// so a client speaking version 1 must refuse rather than half-work. Mirroring
+// it in the openplate copy is an explicit hand-off item — both guards assert
+// TRANSCRIBED literals, so neither can catch the other being stale.
+const EXPECTED_PROTOCOL_VERSION = 2;
 const EXPECTED_ENVELOPE_VERSION = 1;
 const EXPECTED_MAX_BLOB_BYTES = 2 * 1024 * 1024;
 const EXPECTED_BLOB_VERSION_RETENTION = 5;
